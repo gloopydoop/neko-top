@@ -126,18 +126,16 @@ In CMake, POD recovery is enabled only when ADIOS2 is found. If ADIOS2 is
 missing, Neko-TOP falls back to a POD stub and the POD recovery type is not
 available.
 
-The build and runtime helpers try to locate ADIOS2 from:
+The build helpers only configure ADIOS2 when `ADIOS2_DIR` is set, mirroring
+the HDF5 setup path. If `ADIOS2_DIR` is unset, the build skips ADIOS2 and POD
+state recovery falls back to the stub implementation.
 
-- `ADIOS2_PATH`
-- `ADIOS2_DIR`
-- `${repo}/external/adios2`
-- `adios2-config` on `PATH`
+If ADIOS2 is not already installed, `scripts/dependencies.sh` can build it in
+the directory pointed to by `ADIOS2_DIR`. The relevant configuration is:
 
-If ADIOS2 is not already installed, `scripts/dependencies.sh` can build it.
-The relevant configuration is:
-
-- `NEKO_WITH_ADIOS2=true`
 - `ADIOS2_DIR=/path/to/adios2` if you want to point at an existing install
+- `ADIOS2_DIR=/path/where/adios2/should/be/built` if you want the helper
+  script to build ADIOS2 for you
 - optional ADIOS2 build options such as `ADIOS2_ENABLE_FORTRAN=ON`,
   `ADIOS2_ENABLE_PYTHON=ON`, and `ADIOS2_ENABLE_SST=ON`
 
