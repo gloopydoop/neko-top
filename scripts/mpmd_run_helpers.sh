@@ -122,10 +122,6 @@ function mpmd_ensure_python_runtime() {
     mpmd_prepare_python_runtime "${root_dir}"
 }
 
-function mpmd_ensure_mpi_python() {
-    mpmd_ensure_python_runtime "$@"
-}
-
 function mpmd_ensure_adios2_python() {
     mpmd_ensure_python_runtime "$@"
 }
@@ -227,11 +223,6 @@ function mpmd_resolve_case_file() {
         echo "Error: multiple .case files found in ${script_dir}" >&2
     fi
     return 1
-}
-
-function mpmd_case_needs_python_driver() {
-    local case_path=$1
-    grep -q '"type"[[:space:]]*:[[:space:]]*"pod"' "${case_path}"
 }
 
 function mpmd_launch_shared() {
@@ -375,59 +366,6 @@ function mpmd_launch_shared() {
 
     if [ "${rc}" -ne 0 ]; then
         echo "Error: shared MPMD launch failed. See ${log_file}." >&2
-    fi
-
-    return ${rc}
-}
-
-function mpmd_launch_neko_only() {
-    local case_path=$1
-    local neko_exe=$2
-    local neko_ranks=$3
-    local log_file=$4
-    local launcher
-    local errexit_was_set
-    local rc
-    local -a run_cmd
-
-    launcher=$(mpmd_selected_launcher) || return 1
-
-    if [ "${launcher}" = "srun" ]; then
-        run_cmd=(
-            srun
-            --unbuffered
-            -n "${neko_ranks}"
-            "${neko_exe}" "${case_path}"
-        )
-    else
-        run_cmd=(
-            mpirun
-            --tag-output
-            -n "${neko_ranks}"
-            "${neko_exe}" "${case_path}"
-        )
-    fi
-
-    echo "Launching ${launcher} job:"
-    printf '  %q' "${run_cmd[@]}"
-    printf '\n'
-    echo "Output:            ${log_file}"
-
-    errexit_was_set=0
-    if [[ $- == *e* ]]; then
-        errexit_was_set=1
-        set +e
-    fi
-
-    "${run_cmd[@]}" > "${log_file}" 2>&1
-    rc=$?
-
-    if [ "${errexit_was_set}" -eq 1 ]; then
-        set -e
-    fi
-
-    if [ "${rc}" -ne 0 ]; then
-        echo "Error: ${launcher} launch failed. See ${log_file}." >&2
     fi
 
     return ${rc}
