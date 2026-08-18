@@ -133,9 +133,9 @@ printf "Compiling the example codes and Neko-TOP\n"
 [ "$CLEAN" == true ] && rm -fr $MAIN_DIR/build
 mkdir -p $MAIN_DIR/build
 
-# Validate and persist the POD Python runtime when example launchers are built.
+# Validate and persist the MPMD Python runtime when example launchers are built.
 if [ "$EXAMPLES" == "ON" ]; then
-    find_pod_python_runtime $MAIN_DIR
+    find_mpmd_python_runtime $MAIN_DIR
 fi
 
 # If CMAKE_VARIABLES is a string, convert it to an array

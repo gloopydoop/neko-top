@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Generic helpers for coupled Neko/Python POD launches.
+# Generic helpers for coupled Neko/Python MPMD launches.
 #
 # This layer only covers:
 # - locating the Python runtime recorded by setup.sh
@@ -61,7 +61,7 @@ function mpmd_runtime_env_file() {
     local repo_root
 
     repo_root=$(mpmd_find_repo_root "${root_dir}") || return 1
-    printf '%s\n' "${repo_root}/build/pod_runtime.env"
+    printf '%s\n' "${repo_root}/build/mpmd_runtime.env"
 }
 
 function mpmd_source_runtime_env() {
@@ -79,7 +79,6 @@ function mpmd_source_runtime_env() {
     # shellcheck disable=SC1090
     source "${runtime_env}"
     export MPMD_RUNTIME_ENV_FILE="${runtime_env}"
-    export POD_RUNTIME_ENV_FILE="${runtime_env}"
 }
 
 function mpmd_validate_python_runtime() {
@@ -89,7 +88,7 @@ function mpmd_validate_python_runtime() {
     local pyexe
 
     repo_root=$(mpmd_find_repo_root "${root_dir}") || return 1
-    validator="${repo_root}/scripts/python/validate_pod_runtime.py"
+    validator="${repo_root}/scripts/python/validate_mpmd_runtime.py"
     if [ ! -f "${validator}" ]; then
         echo "Error: Python runtime validator not found: ${validator}" >&2
         return 1
@@ -132,7 +131,7 @@ function mpmd_startup_delay() {
         return 0
     fi
 
-    printf '%s\n' "${POD_NEKO_STARTUP_DELAY:-20}"
+    printf '%s\n' "${MPMD_NEKO_STARTUP_DELAY:-20}"
 }
 
 function mpmd_selected_launcher() {
