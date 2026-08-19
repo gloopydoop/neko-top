@@ -195,6 +195,11 @@ The recommended workflow is:
    Neko-TOP root, for example `./run.sh POD_rugby_ball`, rather than manually
    piecing together the MPI command.
 
+Cluster-specific placement should stay in the submit scripts under
+`scripts/jobscripts/<cluster>/...`. The generic MPMD helper is intentionally
+limited to launching the mixed Neko/Python job once the allocation and any
+cluster-local wrappers have already been chosen.
+
 The POD helper scripts print the active `python3`, `mpirun`, `CONDA_PREFIX`,
 `PYTHONPATH`, and `LD_LIBRARY_PATH` before launching. If `mpi4py` or ADIOS2
 import errors occur, or if the Python side appears to hang at startup, the
