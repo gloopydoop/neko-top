@@ -149,9 +149,6 @@ already be activated before running `./setup.sh`. The helper defaults to:
 
 If `HDF5_DIR` is set, the helper also builds ADIOS2 with HDF5 support.
 
-At runtime, the MPMD helper scripts extend `PYTHONPATH` and `LD_LIBRARY_PATH`
-so that the same ADIOS2 installation is visible to the Python driver.
-
 ### Python requirements
 
 The POD Python driver is `scripts/python/pod_state_recover.py`. The runtime
