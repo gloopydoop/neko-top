@@ -127,7 +127,6 @@ cat <<'EOF' > "${select_gpu_path}"
 #!/bin/bash
 
 export ROCR_VISIBLE_DEVICES=${SLURM_LOCALID:-0}
-sleep "${NEKO_STARTUP_DELAY:-20}"
 exec "$@"
 EOF
 
@@ -137,18 +136,20 @@ chmod +x "${select_gpu_path}"
 
 for ((node=0; node<nodes; node++)); do
     node_base=$((node * tasks_per_node))
-    neko_start=$node_base
-    neko_end=$((node_base + neko_ranks_per_node - 1))
-    python_start=$((neko_end + 1))
-    python_end=$((node_base + tasks_per_node - 1))
 
-    printf '%d-%d /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=%d %s %s %s\n' \
-        "${neko_start}" "${neko_end}" "${neko_ranks_per_node}" \
-        "${select_gpu_path}" "${neko_exe}" "${case_file}" >> "${output_path}"
+    for ((local_rank=0; local_rank<neko_ranks_per_node; local_rank++)); do
+        rank=$((node_base + local_rank))
+        printf '%d /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=%d %s %s %s\n' \
+            "${rank}" "${neko_ranks_per_node}" \
+            "${select_gpu_path}" "${neko_exe}" "${case_file}" >> "${output_path}"
+    done
 
-    printf '%d-%d /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 %s %s %s\n' \
-        "${python_start}" "${python_end}" \
-        "${python_bin}" "${python_script}" "${case_file}" >> "${output_path}"
+    for ((local_rank=0; local_rank<python_ranks_per_node; local_rank++)); do
+        rank=$((node_base + neko_ranks_per_node + local_rank))
+        printf '%d /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 %s %s %s\n' \
+            "${rank}" "${python_bin}" "${python_script}" "${case_file}" \
+            >> "${output_path}"
+    done
 done
 
 echo "Generated ${output_path} for ${nodes} LUMI-G node(s)"

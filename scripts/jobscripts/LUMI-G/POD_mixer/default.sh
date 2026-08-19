@@ -42,10 +42,9 @@ source "${MAIN_DIR}/scripts/mpmd_run_helpers.sh"
 
 export MPICH_GPU_SUPPORT_ENABLED=1
 export ATP_ENABLED=true
-export NEKO_STARTUP_DELAY=${NEKO_STARTUP_DELAY:-20}
 export NEKO_RANKS_PER_NODE=${NEKO_RANKS_PER_NODE:-8}
 export PY_RANKS_PER_NODE=${PY_RANKS_PER_NODE:-48}
-export SRUN_MPMD_FLAGS="${SRUN_MPMD_FLAGS:---distribution=block:block}"
+trap 'rm -f ./select_gpu ./mpmd.conf' EXIT
 
 function run {
     set +e
@@ -119,13 +118,15 @@ function run {
         --select-gpu "./select_gpu" || return 1
 
     TIME_START=$(date +%s)
-    read -r -a srun_extra <<< "${SRUN_MPMD_FLAGS}"
-    srun --unbuffered "${srun_extra[@]}" --multi-prog ./mpmd.conf \
-        > "${logfile}" 2>error.log
+    if [ -n "${SRUN_MPMD_FLAGS:-}" ]; then
+        read -r -a srun_extra <<< "${SRUN_MPMD_FLAGS}"
+        srun --unbuffered "${srun_extra[@]}" --multi-prog ./mpmd.conf \
+            > "${logfile}" 2>error.log
+    else
+        srun --unbuffered --multi-prog ./mpmd.conf > "${logfile}" 2>error.log
+    fi
     rc=$?
     TIME_END=$(date +%s)
-
-    rm -f ./select_gpu ./mpmd.conf
 
     if [ "${rc}" -ne 0 ]; then
         printf "ERROR: An error occurred during execution.\n"
