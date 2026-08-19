@@ -238,6 +238,7 @@ function mpmd_launch_shared() {
     local abs_case_dir
     local abs_py_script
     local abs_neko_exe
+    local runtime_env
     local pyexe
     local startup_delay
     local launcher
@@ -252,6 +253,11 @@ function mpmd_launch_shared() {
     abs_case_dir=$(dirname "${abs_case_path}")
     abs_py_script=$(realpath "${py_script}")
     abs_neko_exe=$(realpath "${neko_exe}")
+    runtime_env=${MPMD_RUNTIME_ENV_FILE:-}
+    if [ -z "${runtime_env}" ]; then
+        runtime_env=$(mpmd_runtime_env_file "${abs_case_dir}") || return 1
+    fi
+    runtime_env=$(realpath "${runtime_env}")
     launcher=$(mpmd_selected_launcher) || return 1
 
     if declare -F mpmd_launch_shared_bound_available >/dev/null 2>&1 &&
@@ -274,14 +280,16 @@ function mpmd_launch_shared() {
 
         {
             for ((i=0; i<py_ranks; i++)); do
-                echo "${i} /bin/bash -lc 'cd \"${abs_case_dir}\" &&" \
+                echo "${i} /bin/bash -c 'cd \"${abs_case_dir}\" &&" \
+                    "source \"${runtime_env}\" &&" \
                     "exec /usr/bin/env NEKO_COMM_ID=1" \
                     "NEKO_CTRL_PEER_ROOT=${py_ranks} \"${pyexe}\"" \
                     "\"${abs_py_script}\" \"${abs_case_path}\"'"
             done
 
             for ((i=py_ranks; i<total_ranks; i++)); do
-                echo "${i} /bin/bash -lc 'cd \"${abs_case_dir}\" &&" \
+                echo "${i} /bin/bash -c 'cd \"${abs_case_dir}\" &&" \
+                    "source \"${runtime_env}\" &&" \
                     "sleep ${startup_delay};" \
                     "exec /usr/bin/env NEKO_COMM_ID=0" \
                     "NEKO_CTRL_PEER_ROOT=0 \"${abs_neko_exe}\"" \
@@ -317,16 +325,16 @@ function mpmd_launch_shared() {
     fi
 
     printf -v py_cmd \
-        'cd %q && exec /usr/bin/env NEKO_COMM_ID=1 ' \
-        "${abs_case_dir}"
+        'cd %q && source %q && exec /usr/bin/env NEKO_COMM_ID=1 ' \
+        "${abs_case_dir}" "${runtime_env}"
     printf -v py_cmd \
         '%sNEKO_CTRL_PEER_ROOT=%q %q %q %q' \
         "${py_cmd}" "${py_ranks}" "${pyexe}" "${abs_py_script}" \
         "${abs_case_path}"
 
     printf -v neko_cmd \
-        'cd %q && sleep %q; exec /usr/bin/env NEKO_COMM_ID=0 ' \
-        "${abs_case_dir}" "${startup_delay}"
+        'cd %q && source %q && sleep %q; exec /usr/bin/env NEKO_COMM_ID=0 ' \
+        "${abs_case_dir}" "${runtime_env}" "${startup_delay}"
     printf -v neko_cmd \
         '%sNEKO_CTRL_PEER_ROOT=0 %q %q' \
         "${neko_cmd}" "${abs_neko_exe}" "${abs_case_path}"
@@ -336,12 +344,12 @@ function mpmd_launch_shared() {
         --tag-output
         -n "${py_ranks}"
         /bin/bash
-        -lc
+        -c
         "${py_cmd}"
         :
         -n "${neko_ranks}"
         /bin/bash
-        -lc
+        -c
         "${neko_cmd}"
     )
 
