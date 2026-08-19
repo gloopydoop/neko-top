@@ -119,29 +119,38 @@ from `case.fluid.output_control` and `case.fluid.output_value`.
 
 ### ADIOS2 requirement
 
-POD state recovery depends on ADIOS2. The Fortran side uses the Neko-TOP
-streaming layer, and the Python side imports ADIOS2-backed
-[`pySEMTools`](https://github.com/ExtremeFLOW/pySEMTools) streaming support.
-In CMake, POD recovery is enabled only when ADIOS2 is found. If ADIOS2 is
-missing, Neko-TOP falls back to a POD stub and the POD recovery type is not
-available.
+ADIOS2 is required only for POD state recovery. Checkpoint-based state
+recovery and the rest of Neko-TOP can be built without it.
 
-The build helpers only configure ADIOS2 when `ADIOS2_DIR` is set, mirroring
-the HDF5 setup path. If `ADIOS2_DIR` is unset, the build skips ADIOS2 and POD
-state recovery falls back to the stub implementation.
+On the Neko-TOP side, CMake enables the real POD implementation only when
+`find_package(ADIOS2 QUIET COMPONENTS CXX MPI)` succeeds. If ADIOS2 is not
+found, Neko-TOP builds the POD stub instead, so `state_recovery.type = "pod"`
+is not available at runtime.
 
-If ADIOS2 is not already installed, `scripts/dependencies.sh` can build it in
-the directory pointed to by `ADIOS2_DIR`. The relevant configuration is:
+`./setup.sh` always calls the ADIOS2 helper, but that helper returns
+immediately unless `ADIOS2_DIR` is set. In practice this means:
 
-- `ADIOS2_DIR=/path/to/adios2` if you want to point at an existing install
-- `ADIOS2_DIR=/path/where/adios2/should/be/built` if you want the helper
-  script to build ADIOS2 for you
-- optional ADIOS2 build options such as `ADIOS2_ENABLE_FORTRAN=ON`,
-  `ADIOS2_ENABLE_PYTHON=ON`, and `ADIOS2_ENABLE_SST=ON`
+- leave `ADIOS2_DIR` unset if you do not want ADIOS2 or POD state recovery
+- set `ADIOS2_DIR=/path/to/adios2` to use an existing ADIOS2 installation
+- set `ADIOS2_DIR=/path/where/adios2/should/be/installed` if you want
+  `scripts/dependencies.sh` to clone, build, and install ADIOS2 for you
 
-The runtime helper in `scripts/mpmd_run_helpers.sh` also extends
-`PYTHONPATH` and `LD_LIBRARY_PATH` so that `adios2.bindings` can be imported
-on the Python side.
+When the helper builds ADIOS2 itself, it uses the currently active Python
+interpreter and MPI compiler wrappers. This is why the Python environment must
+already be activated before running `./setup.sh`. The helper defaults to:
+
+- `ADIOS2_USE_MPI=ON` because the coupled Neko/Python workflow is launched as
+  an MPI job
+- `ADIOS2_USE_Fortran=ON` because the Neko side uses the ADIOS2 Fortran
+  interface
+- `ADIOS2_USE_Python=ON` because the Python driver imports `adios2.bindings`
+- `ADIOS2_USE_SST=ON` because the POD workflow uses ADIOS2's in-memory
+  streaming transport rather than file-based exchange
+
+If `HDF5_DIR` is set, the helper also builds ADIOS2 with HDF5 support.
+
+At runtime, the MPMD helper scripts extend `PYTHONPATH` and `LD_LIBRARY_PATH`
+so that the same ADIOS2 installation is visible to the Python driver.
 
 ### Python requirements
 
