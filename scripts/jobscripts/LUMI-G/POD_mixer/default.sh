@@ -56,12 +56,37 @@ export ATP_ENABLED=true
 export NEKO_STARTUP_DELAY=${NEKO_STARTUP_DELAY:-20}
 export NEKO_RANKS_PER_NODE=${NEKO_RANKS_PER_NODE:-8}
 export PY_RANKS_PER_NODE=${PY_RANKS_PER_NODE:-48}
+export NEKO_RANKS=${NEKO_RANKS:-${NEKO_RANKS_PER_NODE}}
+export PY_RANKS=${PY_RANKS:-${PY_RANKS_PER_NODE}}
 export POD_MIXER_DEBUG=${POD_MIXER_DEBUG:-1}
-# Keep the MPMD ranks contiguous and let Slurm bind each rank to a core.
-# The older LUMI helper path did this explicitly; current Cray stacks appear
-# more sensitive to placement than the original branch was.
-export SRUN_MPMD_FLAGS=${SRUN_MPMD_FLAGS:---cpu-bind=cores --distribution=block:block}
+# Match the older working branch by default: plain srun --multi-prog with any
+# extra placement flags supplied explicitly by the user.
+export SRUN_MPMD_FLAGS=${SRUN_MPMD_FLAGS:-}
 trap 'rm -f ./select_gpu ./mpmd.conf' EXIT
+
+function pod_mixer_write_legacy_mpmd_conf() {
+    local casefile=$1
+    local py_script=$2
+    local neko_exe=$3
+    local py_ranks=$4
+    local neko_ranks=$5
+    local conf_file=${6:-./mpmd.conf}
+    local rank
+
+    : > "${conf_file}"
+
+    for ((rank=0; rank<neko_ranks; rank++)); do
+        echo "${rank} /usr/bin/env NEKO_COMM_ID=0" \
+            "NEKO_CTRL_PEER_ROOT=${neko_ranks}" \
+            "./select_gpu ${neko_exe} ${casefile}" >> "${conf_file}"
+    done
+
+    for ((rank=neko_ranks; rank<neko_ranks + py_ranks; rank++)); do
+        echo "${rank} /usr/bin/env NEKO_COMM_ID=1" \
+            "NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${py_script} ${casefile}" \
+            >> "${conf_file}"
+    done
+}
 
 function pod_mixer_write_debug_snapshot() {
     local casefile=$1
@@ -226,12 +251,6 @@ function run {
     printf "Running example: %s.\n" $example
     printf "=%.0s" {1..80} && printf "\n"
 
-    generator="${MAIN_DIR}/scripts/jobscripts/LUMI-G/POD_mixer/generate_mpmd_conf.sh"
-    if [ ! -x "${generator}" ]; then
-        echo "Error: missing POD_mixer MPMD generator: ${generator}" >&2
-        return 1
-    fi
-
     py_script="${PYTHON_SCRIPT:-${MAIN_DIR}/scripts/python/pod_state_recover.py}"
     neko_exe="${neko}"
     if [[ "${neko_exe}" == "./select_gpu "* ]]; then
@@ -240,16 +259,21 @@ function run {
     mpmd_prepare_python_runtime "${MAIN_DIR}" || return 1
     mpmd_print_runtime_env
 
-    "${generator}" \
-        --nodes "${SLURM_NNODES:-1}" \
-        --case-file "${casefile}" \
-        --neko-exe "${neko_exe}" \
-        --python-bin "${PYTHON_BIN}" \
-        --python-script "${py_script}" \
-        --neko-ranks-per-node "${NEKO_RANKS_PER_NODE}" \
-        --python-ranks-per-node "${PY_RANKS_PER_NODE}" \
-        --output "./mpmd.conf" \
-        --select-gpu "./select_gpu" || return 1
+    if [ "${SLURM_NNODES:-1}" != "1" ]; then
+        echo "Error: the legacy POD_mixer launcher currently expects one node." >&2
+        echo "Set #SBATCH --nodes=1 or update the rank layout for multi-node use." >&2
+        return 1
+    fi
+
+    pod_mixer_write_legacy_mpmd_conf \
+        "${casefile}" "${py_script}" "${neko_exe}" \
+        "${PY_RANKS}" "${NEKO_RANKS}" "./mpmd.conf" || return 1
+
+    echo "Launching ${NEKO_RANKS} Neko GPU ranks and ${PY_RANKS} Python ranks"
+    echo "Case:   ${casefile}"
+    echo "Neko:   ${neko_exe}"
+    echo "Python: ${PYTHON_BIN} ${py_script}"
+    echo "Output: ${logfile}"
 
     if [ "${POD_MIXER_DEBUG}" != "0" ]; then
         pod_mixer_write_debug_snapshot "${casefile}" "${logfile}" \
