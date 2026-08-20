@@ -56,7 +56,121 @@ export ATP_ENABLED=true
 export NEKO_STARTUP_DELAY=${NEKO_STARTUP_DELAY:-20}
 export NEKO_RANKS_PER_NODE=${NEKO_RANKS_PER_NODE:-8}
 export PY_RANKS_PER_NODE=${PY_RANKS_PER_NODE:-48}
+export POD_MIXER_DEBUG=${POD_MIXER_DEBUG:-1}
 trap 'rm -f ./select_gpu ./mpmd.conf' EXIT
+
+function pod_mixer_write_debug_snapshot() {
+    local casefile=$1
+    local logfile=$2
+    local neko_exe=$3
+    local py_script=$4
+    local debug_log=./mpmd_runtime_debug.log
+    local rank_probe_log=./mpmd_rank_probe.log
+    local select_gpu_probe_log=./mpmd_select_gpu_probe.log
+
+    cp -f ./mpmd.conf ./mpmd.conf.debug
+    cp -f ./select_gpu ./select_gpu.debug.sh
+
+    {
+        printf "Timestamp: %s\n" "$(date -Is)"
+        printf "Hostname: %s\n" "$(hostname)"
+        printf "PWD: %s\n" "$(pwd)"
+        printf "Case file: %s\n" "${casefile}"
+        printf "Case path: %s\n" "$(realpath "${casefile}")"
+        printf "Log file: %s\n" "${logfile}"
+        printf "Neko exe: %s\n" "${neko_exe}"
+        printf "Neko exe path: %s\n" "$(realpath "${neko_exe}")"
+        printf "Python bin: %s\n" "${PYTHON_BIN}"
+        printf "Python script: %s\n" "${py_script}"
+        printf "Python script path: %s\n" "$(realpath "${py_script}")"
+        printf "srun path: %s\n" "$(command -v srun 2>/dev/null || echo '<not found>')"
+        printf "mpicc path: %s\n" "$(command -v mpicc 2>/dev/null || echo '<not found>')"
+        printf "sbatch path: %s\n" "$(command -v sbatch 2>/dev/null || echo '<not found>')"
+        if command -v srun >/dev/null 2>&1; then
+            printf "srun version: %s\n" "$(srun --version 2>&1 | head -n 1)"
+        fi
+        printf -- "---- module list ----\n"
+        if command -v module >/dev/null 2>&1; then
+            module list 2>&1 || true
+        else
+            printf "module command not available\n"
+        fi
+        printf -- "---- selected environment ----\n"
+        env | sort | grep -E \
+            '^(SLURM|PMI|PMIX|MPICH|ROCR|HIP|CUDA|LD_LIBRARY_PATH|PYTHONPATH|PATH|VIRTUAL_ENV|CONDA_PREFIX|ADIOS2|NEKO|FI_|UCX_|OMP_)=' || true
+        printf -- "---- scontrol show job ----\n"
+        if [ -n "${SLURM_JOB_ID:-}" ] && command -v scontrol >/dev/null 2>&1; then
+            scontrol show job -d "${SLURM_JOB_ID}" 2>&1 || true
+        else
+            printf "scontrol or SLURM_JOB_ID unavailable\n"
+        fi
+        printf -- "---- ldd neko ----\n"
+        ldd "${neko_exe}" 2>&1 || true
+        printf -- "---- python probe ----\n"
+        "${PYTHON_BIN}" - <<'EOF'
+import os
+import sys
+
+print(f"sys.executable: {sys.executable}")
+print(f"sys.version: {sys.version.replace(chr(10), ' ')}")
+for name in ("mpi4py", "adios2"):
+    try:
+        mod = __import__(name)
+        print(f"{name} file: {getattr(mod, '__file__', '<builtin>')}")
+        print(f"{name} version: {getattr(mod, '__version__', '<unknown>')}")
+    except Exception as exc:
+        print(f"{name} import failed: {exc!r}")
+
+try:
+    from mpi4py import MPI
+    print(f"MPI vendor: {MPI.get_vendor()}")
+    print("MPI library version:")
+    print(MPI.Get_library_version().strip())
+except Exception as exc:
+    print(f"mpi4py.MPI probe failed: {exc!r}")
+
+for key in (
+    "LD_LIBRARY_PATH",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "NEKO_COMM_ID",
+    "NEKO_CTRL_PEER_ROOT",
+):
+    print(f"{key}: {os.getenv(key, '<unset>')}")
+EOF
+        printf -- "---- mpmd.conf ----\n"
+        cat ./mpmd.conf
+        printf -- "---- select_gpu ----\n"
+        cat ./select_gpu
+    } > "${debug_log}" 2>&1
+
+    if command -v srun >/dev/null 2>&1; then
+        {
+            srun --unbuffered -n "${SLURM_NTASKS:-56}" /bin/bash -lc \
+                'printf "rank=%s local=%s node=%s host=%s pmi_rank=%s pmi_size=%s pmix_rank=%s pmix_size=%s rocr=%s\n" \
+                "${SLURM_PROCID:-<unset>}" "${SLURM_LOCALID:-<unset>}" \
+                "${SLURM_NODEID:-<unset>}" "$(hostname)" "${PMI_RANK:-<unset>}" \
+                "${PMI_SIZE:-<unset>}" "${PMIX_RANK:-<unset>}" \
+                "${PMIX_SIZE:-<unset>}" "${ROCR_VISIBLE_DEVICES:-<unset>}"'
+        } 2>&1 | sort -V > "${rank_probe_log}" || true
+
+        {
+            srun --unbuffered -n "${NEKO_RANKS_PER_NODE}" ./select_gpu /bin/bash -lc \
+                'printf "rank=%s local=%s host=%s rocr=%s pmi_rank=%s pmi_size=%s\n" \
+                "${SLURM_PROCID:-<unset>}" "${SLURM_LOCALID:-<unset>}" \
+                "$(hostname)" "${ROCR_VISIBLE_DEVICES:-<unset>}" \
+                "${PMI_RANK:-<unset>}" "${PMI_SIZE:-<unset>}"'
+        } 2>&1 | sort -V > "${select_gpu_probe_log}" || true
+    fi
+
+    printf "Wrote debug files:\n"
+    printf "\t%s\n" "${debug_log}"
+    printf "\t%s\n" "${rank_probe_log}"
+    printf "\t%s\n" "${select_gpu_probe_log}"
+    printf "\t%s\n" "./mpmd.conf.debug"
+    printf "\t%s\n" "./select_gpu.debug.sh"
+}
 
 function run {
     set +e
@@ -132,6 +246,11 @@ function run {
         --python-ranks-per-node "${PY_RANKS_PER_NODE}" \
         --output "./mpmd.conf" \
         --select-gpu "./select_gpu" || return 1
+
+    if [ "${POD_MIXER_DEBUG}" != "0" ]; then
+        pod_mixer_write_debug_snapshot "${casefile}" "${logfile}" \
+            "${neko_exe}" "${py_script}"
+    fi
 
     TIME_START=$(date +%s)
     if [ -n "${SRUN_MPMD_FLAGS:-}" ]; then
