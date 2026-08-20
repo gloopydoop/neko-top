@@ -1,0 +1,15 @@
+diff --git a/src/comm/comm.F90.in b/src/comm/comm.F90.in
+index 9e6a28f..2f91472 100644
+--- a/src/comm/comm.F90.in
++++ b/src/comm/comm.F90.in
+@@ -172,8 +172,9 @@ contains
+ 
+ #ifdef HAVE_ADIOS2
+     ! We split the communicator it to work asynchronously (MPMD)
++    ! and isolate each application before any Neko-side communicator setup.
+     call MPI_Comm_rank(MPI_COMM_WORLD, pe_rank, ierr)
+-    call MPI_Comm_split(MPI_COMM_WORLD, 0, pe_rank, NEKO_GLOBAL_COMM, ierr)
++    call MPI_Comm_split(MPI_COMM_WORLD, color, pe_rank, NEKO_GLOBAL_COMM, ierr)
+ #else
+     ! Original version duplicates the communicator:
+     call MPI_Comm_dup(MPI_COMM_WORLD, NEKO_GLOBAL_COMM, ierr)
