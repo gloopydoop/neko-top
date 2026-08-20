@@ -50,6 +50,8 @@ source functions.sh
 source "${MAIN_DIR}/scripts/mpmd_run_helpers.sh"
 
 export MPICH_GPU_SUPPORT_ENABLED=1
+# Cray MPICH requires this for srun --multi-prog MPMD jobs on LUMI-G.
+export MPICH_DMAPP_APP_IS_WORLD=1
 export ATP_ENABLED=true
 export NEKO_STARTUP_DELAY=${NEKO_STARTUP_DELAY:-20}
 export NEKO_RANKS_PER_NODE=${NEKO_RANKS_PER_NODE:-8}
