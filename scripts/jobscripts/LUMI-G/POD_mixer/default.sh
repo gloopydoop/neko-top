@@ -57,6 +57,10 @@ export NEKO_STARTUP_DELAY=${NEKO_STARTUP_DELAY:-20}
 export NEKO_RANKS_PER_NODE=${NEKO_RANKS_PER_NODE:-8}
 export PY_RANKS_PER_NODE=${PY_RANKS_PER_NODE:-48}
 export POD_MIXER_DEBUG=${POD_MIXER_DEBUG:-1}
+# Keep the MPMD ranks contiguous and let Slurm bind each rank to a core.
+# The older LUMI helper path did this explicitly; current Cray stacks appear
+# more sensitive to placement than the original branch was.
+export SRUN_MPMD_FLAGS=${SRUN_MPMD_FLAGS:---cpu-bind=cores --distribution=block:block}
 trap 'rm -f ./select_gpu ./mpmd.conf' EXIT
 
 function pod_mixer_write_debug_snapshot() {
