@@ -660,27 +660,19 @@ function find_neko() {
 
         fi
 
-        neko_patches=()
-        if [ -n "$ADIOS2_DIR" ]; then
-            neko_patches+=(
-                "$MAIN_DIR/scripts/patches/neko_adios2_mpmd_comm.patch"
-            )
-        fi
-
         # Apply Cray-specific patches before building on Cray systems
         if [[ -n "${CRAYPE_VERSION:-}" || "${PE_ENV:-}" == "CRAY" || -d "/opt/cray" ]]; then
-            neko_patches+=(
+            cray_patches=(
                 "patches/cce_stack.patch"
                 "patches/cce_time_state.patch"
                 "patches/cce_openmp.patch"
             )
+            for patch in "${cray_patches[@]}"; do
+                if git -C "$NEKO_DIR" apply --check "$patch" 2>/dev/null; then
+                    git -C "$NEKO_DIR" apply "$patch"
+                fi
+            done
         fi
-
-        for patch in "${neko_patches[@]}"; do
-            if git -C "$NEKO_DIR" apply --check "$patch" 2>/dev/null; then
-                git -C "$NEKO_DIR" apply "$patch"
-            fi
-        done
 
         # Determine available features
         FEATURES="--enable-contrib"
@@ -775,11 +767,13 @@ function find_neko() {
         cd $CURRENT_DIR
 
         # Revert the patches to keep the repository clean
-        for patch in "${neko_patches[@]}"; do
-            if git -C "$NEKO_DIR" apply --reverse --check "$patch" 2>/dev/null; then
-                git -C "$NEKO_DIR" apply --reverse "$patch"
-            fi
-        done
+        if [[ -n "${CRAYPE_VERSION:-}" || "${PE_ENV:-}" == "CRAY" || -d "/opt/cray" ]]; then
+            for patch in "${cray_patches[@]}"; do
+                if git -C "$NEKO_DIR" apply --reverse --check "$patch" 2>/dev/null; then
+                    git -C "$NEKO_DIR" apply --reverse "$patch"
+                fi
+            done
+        fi
     fi
 
     NEKO_LIB=$(find $NEKO_DIR -type d -name 'lib*' -maxdepth 1 \

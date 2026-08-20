@@ -111,22 +111,11 @@ if [ "${tasks_per_node}" -ne 56 ]; then
     exit 1
 fi
 
-if [ -f "${case_file}" ]; then
-    case_file=$(realpath "${case_file}")
-fi
-
-if [ -f "${python_script}" ]; then
-    python_script=$(realpath "${python_script}")
-fi
-
-if [ -x "${neko_exe}" ]; then
-    neko_exe=$(realpath "${neko_exe}")
-fi
-
 cat <<'EOF' > "${select_gpu_path}"
 #!/bin/bash
 
-export ROCR_VISIBLE_DEVICES=${SLURM_LOCALID:-0}
+export ROCR_VISIBLE_DEVICES=${SLURM_LOCALID}
+sleep "${NEKO_STARTUP_DELAY:-20}"
 exec "$@"
 EOF
 
