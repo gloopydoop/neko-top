@@ -14,6 +14,7 @@ TOTAL_RANKS=$((NEKO_RANKS + PY_RANKS))
 SHORT_TIMEOUT=${DEBUG_TIMEOUT_SHORT:-120}
 LONG_TIMEOUT=${DEBUG_TIMEOUT_LONG:-180}
 TEST_DIR=${DEBUG_TEST_DIR:-./debug_artifacts}
+NO_POD_CASE="${TEST_DIR}/debug_no_pod.case"
 
 mkdir -p "${TEST_DIR}"
 
@@ -146,9 +147,37 @@ exec "$@"
 EOF
 chmod +x "${TEST_DIR}/select_gpu_delay.sh"
 
+run_step "prepare_no_pod_case" "${PYTHON_BIN}" - "${CASE_FILE}" "${NO_POD_CASE}" <<'PY'
+import json
+import pathlib
+import sys
+
+src = pathlib.Path(sys.argv[1])
+dst = pathlib.Path(sys.argv[2])
+
+with src.open() as f:
+    case_data = json.load(f)
+
+case_data["state_recovery"] = {
+    "type": "checkpoint",
+    "enabled": False,
+}
+
+with dst.open("w") as f:
+    json.dump(case_data, f, indent=4)
+    f.write("\n")
+
+print(dst)
+PY
+
 cat > "${TEST_DIR}/mpmd_py_only.conf" <<EOF
 0-7 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_a.py
 8-55 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
+EOF
+
+cat > "${TEST_DIR}/mpmd_neko_no_pod_pyhello.conf" <<EOF
+0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/select_gpu_delay.sh ${NEKO_EXE} ${NO_POD_CASE}
+8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
 EOF
 
 cat > "${TEST_DIR}/mpmd_neko_pyhello.conf" <<EOF
@@ -175,6 +204,10 @@ run_step "single_program_python_mpi" timeout --foreground "${SHORT_TIMEOUT}s" \
     srun -n "${TOTAL_RANKS}" --label "${PYTHON_BIN}" "${TEST_DIR}/py_mpi_a.py"
 run_step "mpmd_python_only" timeout --foreground "${SHORT_TIMEOUT}s" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_py_only.conf"
+run_step "neko_no_pod_alone" timeout --foreground "${SHORT_TIMEOUT}s" \
+    srun -n "${NEKO_RANKS}" --label "${TEST_DIR}/select_gpu.sh" "${NEKO_EXE}" "${NO_POD_CASE}"
+run_step "neko_no_pod_pyhello_mpmd" timeout --foreground "${SHORT_TIMEOUT}s" \
+    srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_neko_no_pod_pyhello.conf"
 run_step "neko_alone" timeout --foreground "${SHORT_TIMEOUT}s" \
     srun -n "${NEKO_RANKS}" --label "${TEST_DIR}/select_gpu.sh" "${NEKO_EXE}" "${CASE_FILE}"
 run_step "neko_pyhello_mpmd" timeout --foreground "${SHORT_TIMEOUT}s" \
