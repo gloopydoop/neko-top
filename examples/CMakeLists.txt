@@ -51,6 +51,7 @@ add_subdirectory(${EXAMPLES_DIR}/unsteady_mixer)
 add_subdirectory(${EXAMPLES_DIR}/unsteady_rugby_ball)
 add_subdirectory(${EXAMPLES_DIR}/POD_mixer)
 add_subdirectory(${EXAMPLES_DIR}/POD_rugby_ball)
+add_subdirectory(${EXAMPLES_DIR}/debug)
 add_subdirectory(${EXAMPLES_DIR}/wiggles)
 
 # If the benchmark_mixer folder exists, add it as well

@@ -50,9 +50,5 @@ if [[ -z $(which genmeshbox) ]]; then
     exit 1
 fi
 
-if [ ! -f "./user.f90" ]; then
-    cp "${MAIN_DIR}/examples/POD_mixer/user.f90" ./user.f90
-fi
-
 echo "Generating mesh with dimensions: $Nx $Ny $Nz"
 genmeshbox 0 6 0 2 0 2 $Nx $Ny $Nz .false. .false. .false.
