@@ -50,6 +50,8 @@ trap 'rm -f ./select_gpu' EXIT
 source functions.sh
 
 export MPICH_GPU_SUPPORT_ENABLED=1
+# Cray MPICH on LUMI requires this for srun --multi-prog MPMD launches.
+export MPICH_DMAPP_APP_IS_WORLD=1
 export ATP_ENABLED=true
 
 # Match the working pySEMTools/checkpointing launch path: the example-local
