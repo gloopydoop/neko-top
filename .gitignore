@@ -9,6 +9,9 @@ examples/**/neko
 examples/debug/*
 !examples/debug/debug.case
 !examples/debug/CMakeLists.txt
+!examples/debug/prepare.sh
+!examples/debug/readme.md
+!examples/debug/run.sh
 
 # Translated unit test files
 tests/unit/**/*.F90
