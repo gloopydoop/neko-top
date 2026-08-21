@@ -12,7 +12,7 @@
 #SBATCH --mem=480GB
 
 # Time specifications (dd-hh:mm:ss)
-#SBATCH --time=00-00:30:00
+#SBATCH --time=00-01:00:00
 
 # Notification options
 #SBATCH --mail-type=END
@@ -59,5 +59,7 @@ export PY_RANKS="${PY_RANKS:-48}"
 export NEKO_STARTUP_DELAY="${NEKO_STARTUP_DELAY:-20}"
 export DEBUG_TIMEOUT_SHORT="${DEBUG_TIMEOUT_SHORT:-120}"
 export DEBUG_TIMEOUT_LONG="${DEBUG_TIMEOUT_LONG:-180}"
+export DEBUG_TIMEOUT_ATTEMPT="${DEBUG_TIMEOUT_ATTEMPT:-60}"
+export DEBUG_TIMEOUT_POD_ATTEMPT="${DEBUG_TIMEOUT_POD_ATTEMPT:-90}"
 
 run "$example"

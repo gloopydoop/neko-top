@@ -13,12 +13,15 @@ PY_RANKS=${PY_RANKS:-48}
 TOTAL_RANKS=$((NEKO_RANKS + PY_RANKS))
 SHORT_TIMEOUT=${DEBUG_TIMEOUT_SHORT:-120}
 LONG_TIMEOUT=${DEBUG_TIMEOUT_LONG:-180}
+ATTEMPT_TIMEOUT=${DEBUG_TIMEOUT_ATTEMPT:-60}
+POD_ATTEMPT_TIMEOUT=${DEBUG_TIMEOUT_POD_ATTEMPT:-90}
 TEST_DIR=${DEBUG_TEST_DIR:-./debug_artifacts}
 NO_POD_CASE="${TEST_DIR}/debug_no_pod.case"
 
 mkdir -p "${TEST_DIR}"
 
 source "${MAIN_DIR}/scripts/mpmd_run_helpers.sh"
+RUNTIME_ENV_FILE=${MPMD_RUNTIME_ENV_FILE:-"${MAIN_DIR}/build/mpmd_runtime.env"}
 
 declare -a STEP_NAMES=()
 declare -a STEP_RCS=()
@@ -82,6 +85,7 @@ env_log="${TEST_DIR}/environment.log"
     printf 'Neko ranks: %s\n' "${NEKO_RANKS}"
     printf 'Python ranks: %s\n' "${PY_RANKS}"
     printf 'Total ranks: %s\n' "${TOTAL_RANKS}"
+    printf 'Runtime env: %s\n' "${RUNTIME_ENV_FILE}"
     printf '\n--- Module List ---\n'
     module list 2>&1 || true
     printf '\n--- Runtime Environment ---\n'
@@ -147,6 +151,53 @@ exec "$@"
 EOF
 chmod +x "${TEST_DIR}/select_gpu_delay.sh"
 
+cat > "${TEST_DIR}/source_runtime_exec.sh" <<'EOF'
+#!/bin/bash
+runtime_env=$1
+shift
+source "${runtime_env}"
+exec "$@"
+EOF
+chmod +x "${TEST_DIR}/source_runtime_exec.sh"
+
+cat > "${TEST_DIR}/select_gpu_delay_source.sh" <<'EOF'
+#!/bin/bash
+runtime_env=$1
+shift
+source "${runtime_env}"
+export ROCR_VISIBLE_DEVICES=${SLURM_LOCALID:-0}
+sleep "${NEKO_STARTUP_DELAY:-20}"
+exec "$@"
+EOF
+chmod +x "${TEST_DIR}/select_gpu_delay_source.sh"
+
+cat > "${TEST_DIR}/run_mpmd_via_helper.sh" <<'EOF'
+#!/bin/bash
+set -uo pipefail
+
+main_dir=$1
+case_file=$2
+py_script=$3
+neko_exe=$4
+py_ranks=$5
+neko_ranks=$6
+program_log=$7
+
+source "${main_dir}/scripts/mpmd_run_helpers.sh"
+mpmd_prepare_python_runtime "${main_dir}" > /dev/null 2>&1
+
+mpmd_launch_shared "${case_file}" "${py_script}" "${neko_exe}" \
+    "${py_ranks}" "${neko_ranks}" "${program_log}"
+rc=$?
+
+if [ -f "${program_log}" ]; then
+    cat "${program_log}"
+fi
+
+exit "${rc}"
+EOF
+chmod +x "${TEST_DIR}/run_mpmd_via_helper.sh"
+
 run_step "prepare_no_pod_case" "${PYTHON_BIN}" - "${CASE_FILE}" "${NO_POD_CASE}" <<'PY'
 import json
 import pathlib
@@ -180,14 +231,44 @@ cat > "${TEST_DIR}/mpmd_neko_no_pod_pyhello.conf" <<EOF
 8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
 EOF
 
+cat > "${TEST_DIR}/mpmd_neko_no_pod_pyhello_pyfirst.conf" <<EOF
+0-47 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=${PY_RANKS} ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
+48-55 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=0 ${TEST_DIR}/select_gpu_delay.sh ${NEKO_EXE} ${NO_POD_CASE}
+EOF
+
+cat > "${TEST_DIR}/mpmd_neko_no_pod_pyhello_wrapped.conf" <<EOF
+0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/select_gpu_delay_source.sh ${RUNTIME_ENV_FILE} ${NEKO_EXE} ${NO_POD_CASE}
+8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${TEST_DIR}/source_runtime_exec.sh ${RUNTIME_ENV_FILE} ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
+EOF
+
 cat > "${TEST_DIR}/mpmd_neko_pyhello.conf" <<EOF
 0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/select_gpu_delay.sh ${NEKO_EXE} ${CASE_FILE}
 8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
 EOF
 
+cat > "${TEST_DIR}/mpmd_neko_pyhello_pyfirst.conf" <<EOF
+0-47 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=${PY_RANKS} ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
+48-55 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=0 ${TEST_DIR}/select_gpu_delay.sh ${NEKO_EXE} ${CASE_FILE}
+EOF
+
+cat > "${TEST_DIR}/mpmd_neko_pyhello_wrapped.conf" <<EOF
+0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/select_gpu_delay_source.sh ${RUNTIME_ENV_FILE} ${NEKO_EXE} ${CASE_FILE}
+8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${TEST_DIR}/source_runtime_exec.sh ${RUNTIME_ENV_FILE} ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
+EOF
+
 cat > "${TEST_DIR}/mpmd_pod_driver.conf" <<EOF
 0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/select_gpu_delay.sh ${NEKO_EXE} ${CASE_FILE}
 8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${PYTHON_SCRIPT} ${CASE_FILE}
+EOF
+
+cat > "${TEST_DIR}/mpmd_pod_driver_pyfirst.conf" <<EOF
+0-47 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=${PY_RANKS} ${PYTHON_BIN} ${PYTHON_SCRIPT} ${CASE_FILE}
+48-55 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=0 ${TEST_DIR}/select_gpu_delay.sh ${NEKO_EXE} ${CASE_FILE}
+EOF
+
+cat > "${TEST_DIR}/mpmd_pod_driver_wrapped.conf" <<EOF
+0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/select_gpu_delay_source.sh ${RUNTIME_ENV_FILE} ${NEKO_EXE} ${CASE_FILE}
+8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${TEST_DIR}/source_runtime_exec.sh ${RUNTIME_ENV_FILE} ${PYTHON_BIN} ${PYTHON_SCRIPT} ${CASE_FILE}
 EOF
 
 run_step "python_imports" "${PYTHON_BIN}" - <<'PY'
@@ -206,14 +287,40 @@ run_step "mpmd_python_only" timeout --foreground "${SHORT_TIMEOUT}s" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_py_only.conf"
 run_step "neko_no_pod_alone" timeout --foreground "${SHORT_TIMEOUT}s" \
     srun -n "${NEKO_RANKS}" --label "${TEST_DIR}/select_gpu.sh" "${NEKO_EXE}" "${NO_POD_CASE}"
+run_step "neko_no_pod_alone_block" timeout --foreground "${ATTEMPT_TIMEOUT}s" \
+    srun --distribution=block:block -n "${NEKO_RANKS}" --label "${TEST_DIR}/select_gpu.sh" "${NEKO_EXE}" "${NO_POD_CASE}"
+run_step "neko_no_pod_alone_gpu_bind" timeout --foreground "${ATTEMPT_TIMEOUT}s" \
+    srun --gpus-per-task=1 --gpu-bind=closest -n "${NEKO_RANKS}" --label "${TEST_DIR}/select_gpu.sh" "${NEKO_EXE}" "${NO_POD_CASE}"
 run_step "neko_no_pod_pyhello_mpmd" timeout --foreground "${SHORT_TIMEOUT}s" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_neko_no_pod_pyhello.conf"
+run_step "neko_no_pod_pyhello_mpmd_block" timeout --foreground "${ATTEMPT_TIMEOUT}s" \
+    srun --distribution=block:block -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_neko_no_pod_pyhello.conf"
+run_step "neko_no_pod_pyhello_mpmd_pyfirst" timeout --foreground "${ATTEMPT_TIMEOUT}s" \
+    srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_neko_no_pod_pyhello_pyfirst.conf"
+run_step "neko_no_pod_pyhello_mpmd_wrapped" timeout --foreground "${ATTEMPT_TIMEOUT}s" \
+    srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_neko_no_pod_pyhello_wrapped.conf"
+run_step "neko_no_pod_pyhello_helper" timeout --foreground "${ATTEMPT_TIMEOUT}s" \
+    "${TEST_DIR}/run_mpmd_via_helper.sh" "${MAIN_DIR}" "${NO_POD_CASE}" "${TEST_DIR}/py_mpi_b.py" "${NEKO_EXE}" "${PY_RANKS}" "${NEKO_RANKS}" "${TEST_DIR}/helper_no_pod_pyhello_program.log"
 run_step "neko_alone" timeout --foreground "${SHORT_TIMEOUT}s" \
     srun -n "${NEKO_RANKS}" --label "${TEST_DIR}/select_gpu.sh" "${NEKO_EXE}" "${CASE_FILE}"
 run_step "neko_pyhello_mpmd" timeout --foreground "${SHORT_TIMEOUT}s" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_neko_pyhello.conf"
+run_step "neko_pyhello_mpmd_block" timeout --foreground "${ATTEMPT_TIMEOUT}s" \
+    srun --distribution=block:block -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_neko_pyhello.conf"
+run_step "neko_pyhello_mpmd_pyfirst" timeout --foreground "${ATTEMPT_TIMEOUT}s" \
+    srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_neko_pyhello_pyfirst.conf"
+run_step "neko_pyhello_mpmd_wrapped" timeout --foreground "${ATTEMPT_TIMEOUT}s" \
+    srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_neko_pyhello_wrapped.conf"
 run_step "pod_driver_mpmd" timeout --foreground "${LONG_TIMEOUT}s" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_pod_driver.conf"
+run_step "pod_driver_mpmd_block" timeout --foreground "${POD_ATTEMPT_TIMEOUT}s" \
+    srun --distribution=block:block -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_pod_driver.conf"
+run_step "pod_driver_mpmd_pyfirst" timeout --foreground "${POD_ATTEMPT_TIMEOUT}s" \
+    srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_pod_driver_pyfirst.conf"
+run_step "pod_driver_mpmd_wrapped" timeout --foreground "${POD_ATTEMPT_TIMEOUT}s" \
+    srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog "${TEST_DIR}/mpmd_pod_driver_wrapped.conf"
+run_step "pod_driver_helper" timeout --foreground "${POD_ATTEMPT_TIMEOUT}s" \
+    "${TEST_DIR}/run_mpmd_via_helper.sh" "${MAIN_DIR}" "${CASE_FILE}" "${PYTHON_SCRIPT}" "${NEKO_EXE}" "${PY_RANKS}" "${NEKO_RANKS}" "${TEST_DIR}/helper_pod_driver_program.log"
 
 summary_file="${TEST_DIR}/summary.txt"
 print_section "SUMMARY"
