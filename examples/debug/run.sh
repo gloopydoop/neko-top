@@ -117,6 +117,23 @@ function skip_step() {
     record_step_rc "${name}" "SKIP"
 }
 
+function finish_debug() {
+    local summary_file="${TEST_DIR}/summary.txt"
+
+    print_section "SUMMARY"
+    {
+        printf '%-32s %s\n' "step" "rc"
+        for idx in "${!STEP_NAMES[@]}"; do
+            printf '%-32s %s\n' "${STEP_NAMES[$idx]}" "${STEP_RCS[$idx]}"
+        done
+    } > "${summary_file}"
+    cat "${summary_file}"
+
+    printf "\nArtifacts written to %s\n" "${TEST_DIR}"
+    printf "This reduced debug example exits successfully so the framework archives the logs.\n"
+    exit 0
+}
+
 function resolve_optional_binary() {
     local candidate
 
@@ -202,29 +219,6 @@ env_log="${TEST_DIR}/environment.log"
 cat "${env_log}"
 record_step_rc "environment" 0
 
-MPI4PY_SO=$("${PYTHON_BIN}" - <<'PY'
-import pathlib
-import mpi4py.MPI
-print(pathlib.Path(mpi4py.MPI.__file__).resolve())
-PY
-)
-
-ADIOS2_BINDINGS=$("${PYTHON_BIN}" - <<'PY'
-import pathlib
-import adios2.bindings
-print(pathlib.Path(adios2.bindings.__file__).resolve())
-PY
-)
-
-FORTRAN_MPI_EXE="${TEST_DIR}/fortran_mpi_hello"
-FORTRAN_SPLIT_EXE="${TEST_DIR}/fortran_split_peer"
-
-cat > "${TEST_DIR}/py_mpi_a.py" <<'EOF'
-from mpi4py import MPI
-comm = MPI.COMM_WORLD
-print(f"A rank {comm.rank} / {comm.size}", flush=True)
-EOF
-
 cat > "${TEST_DIR}/py_mpi_b.py" <<'EOF'
 from mpi4py import MPI
 comm = MPI.COMM_WORLD
@@ -260,83 +254,6 @@ sleep "${HELPER_SLEEP_SECONDS:-30}"
 EOF
 chmod +x "${TEST_DIR}/helper_sleep.sh"
 
-cat > "${TEST_DIR}/fortran_mpi_hello.f90" <<'EOF'
-program fortran_mpi_hello
-  use mpi_f08
-  implicit none
-
-  integer :: ierr
-  integer :: rank
-  integer :: size
-
-  call MPI_Init(ierr)
-  call MPI_Comm_rank(MPI_COMM_WORLD, rank, ierr)
-  call MPI_Comm_size(MPI_COMM_WORLD, size, ierr)
-  write (*,'(a,i0,a,i0)') 'F rank ', rank, ' / ', size
-  call MPI_Barrier(MPI_COMM_WORLD, ierr)
-  call MPI_Finalize(ierr)
-end program fortran_mpi_hello
-EOF
-
-cat > "${TEST_DIR}/fortran_split_peer.f90" <<'EOF'
-program fortran_split_peer
-  use mpi_f08
-  implicit none
-
-  character(len=32) :: env_value
-  integer :: color
-  integer :: env_len
-  integer :: ierr
-  integer :: rank
-  integer :: size
-  integer :: local_rank
-  integer :: local_size
-  integer :: status
-  type(MPI_Comm) :: local_comm
-
-  call MPI_Init(ierr)
-  call MPI_Comm_rank(MPI_COMM_WORLD, rank, ierr)
-  call MPI_Comm_size(MPI_COMM_WORLD, size, ierr)
-
-  color = 0
-  env_value = ''
-  call get_environment_variable('NEKO_COMM_ID', env_value, env_len, status)
-  if (status .eq. 0 .and. env_len .gt. 0) then
-     read (env_value(1:env_len), *, iostat=ierr) color
-     if (ierr .ne. 0) color = 0
-  end if
-
-  call MPI_Comm_split(MPI_COMM_WORLD, color, rank, local_comm, ierr)
-  call MPI_Comm_rank(local_comm, local_rank, ierr)
-  call MPI_Comm_size(local_comm, local_size, ierr)
-
-  write (*,'(a,i0,a,i0,a,i0,a,i0,a,i0)') &
-       'fortran_split world_rank=', rank, &
-       ' world_size=', size, &
-       ' local_rank=', local_rank, &
-       ' local_size=', local_size, &
-       ' color=', color
-
-  call MPI_Barrier(MPI_COMM_WORLD, ierr)
-  call MPI_Comm_free(local_comm, ierr)
-  call MPI_Finalize(ierr)
-end program fortran_split_peer
-EOF
-
-cat > "${TEST_DIR}/binary_report.sh" <<'EOF'
-#!/bin/bash
-set -eu
-
-binary=$1
-
-file "${binary}"
-ls -lh "${binary}"
-sha256sum "${binary}"
-strings "${binary}" | grep -m1 '(build:' || true
-readelf -d "${binary}" | grep -E 'NEEDED|RPATH|RUNPATH'
-EOF
-chmod +x "${TEST_DIR}/binary_report.sh"
-
 cat > "${TEST_DIR}/run_neko_env.sh" <<'EOF'
 #!/bin/bash
 export MPICH_DMAPP_APP_IS_WORLD=${MPICH_DMAPP_APP_IS_WORLD:-1}
@@ -366,15 +283,6 @@ export MPICH_GPU_SUPPORT_ENABLED=0
 exec "$@"
 EOF
 chmod +x "${TEST_DIR}/run_python_host_env.sh"
-
-cat > "${TEST_DIR}/select_gpu_force.sh" <<'EOF'
-#!/bin/bash
-if [ "${DEBUG_USE_GPU:-1}" = "1" ]; then
-    export ROCR_VISIBLE_DEVICES=${SLURM_LOCALID:-0}
-fi
-exec "$@"
-EOF
-chmod +x "${TEST_DIR}/select_gpu_force.sh"
 
 cat > "${TEST_DIR}/select_gpu_preserve.sh" <<'EOF'
 #!/bin/bash
@@ -435,39 +343,19 @@ print(f"no_pod_case={no_pod_dst}")
 print(f"smoke_end_time={end_time}")
 PY
 
-cat > "${TEST_DIR}/mpmd_py_only.conf" <<EOF
-0-7 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_a.py
-8-55 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
-EOF
-
-cat > "${TEST_DIR}/mpmd_fortran_python.conf" <<EOF
-0-7 ${FORTRAN_MPI_EXE}
-8-55 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
-EOF
-
-cat > "${TEST_DIR}/mpmd_fortran_splitpeer.conf" <<EOF
-0-7 /usr/bin/env NEKO_COMM_ID=0 ${FORTRAN_SPLIT_EXE}
-8-55 /usr/bin/env NEKO_COMM_ID=1 ${PYTHON_BIN} ${TEST_DIR}/py_split_peer.py
-EOF
+run_step "verify_current_neko" test -x "${CURRENT_NEKO_EXE}"
+if [ "${STEP_RC_MAP[verify_current_neko]:-1}" != "0" ]; then
+    finish_debug
+fi
 
 cat > "${TEST_DIR}/mpmd_current_no_pod.conf" <<EOF
 0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_mpmd_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
 8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
 EOF
 
-cat > "${TEST_DIR}/mpmd_current_pod.conf" <<EOF
-0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_mpmd_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${SMOKE_CASE}
-8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${PYTHON_SCRIPT} ${SMOKE_CASE}
-EOF
-
 cat > "${TEST_DIR}/mpmd_current_no_pod_helpers.conf" <<EOF
 0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_mpmd_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
 8-55 ${TEST_DIR}/helper_sleep.sh
-EOF
-
-cat > "${TEST_DIR}/mpmd_current_no_pod_small.conf" <<EOF
-0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_mpmd_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
-8-$((SMALL_TOTAL_RANKS - 1)) /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
 EOF
 
 cat > "${TEST_DIR}/mpmd_current_no_pod_splitpeer.conf" <<EOF
@@ -480,270 +368,55 @@ cat > "${TEST_DIR}/mpmd_current_no_pod_hostpy.conf" <<EOF
 8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${TEST_DIR}/run_python_host_env.sh ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
 EOF
 
-if [ -n "${WORKING_NEKO_EXE:-}" ]; then
-    cat > "${TEST_DIR}/mpmd_working_no_pod.conf" <<EOF
-0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${WORKING_NEKO_EXE} ${NO_POD_CASE}
-8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
-EOF
-
-    cat > "${TEST_DIR}/mpmd_working_pod.conf" <<EOF
-0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${WORKING_NEKO_EXE} ${SMOKE_CASE}
-8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${PYTHON_SCRIPT} ${SMOKE_CASE}
-EOF
-fi
-
-if [ -n "${NODEVICE_NEKO_EXE:-}" ]; then
-    cat > "${TEST_DIR}/mpmd_nodevice_no_pod.conf" <<EOF
-0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${NODEVICE_NEKO_EXE} ${NO_POD_CASE}
-8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
-EOF
-
-    cat > "${TEST_DIR}/mpmd_nodevice_pod.conf" <<EOF
-0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${NODEVICE_NEKO_EXE} ${SMOKE_CASE}
-8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${PYTHON_SCRIPT} ${SMOKE_CASE}
-EOF
-fi
-
-run_step "python_imports" "${PYTHON_BIN}" - <<'PY'
-from mpi4py import MPI
-import adios2.bindings
-print(MPI.Get_library_version())
-print(adios2.bindings.__file__)
-PY
-
-run_step "build_fortran_mpi_probe" \
-    "${MPIFC:-ftn}" -O0 "${TEST_DIR}/fortran_mpi_hello.f90" -o "${FORTRAN_MPI_EXE}"
-
-run_step "build_fortran_split_probe" \
-    "${MPIFC:-ftn}" -O0 "${TEST_DIR}/fortran_split_peer.f90" -o "${FORTRAN_SPLIT_EXE}"
-
-run_step "srun_mpi_list" srun --mpi=list
-run_step "mpi4py_ldd" ldd "${MPI4PY_SO}"
-run_step "binary_current" "${TEST_DIR}/binary_report.sh" "${CURRENT_NEKO_EXE}"
-
-if [ -n "${WORKING_NEKO_EXE:-}" ]; then
-    run_step "binary_working" "${TEST_DIR}/binary_report.sh" "${WORKING_NEKO_EXE}"
-    run_step "binary_compare_current_working" "${PYTHON_BIN}" - "${CURRENT_NEKO_EXE}" "${WORKING_NEKO_EXE}" <<'PY'
-import pathlib
-import re
-import subprocess
-import sys
-
-pattern = re.compile(r"Shared library: \[(.*?)\]")
-rpath_pattern = re.compile(r"Library (?:rpath|runpath): \[(.*?)\]")
-
-def inspect(path):
-    out = subprocess.check_output(["readelf", "-d", path], text=True)
-    return {
-        "needed": sorted(set(pattern.findall(out))),
-        "rpath": rpath_pattern.findall(out),
-    }
-
-left = inspect(sys.argv[1])
-right = inspect(sys.argv[2])
-
-print(f"current_only={sorted(set(left['needed']) - set(right['needed']))}")
-print(f"working_only={sorted(set(right['needed']) - set(left['needed']))}")
-print(f"current_rpath={left['rpath']}")
-print(f"working_rpath={right['rpath']}")
-PY
-else
-    skip_step "binary_working" "No working control binary available."
-    skip_step "binary_compare_current_working" \
-        "No working control binary available."
-fi
-
-if [ -n "${BAD_NEKO_EXE:-}" ]; then
-    run_step "binary_bad" "${TEST_DIR}/binary_report.sh" "${BAD_NEKO_EXE}"
-else
-    skip_step "binary_bad" "No bad control binary available."
-fi
-
-if [ -n "${NODEVICE_NEKO_EXE:-}" ]; then
-    run_step "binary_nodevice" "${TEST_DIR}/binary_report.sh" "${NODEVICE_NEKO_EXE}"
-else
-    skip_step "binary_nodevice" "No no-device-MPI binary available."
-fi
-
-run_step "mpmd_python_only" timeout --foreground "${SHORT_TIMEOUT}s" \
-    srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-    "${TEST_DIR}/mpmd_py_only.conf"
-
-if [ "${STEP_RC_MAP[build_fortran_mpi_probe]:-1}" = "0" ]; then
-    run_step "binary_fortran_mpi_probe" "${TEST_DIR}/binary_report.sh" "${FORTRAN_MPI_EXE}"
-    run_step "mpmd_fortran_python_only" timeout --foreground "${SHORT_TIMEOUT}s" \
-        srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-        "${TEST_DIR}/mpmd_fortran_python.conf"
-else
-    skip_step "binary_fortran_mpi_probe" "Fortran MPI probe did not build."
-    skip_step "mpmd_fortran_python_only" "Fortran MPI probe did not build."
-fi
-
-if [ "${STEP_RC_MAP[build_fortran_split_probe]:-1}" = "0" ]; then
-    run_step "binary_fortran_split_probe" "${TEST_DIR}/binary_report.sh" "${FORTRAN_SPLIT_EXE}"
-    run_step "mpmd_fortran_splitpeer" timeout --foreground "${SHORT_TIMEOUT}s" \
-        srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-        "${TEST_DIR}/mpmd_fortran_splitpeer.conf"
-else
-    skip_step "binary_fortran_split_probe" "Fortran split-peer probe did not build."
-    skip_step "mpmd_fortran_splitpeer" "Fortran split-peer probe did not build."
-fi
-
-run_neko_step "current_no_pod_alone_wrapper" "${SHORT_TIMEOUT}" \
-    srun -n "${NEKO_RANKS}" --label \
-    "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_force.sh" \
-    "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
-
 run_neko_step "current_no_pod_alone_docs" "${SHORT_TIMEOUT}" \
     srun "${STANDALONE_DOCS_ARGS[@]}" \
     "${TEST_DIR}/run_neko_env.sh" "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
-
-run_neko_step "current_no_pod_alone_docs_preserve" "${SHORT_TIMEOUT}" \
-    srun "${STANDALONE_DOCS_ARGS[@]}" \
-    "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_preserve.sh" \
-    "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
-
-run_neko_step "current_no_pod_alone_docs_wrapper" "${SHORT_TIMEOUT}" \
-    srun "${STANDALONE_WRAPPER_ARGS[@]}" \
-    "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_force.sh" \
-    "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
-
-if [ "${DEBUG_USE_GPU}" = "1" ]; then
-    run_neko_step "current_no_pod_alone_mask_wrapper" "${SHORT_TIMEOUT}" \
-        srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
-        --cpu-bind="${DOCS_CPU_MASK}" --gres-flags=allow-task-sharing --label \
-        "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_force.sh" \
-        "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
-else
-    skip_step "current_no_pod_alone_mask_wrapper" \
-        "Skipped in CPU debug mode."
-fi
-
-if [ -n "${WORKING_NEKO_EXE:-}" ]; then
-    run_neko_step "working_no_pod_alone_docs" "${SHORT_TIMEOUT}" \
-        srun "${STANDALONE_DOCS_ARGS[@]}" \
-        "${TEST_DIR}/run_neko_env.sh" "${WORKING_NEKO_EXE}" "${NO_POD_CASE}"
-else
-    skip_step "working_no_pod_alone_docs" "No working control binary available."
-fi
-
-if [ -n "${NODEVICE_NEKO_EXE:-}" ]; then
-    run_neko_step "nodevice_no_pod_alone_docs" "${SHORT_TIMEOUT}" \
-        srun "${STANDALONE_DOCS_ARGS[@]}" \
-        "${TEST_DIR}/run_neko_env.sh" "${NODEVICE_NEKO_EXE}" "${NO_POD_CASE}"
-else
-    skip_step "nodevice_no_pod_alone_docs" "No no-device-MPI binary available."
+if [ "${STEP_RC_MAP[current_no_pod_alone_docs]:-1}" != "0" ]; then
+    skip_step "current_no_pod_mpmd_helpers" \
+        "Skipped because standalone current Neko failed."
+    skip_step "current_no_pod_mpmd_splitpeer" \
+        "Skipped because standalone current Neko failed."
+    skip_step "current_no_pod_mpmd_hostpy" \
+        "Skipped because standalone current Neko failed."
+    skip_step "current_no_pod_mpmd" \
+        "Skipped because standalone current Neko failed."
+    finish_debug
 fi
 
 run_neko_step "current_no_pod_mpmd_helpers" "${ATTEMPT_TIMEOUT}" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
     "${TEST_DIR}/mpmd_current_no_pod_helpers.conf"
-
-run_neko_step "current_no_pod_mpmd_helpers_shasta" "${ATTEMPT_TIMEOUT}" \
-    srun --mpi=cray_shasta -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-    "${TEST_DIR}/mpmd_current_no_pod_helpers.conf"
-
-run_neko_step "current_no_pod_mpmd_helpers_pmi2" "${ATTEMPT_TIMEOUT}" \
-    srun --mpi=pmi2 -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-    "${TEST_DIR}/mpmd_current_no_pod_helpers.conf"
-
 if [ "${STEP_RC_MAP[current_no_pod_mpmd_helpers]:-1}" != "0" ]; then
-    run_neko_step "current_no_pod_mpmd_helpers_env_display" "${ATTEMPT_TIMEOUT}" \
-        env MPICH_ENV_DISPLAY=1 MPICH_VERSION_DISPLAY=1 MPICH_CPUMASK_DISPLAY=1 \
-        MPICH_ABORT_ON_ERROR=1 \
-        srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-        "${TEST_DIR}/mpmd_current_no_pod_helpers.conf"
-else
-    skip_step "current_no_pod_mpmd_helpers_env_display" \
-        "Skipped because current_no_pod_mpmd_helpers already passed."
+    skip_step "current_no_pod_mpmd_splitpeer" \
+        "Skipped because helper MPMD already failed."
+    skip_step "current_no_pod_mpmd_hostpy" \
+        "Skipped because helper MPMD already failed."
+    skip_step "current_no_pod_mpmd" \
+        "Skipped because helper MPMD already failed."
+    finish_debug
 fi
-
-run_neko_step "current_no_pod_mpmd_small" "${ATTEMPT_TIMEOUT}" \
-    srun --exact -n "${SMALL_TOTAL_RANKS}" --label \
-    --unbuffered --multi-prog "${TEST_DIR}/mpmd_current_no_pod_small.conf"
 
 run_neko_step "current_no_pod_mpmd_splitpeer" "${ATTEMPT_TIMEOUT}" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
     "${TEST_DIR}/mpmd_current_no_pod_splitpeer.conf"
-
-run_neko_step "current_no_pod_mpmd_splitpeer_shasta" "${ATTEMPT_TIMEOUT}" \
-    srun --mpi=cray_shasta -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-    "${TEST_DIR}/mpmd_current_no_pod_splitpeer.conf"
-
-run_neko_step "current_no_pod_mpmd_splitpeer_pmi2" "${ATTEMPT_TIMEOUT}" \
-    srun --mpi=pmi2 -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-    "${TEST_DIR}/mpmd_current_no_pod_splitpeer.conf"
+if [ "${STEP_RC_MAP[current_no_pod_mpmd_splitpeer]:-1}" != "0" ]; then
+    skip_step "current_no_pod_mpmd_hostpy" \
+        "Skipped because split-peer MPMD already failed."
+    skip_step "current_no_pod_mpmd" \
+        "Skipped because split-peer MPMD already failed."
+    finish_debug
+fi
 
 run_neko_step "current_no_pod_mpmd_hostpy" "${ATTEMPT_TIMEOUT}" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
     "${TEST_DIR}/mpmd_current_no_pod_hostpy.conf"
-
-run_neko_step "current_no_pod_mpmd_hostpy_shasta" "${ATTEMPT_TIMEOUT}" \
-    srun --mpi=cray_shasta -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-    "${TEST_DIR}/mpmd_current_no_pod_hostpy.conf"
-
-run_neko_step "current_no_pod_mpmd_hostpy_pmi2" "${ATTEMPT_TIMEOUT}" \
-    srun --mpi=pmi2 -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-    "${TEST_DIR}/mpmd_current_no_pod_hostpy.conf"
+if [ "${STEP_RC_MAP[current_no_pod_mpmd_hostpy]:-1}" != "0" ]; then
+    skip_step "current_no_pod_mpmd" \
+        "Skipped because host-Python MPMD already failed."
+    finish_debug
+fi
 
 run_neko_step "current_no_pod_mpmd" "${LONG_TIMEOUT}" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
     "${TEST_DIR}/mpmd_current_no_pod.conf"
-
-if [ -n "${WORKING_NEKO_EXE:-}" ]; then
-    run_neko_step "working_no_pod_mpmd" "${LONG_TIMEOUT}" \
-        srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-        "${TEST_DIR}/mpmd_working_no_pod.conf"
-else
-    skip_step "working_no_pod_mpmd" "No working control binary available."
-fi
-
-if [ -n "${NODEVICE_NEKO_EXE:-}" ]; then
-    run_neko_step "nodevice_no_pod_mpmd" "${LONG_TIMEOUT}" \
-        srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-        "${TEST_DIR}/mpmd_nodevice_no_pod.conf"
-else
-    skip_step "nodevice_no_pod_mpmd" "No no-device-MPI binary available."
-fi
-
-if [ "${STEP_RC_MAP[current_no_pod_mpmd]:-1}" = "0" ]; then
-    run_neko_step "current_pod_mpmd" "${LONG_TIMEOUT}" \
-        srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-        "${TEST_DIR}/mpmd_current_pod.conf"
-else
-    skip_step "current_pod_mpmd" \
-        "Skipped because current_no_pod_mpmd did not pass."
-fi
-
-if [ "${STEP_RC_MAP[working_no_pod_mpmd]:-1}" = "0" ]; then
-    run_neko_step "working_pod_mpmd" "${LONG_TIMEOUT}" \
-        srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-        "${TEST_DIR}/mpmd_working_pod.conf"
-else
-    skip_step "working_pod_mpmd" \
-        "Skipped because working_no_pod_mpmd did not pass."
-fi
-
-if [ "${STEP_RC_MAP[nodevice_no_pod_mpmd]:-1}" = "0" ]; then
-    run_neko_step "nodevice_pod_mpmd" "${LONG_TIMEOUT}" \
-        srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
-        "${TEST_DIR}/mpmd_nodevice_pod.conf"
-else
-    skip_step "nodevice_pod_mpmd" \
-        "Skipped because nodevice_no_pod_mpmd did not pass."
-fi
-
-summary_file="${TEST_DIR}/summary.txt"
-print_section "SUMMARY"
-{
-    printf '%-32s %s\n' "step" "rc"
-    for idx in "${!STEP_NAMES[@]}"; do
-        printf '%-32s %s\n' "${STEP_NAMES[$idx]}" "${STEP_RCS[$idx]}"
-    done
-} > "${summary_file}"
-cat "${summary_file}"
-
-printf "\nArtifacts written to %s\n" "${TEST_DIR}"
-printf "This debug example always exits successfully so the framework archives the logs.\n"
-
-exit 0
+finish_debug
