@@ -11,6 +11,7 @@ CURRENT_NEKO_EXE=${NEKO_BIN:-./neko}
 NEKO_RANKS=${NEKO_RANKS:-8}
 PY_RANKS=${PY_RANKS:-48}
 TOTAL_RANKS=$((NEKO_RANKS + PY_RANKS))
+DEBUG_USE_GPU=${DEBUG_USE_GPU:-1}
 SHORT_TIMEOUT=${DEBUG_TIMEOUT_SHORT:-60}
 LONG_TIMEOUT=${DEBUG_TIMEOUT_LONG:-120}
 ATTEMPT_TIMEOUT=${DEBUG_TIMEOUT_ATTEMPT:-60}
@@ -29,6 +30,24 @@ mkdir -p "${TEST_DIR}"
 
 source "${MAIN_DIR}/scripts/mpmd_run_helpers.sh"
 RUNTIME_ENV_FILE=${MPMD_RUNTIME_ENV_FILE:-"${MAIN_DIR}/build/mpmd_runtime.env"}
+
+if [ "${DEBUG_USE_GPU}" = "1" ]; then
+    STANDALONE_DOCS_ARGS=(
+        --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}"
+        --cpu-bind="${DOCS_CPU_BIND}" --gpu-bind="map:${DOCS_GPU_MAP}"
+        --gres-flags=allow-task-sharing --label
+    )
+    STANDALONE_WRAPPER_ARGS=(
+        --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}"
+        --cpu-bind="${DOCS_CPU_BIND}" --gres-flags=allow-task-sharing --label
+    )
+else
+    STANDALONE_DOCS_ARGS=(
+        --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}"
+        --cpu-bind="${DOCS_CPU_BIND}" --label
+    )
+    STANDALONE_WRAPPER_ARGS=("${STANDALONE_DOCS_ARGS[@]}")
+fi
 
 declare -a STEP_NAMES=()
 declare -a STEP_RCS=()
@@ -153,6 +172,7 @@ env_log="${TEST_DIR}/environment.log"
     printf 'Neko ranks: %s\n' "${NEKO_RANKS}"
     printf 'Python ranks: %s\n' "${PY_RANKS}"
     printf 'Total ranks: %s\n' "${TOTAL_RANKS}"
+    printf 'Debug use GPU: %s\n' "${DEBUG_USE_GPU}"
     printf 'Smoke steps: %s\n' "${SMOKE_STEPS}"
     printf 'LUMI GPU map: %s\n' "${DOCS_GPU_MAP}"
     printf 'LUMI cpu-bind: %s\n' "${DOCS_CPU_BIND}"
@@ -196,6 +216,9 @@ print(pathlib.Path(adios2.bindings.__file__).resolve())
 PY
 )
 
+FORTRAN_MPI_EXE="${TEST_DIR}/fortran_mpi_hello"
+FORTRAN_SPLIT_EXE="${TEST_DIR}/fortran_split_peer"
+
 cat > "${TEST_DIR}/py_mpi_a.py" <<'EOF'
 from mpi4py import MPI
 comm = MPI.COMM_WORLD
@@ -236,6 +259,69 @@ echo "helper rank ${SLURM_PROCID:-?} / local ${SLURM_LOCALID:-?}" >&2
 sleep "${HELPER_SLEEP_SECONDS:-30}"
 EOF
 chmod +x "${TEST_DIR}/helper_sleep.sh"
+
+cat > "${TEST_DIR}/fortran_mpi_hello.f90" <<'EOF'
+program fortran_mpi_hello
+  use mpi_f08
+  implicit none
+
+  integer :: ierr
+  integer :: rank
+  integer :: size
+
+  call MPI_Init(ierr)
+  call MPI_Comm_rank(MPI_COMM_WORLD, rank, ierr)
+  call MPI_Comm_size(MPI_COMM_WORLD, size, ierr)
+  write (*,'(a,i0,a,i0)') 'F rank ', rank, ' / ', size
+  call MPI_Barrier(MPI_COMM_WORLD, ierr)
+  call MPI_Finalize(ierr)
+end program fortran_mpi_hello
+EOF
+
+cat > "${TEST_DIR}/fortran_split_peer.f90" <<'EOF'
+program fortran_split_peer
+  use mpi_f08
+  implicit none
+
+  character(len=32) :: env_value
+  integer :: color
+  integer :: env_len
+  integer :: ierr
+  integer :: rank
+  integer :: size
+  integer :: local_rank
+  integer :: local_size
+  integer :: status
+  type(MPI_Comm) :: local_comm
+
+  call MPI_Init(ierr)
+  call MPI_Comm_rank(MPI_COMM_WORLD, rank, ierr)
+  call MPI_Comm_size(MPI_COMM_WORLD, size, ierr)
+
+  color = 0
+  env_value = ''
+  call get_environment_variable('NEKO_COMM_ID', env_value, env_len, status)
+  if (status .eq. 0 .and. env_len .gt. 0) then
+     read (env_value(1:env_len), *, iostat=ierr) color
+     if (ierr .ne. 0) color = 0
+  end if
+
+  call MPI_Comm_split(MPI_COMM_WORLD, color, rank, local_comm, ierr)
+  call MPI_Comm_rank(local_comm, local_rank, ierr)
+  call MPI_Comm_size(local_comm, local_size, ierr)
+
+  write (*,'(a,i0,a,i0,a,i0,a,i0,a,i0)') &
+       'fortran_split world_rank=', rank, &
+       ' world_size=', size, &
+       ' local_rank=', local_rank, &
+       ' local_size=', local_size, &
+       ' color=', color
+
+  call MPI_Barrier(MPI_COMM_WORLD, ierr)
+  call MPI_Comm_free(local_comm, ierr)
+  call MPI_Finalize(ierr)
+end program fortran_split_peer
+EOF
 
 cat > "${TEST_DIR}/binary_report.sh" <<'EOF'
 #!/bin/bash
@@ -283,14 +369,16 @@ chmod +x "${TEST_DIR}/run_python_host_env.sh"
 
 cat > "${TEST_DIR}/select_gpu_force.sh" <<'EOF'
 #!/bin/bash
-export ROCR_VISIBLE_DEVICES=${SLURM_LOCALID:-0}
+if [ "${DEBUG_USE_GPU:-1}" = "1" ]; then
+    export ROCR_VISIBLE_DEVICES=${SLURM_LOCALID:-0}
+fi
 exec "$@"
 EOF
 chmod +x "${TEST_DIR}/select_gpu_force.sh"
 
 cat > "${TEST_DIR}/select_gpu_preserve.sh" <<'EOF'
 #!/bin/bash
-if [ -z "${ROCR_VISIBLE_DEVICES:-}" ]; then
+if [ "${DEBUG_USE_GPU:-1}" = "1" ] && [ -z "${ROCR_VISIBLE_DEVICES:-}" ]; then
     export ROCR_VISIBLE_DEVICES=${SLURM_LOCALID:-0}
 fi
 exec "$@"
@@ -350,6 +438,16 @@ PY
 cat > "${TEST_DIR}/mpmd_py_only.conf" <<EOF
 0-7 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_a.py
 8-55 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
+EOF
+
+cat > "${TEST_DIR}/mpmd_fortran_python.conf" <<EOF
+0-7 ${FORTRAN_MPI_EXE}
+8-55 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
+EOF
+
+cat > "${TEST_DIR}/mpmd_fortran_splitpeer.conf" <<EOF
+0-7 /usr/bin/env NEKO_COMM_ID=0 ${FORTRAN_SPLIT_EXE}
+8-55 /usr/bin/env NEKO_COMM_ID=1 ${PYTHON_BIN} ${TEST_DIR}/py_split_peer.py
 EOF
 
 cat > "${TEST_DIR}/mpmd_current_no_pod.conf" <<EOF
@@ -413,6 +511,12 @@ print(MPI.Get_library_version())
 print(adios2.bindings.__file__)
 PY
 
+run_step "build_fortran_mpi_probe" \
+    "${MPIFC:-ftn}" -O0 "${TEST_DIR}/fortran_mpi_hello.f90" -o "${FORTRAN_MPI_EXE}"
+
+run_step "build_fortran_split_probe" \
+    "${MPIFC:-ftn}" -O0 "${TEST_DIR}/fortran_split_peer.f90" -o "${FORTRAN_SPLIT_EXE}"
+
 run_step "srun_mpi_list" srun --mpi=list
 run_step "mpi4py_ldd" ldd "${MPI4PY_SO}"
 run_step "binary_current" "${TEST_DIR}/binary_report.sh" "${CURRENT_NEKO_EXE}"
@@ -465,41 +569,59 @@ run_step "mpmd_python_only" timeout --foreground "${SHORT_TIMEOUT}s" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
     "${TEST_DIR}/mpmd_py_only.conf"
 
+if [ "${STEP_RC_MAP[build_fortran_mpi_probe]:-1}" = "0" ]; then
+    run_step "binary_fortran_mpi_probe" "${TEST_DIR}/binary_report.sh" "${FORTRAN_MPI_EXE}"
+    run_step "mpmd_fortran_python_only" timeout --foreground "${SHORT_TIMEOUT}s" \
+        srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
+        "${TEST_DIR}/mpmd_fortran_python.conf"
+else
+    skip_step "binary_fortran_mpi_probe" "Fortran MPI probe did not build."
+    skip_step "mpmd_fortran_python_only" "Fortran MPI probe did not build."
+fi
+
+if [ "${STEP_RC_MAP[build_fortran_split_probe]:-1}" = "0" ]; then
+    run_step "binary_fortran_split_probe" "${TEST_DIR}/binary_report.sh" "${FORTRAN_SPLIT_EXE}"
+    run_step "mpmd_fortran_splitpeer" timeout --foreground "${SHORT_TIMEOUT}s" \
+        srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
+        "${TEST_DIR}/mpmd_fortran_splitpeer.conf"
+else
+    skip_step "binary_fortran_split_probe" "Fortran split-peer probe did not build."
+    skip_step "mpmd_fortran_splitpeer" "Fortran split-peer probe did not build."
+fi
+
 run_neko_step "current_no_pod_alone_wrapper" "${SHORT_TIMEOUT}" \
     srun -n "${NEKO_RANKS}" --label \
     "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_force.sh" \
     "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
 
 run_neko_step "current_no_pod_alone_docs" "${SHORT_TIMEOUT}" \
-    srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
-    --cpu-bind="${DOCS_CPU_BIND}" --gpu-bind="map:${DOCS_GPU_MAP}" \
-    --gres-flags=allow-task-sharing --label \
+    srun "${STANDALONE_DOCS_ARGS[@]}" \
     "${TEST_DIR}/run_neko_env.sh" "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
 
 run_neko_step "current_no_pod_alone_docs_preserve" "${SHORT_TIMEOUT}" \
-    srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
-    --cpu-bind="${DOCS_CPU_BIND}" --gpu-bind="map:${DOCS_GPU_MAP}" \
-    --gres-flags=allow-task-sharing --label \
+    srun "${STANDALONE_DOCS_ARGS[@]}" \
     "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_preserve.sh" \
     "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
 
 run_neko_step "current_no_pod_alone_docs_wrapper" "${SHORT_TIMEOUT}" \
-    srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
-    --cpu-bind="${DOCS_CPU_BIND}" --gres-flags=allow-task-sharing --label \
+    srun "${STANDALONE_WRAPPER_ARGS[@]}" \
     "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_force.sh" \
     "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
 
-run_neko_step "current_no_pod_alone_mask_wrapper" "${SHORT_TIMEOUT}" \
-    srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
-    --cpu-bind="${DOCS_CPU_MASK}" --gres-flags=allow-task-sharing --label \
-    "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_force.sh" \
-    "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
+if [ "${DEBUG_USE_GPU}" = "1" ]; then
+    run_neko_step "current_no_pod_alone_mask_wrapper" "${SHORT_TIMEOUT}" \
+        srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
+        --cpu-bind="${DOCS_CPU_MASK}" --gres-flags=allow-task-sharing --label \
+        "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_force.sh" \
+        "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
+else
+    skip_step "current_no_pod_alone_mask_wrapper" \
+        "Skipped in CPU debug mode."
+fi
 
 if [ -n "${WORKING_NEKO_EXE:-}" ]; then
     run_neko_step "working_no_pod_alone_docs" "${SHORT_TIMEOUT}" \
-        srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
-        --cpu-bind="${DOCS_CPU_BIND}" --gpu-bind="map:${DOCS_GPU_MAP}" \
-        --gres-flags=allow-task-sharing --label \
+        srun "${STANDALONE_DOCS_ARGS[@]}" \
         "${TEST_DIR}/run_neko_env.sh" "${WORKING_NEKO_EXE}" "${NO_POD_CASE}"
 else
     skip_step "working_no_pod_alone_docs" "No working control binary available."
@@ -507,9 +629,7 @@ fi
 
 if [ -n "${NODEVICE_NEKO_EXE:-}" ]; then
     run_neko_step "nodevice_no_pod_alone_docs" "${SHORT_TIMEOUT}" \
-        srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
-        --cpu-bind="${DOCS_CPU_BIND}" --gpu-bind="map:${DOCS_GPU_MAP}" \
-        --gres-flags=allow-task-sharing --label \
+        srun "${STANDALONE_DOCS_ARGS[@]}" \
         "${TEST_DIR}/run_neko_env.sh" "${NODEVICE_NEKO_EXE}" "${NO_POD_CASE}"
 else
     skip_step "nodevice_no_pod_alone_docs" "No no-device-MPI binary available."
