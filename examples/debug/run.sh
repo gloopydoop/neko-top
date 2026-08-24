@@ -241,6 +241,25 @@ exec "$@"
 EOF
 chmod +x "${TEST_DIR}/run_neko_env.sh"
 
+cat > "${TEST_DIR}/run_neko_mpmd_env.sh" <<'EOF'
+#!/bin/bash
+export MPICH_DMAPP_APP_IS_WORLD=${MPICH_DMAPP_APP_IS_WORLD:-1}
+export MPICH_GPU_SUPPORT_ENABLED=${MPICH_GPU_SUPPORT_ENABLED:-1}
+export NEKO_GS_STRTGY=${NEKO_GS_STRTGY:-3}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-PASSIVE}
+exec "$@"
+EOF
+chmod +x "${TEST_DIR}/run_neko_mpmd_env.sh"
+
+cat > "${TEST_DIR}/run_python_host_env.sh" <<'EOF'
+#!/bin/bash
+unset ROCR_VISIBLE_DEVICES
+export MPICH_GPU_SUPPORT_ENABLED=0
+exec "$@"
+EOF
+chmod +x "${TEST_DIR}/run_python_host_env.sh"
+
 cat > "${TEST_DIR}/select_gpu_force.sh" <<'EOF'
 #!/bin/bash
 export ROCR_VISIBLE_DEVICES=${SLURM_LOCALID:-0}
@@ -313,23 +332,28 @@ cat > "${TEST_DIR}/mpmd_py_only.conf" <<EOF
 EOF
 
 cat > "${TEST_DIR}/mpmd_current_no_pod.conf" <<EOF
-0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
+0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_mpmd_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
 8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
 EOF
 
 cat > "${TEST_DIR}/mpmd_current_pod.conf" <<EOF
-0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${SMOKE_CASE}
+0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_mpmd_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${SMOKE_CASE}
 8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${PYTHON_SCRIPT} ${SMOKE_CASE}
 EOF
 
 cat > "${TEST_DIR}/mpmd_current_no_pod_helpers.conf" <<EOF
-0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
+0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_mpmd_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
 8-55 ${TEST_DIR}/helper_sleep.sh
 EOF
 
 cat > "${TEST_DIR}/mpmd_current_no_pod_small.conf" <<EOF
-0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
+0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_mpmd_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
 8-$((SMALL_TOTAL_RANKS - 1)) /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
+EOF
+
+cat > "${TEST_DIR}/mpmd_current_no_pod_hostpy.conf" <<EOF
+0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_mpmd_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
+8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${TEST_DIR}/run_python_host_env.sh ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
 EOF
 
 if [ -n "${WORKING_NEKO_EXE:-}" ]; then
@@ -469,6 +493,14 @@ run_neko_step "current_no_pod_mpmd_helpers" "${ATTEMPT_TIMEOUT}" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
     "${TEST_DIR}/mpmd_current_no_pod_helpers.conf"
 
+run_neko_step "current_no_pod_mpmd_helpers_shasta" "${ATTEMPT_TIMEOUT}" \
+    srun --mpi=cray_shasta -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
+    "${TEST_DIR}/mpmd_current_no_pod_helpers.conf"
+
+run_neko_step "current_no_pod_mpmd_helpers_pmi2" "${ATTEMPT_TIMEOUT}" \
+    srun --mpi=pmi2 -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
+    "${TEST_DIR}/mpmd_current_no_pod_helpers.conf"
+
 if [ "${STEP_RC_MAP[current_no_pod_mpmd_helpers]:-1}" != "0" ]; then
     run_neko_step "current_no_pod_mpmd_helpers_env_display" "${ATTEMPT_TIMEOUT}" \
         env MPICH_ENV_DISPLAY=1 MPICH_VERSION_DISPLAY=1 MPICH_CPUMASK_DISPLAY=1 \
@@ -481,9 +513,20 @@ else
 fi
 
 run_neko_step "current_no_pod_mpmd_small" "${ATTEMPT_TIMEOUT}" \
-    srun --exact -n "${SMALL_TOTAL_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
-    --cpu-bind="${DOCS_CPU_BIND}" --gres-flags=allow-task-sharing --label \
+    srun --exact -n "${SMALL_TOTAL_RANKS}" --label \
     --unbuffered --multi-prog "${TEST_DIR}/mpmd_current_no_pod_small.conf"
+
+run_neko_step "current_no_pod_mpmd_hostpy" "${ATTEMPT_TIMEOUT}" \
+    srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
+    "${TEST_DIR}/mpmd_current_no_pod_hostpy.conf"
+
+run_neko_step "current_no_pod_mpmd_hostpy_shasta" "${ATTEMPT_TIMEOUT}" \
+    srun --mpi=cray_shasta -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
+    "${TEST_DIR}/mpmd_current_no_pod_hostpy.conf"
+
+run_neko_step "current_no_pod_mpmd_hostpy_pmi2" "${ATTEMPT_TIMEOUT}" \
+    srun --mpi=pmi2 -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
+    "${TEST_DIR}/mpmd_current_no_pod_hostpy.conf"
 
 run_neko_step "current_no_pod_mpmd" "${LONG_TIMEOUT}" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \

@@ -16,6 +16,10 @@ This variant is trimmed to the remaining high-value checks:
 - Mixed-launch probes that do not require a known-good reference binary:
   `Neko + non-MPI helpers`, a smaller `8 Neko + 8 Python` case, and the full
   `8 Neko + 48 Python` MPMD case.
+- Explicit `srun --mpi=cray_shasta` and `srun --mpi=pmi2` variants for the
+  mixed-launch probes.
+- A host-only Python wrapper that disables GPU-aware MPI on the Python control
+  ranks while leaving it enabled for Neko.
 - Optional control binaries run under the same batch harness when available.
 - Full POD MPMD only after the matching `no_pod` MPMD test passes.
 
