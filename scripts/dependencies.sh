@@ -699,6 +699,152 @@ EOF
 }
 
 # ============================================================================ #
+# Patch vendored Neko so MPMD runs can disable device-MPI at runtime.
+function patch_neko_device_mpi_runtime() {
+    local neko_dir="$1"
+    local patch_file
+
+    patch_file=$(mktemp "${TMPDIR:-/tmp}/neko_device_mpi.XXXXXX.patch")
+
+    cat >"${patch_file}" <<'EOF'
+diff --git a/src/config/neko_config.f90.in b/src/config/neko_config.f90.in
+index c06698f..3c76d05 100644
+--- a/src/config/neko_config.f90.in
++++ b/src/config/neko_config.f90.in
+@@ -48,4 +48,24 @@ module neko_config
+ 
+   integer, parameter :: NEKO_BLK_SIZE = @blk_size@
+ 
++  public :: neko_device_mpi_enabled
++
++contains
++
++  logical function neko_device_mpi_enabled()
++    character(len=32) :: env_val
++    integer :: env_len
++
++    neko_device_mpi_enabled = NEKO_DEVICE_MPI
++    if (.not. NEKO_DEVICE_MPI) return
++
++    call get_environment_variable("NEKO_DISABLE_DEVICE_MPI", env_val, env_len)
++    if (env_len <= 0) return
++
++    select case (trim(adjustl(env_val(1:env_len))))
++    case ("1", "true", "TRUE", "yes", "YES", "on", "ON")
++       neko_device_mpi_enabled = .false.
++    end select
++  end function neko_device_mpi_enabled
++
+ end module neko_config
+diff --git a/src/gs/gather_scatter.f90 b/src/gs/gather_scatter.f90
+index 6ad71b1..6d6c9d2 100644
+--- a/src/gs/gather_scatter.f90
++++ b/src/gs/gather_scatter.f90
+@@ -33,7 +33,8 @@
+ !> Gather-scatter
+ module gather_scatter
+   use neko_config, only : NEKO_BCKND_DEVICE, NEKO_BCKND_SX, NEKO_BCKND_HIP, &
+-       NEKO_BCKND_CUDA, NEKO_BCKND_OPENCL, NEKO_BCKND_METAL, NEKO_DEVICE_MPI
++       NEKO_BCKND_CUDA, NEKO_BCKND_OPENCL, NEKO_BCKND_METAL, &
++       neko_device_mpi_enabled
+   use gs_bcknd, only : gs_bcknd_t, GS_BCKND_CPU, GS_BCKND_SX, GS_BCKND_DEV
+   use gs_device, only : gs_device_t
+   use gs_sx, only : gs_sx_t
+@@ -216,7 +217,7 @@ contains
+     else if (use_utofu) then
+        comm_bcknd_ = GS_COMM_UTOFU
+     else
+-       if (NEKO_DEVICE_MPI) then
++       if (neko_device_mpi_enabled()) then
+           comm_bcknd_ = GS_COMM_MPIGPU
+           use_device_mpi = .true.
+        else
+diff --git a/src/common/projection.f90 b/src/common/projection.f90
+index 312a956..29f44db 100644
+--- a/src/common/projection.f90
++++ b/src/common/projection.f90
+@@ -68,7 +68,7 @@ module projection
+   use bc_list, only : bc_list_t
+   use gather_scatter, only : gs_t, GS_OP_ADD
+   use neko_config, only : NEKO_BCKND_DEVICE, NEKO_BLK_SIZE, &
+-       NEKO_DEVICE_MPI, NEKO_BCKND_OPENCL
++       NEKO_BCKND_OPENCL, neko_device_mpi_enabled
+   use device, only : device_alloc, HOST_TO_DEVICE, device_memcpy, &
+        device_get_ptr, device_free, device_map, device_unmap
+   use device_math, only : device_glsc3, device_add2s2, device_cmult, &
+@@ -569,7 +569,7 @@ contains
+ 
+       this%proj_res = sqrt(device_glsc3(b_d, b_d, coef%mult_d, n)/coef%volume)
+       this%proj_m = this%m
+-      if (NEKO_DEVICE_MPI .and. (NEKO_BCKND_OPENCL .ne. 1)) then
++      if (neko_device_mpi_enabled() .and. (NEKO_BCKND_OPENCL .ne. 1)) then
+          call device_proj_on(alpha_d, b_d, xx_d_d, bb_d_d, &
+               coef%mult_d, xbar_d, this%m, n)
+       else
+@@ -649,7 +649,7 @@ contains
+ 
+       if (m .le. 0) return
+ 
+-      if (NEKO_DEVICE_MPI .and. (NEKO_BCKND_OPENCL .ne. 1)) then
++      if (neko_device_mpi_enabled() .and. (NEKO_BCKND_OPENCL .ne. 1)) then
+          call device_project_ortho(alpha_d, bb_d(m), xx_d_d, bb_d_d, &
+               w_d, xx_d(m), this%m, n, nrm)
+       else
+diff --git a/src/math/operators.f90 b/src/math/operators.f90
+index 00eee84..971fdef 100644
+--- a/src/math/operators.f90
++++ b/src/math/operators.f90
+@@ -33,7 +33,7 @@
+ !> Operators
+ module operators
+   use neko_config, only : NEKO_BCKND_SX, NEKO_BCKND_DEVICE, NEKO_BCKND_XSMM, &
+-       NEKO_DEVICE_MPI
++       neko_device_mpi_enabled
+   use num_types, only : rp, i8
+   use opr_cpu, only : opr_cpu_cfl, opr_cpu_curl, opr_cpu_opgrad, &
+        opr_cpu_conv1, opr_cpu_convect_scalar, opr_cpu_cdtp, &
+@@ -591,7 +591,7 @@ contains
+        cfl_r4 = opr_cpu_cfl(dt, u, v, w, Xh, coef, nelv, gdim)
+     end if
+ 
+-    if (.not. NEKO_DEVICE_MPI) then
++    if (.not. neko_device_mpi_enabled()) then
+        call MPI_Allreduce(MPI_IN_PLACE, cfl_r4, 1, &
+             MPI_REAL_PRECISION, MPI_MAX, NEKO_COMM, ierr)
+     end if
+@@ -609,7 +609,7 @@ contains
+ 
+     cfl_d = opr_device_cfl(dt, u_d, v_d, w_d, Xh, coef, nelv, gdim)
+ 
+-    if (.not. NEKO_DEVICE_MPI) then
++    if (.not. neko_device_mpi_enabled()) then
+        call MPI_Allreduce(MPI_IN_PLACE, cfl_d, 1, &
+             MPI_REAL_PRECISION, MPI_MAX, NEKO_COMM, ierr)
+     end if
+@@ -633,7 +633,7 @@ contains
+        cfl_f = opr_cpu_cfl(dt, u%x, v%x, w%x, Xh, coef, nelv, gdim)
+     end if
+ 
+-    if (.not. NEKO_DEVICE_MPI) then
++    if (.not. neko_device_mpi_enabled()) then
+        call MPI_Allreduce(MPI_IN_PLACE, cfl_f, 1, &
+             MPI_REAL_PRECISION, MPI_MAX, NEKO_COMM, ierr)
+     end if
+EOF
+
+    if git -C "$neko_dir" apply --check "${patch_file}" 2>/dev/null; then
+        git -C "$neko_dir" apply "${patch_file}"
+    elif ! grep -q "NEKO_DISABLE_DEVICE_MPI" \
+        "${neko_dir}/src/config/neko_config.f90.in" 2>/dev/null; then
+        error "Failed to apply the Neko device-MPI runtime patch."
+        rm -f "${patch_file}"
+        return 1
+    fi
+
+    rm -f "${patch_file}"
+}
+
+# ============================================================================ #
 # Ensure Neko is installed, if not install it.
 function find_neko() {
     check_external_dir
@@ -803,6 +949,7 @@ function find_neko() {
 
         if [ -n "$ADIOS2_DIR" ] || [ "${NEKO_WITH_ADIOS2:-false}" == true ]; then
             patch_neko_adios2_linking "$NEKO_DIR"
+            patch_neko_device_mpi_runtime "$NEKO_DIR" || exit 1
             force_neko_regen=true
         fi
 

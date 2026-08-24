@@ -61,6 +61,8 @@ cat <<'EOF' > select_gpu
 #!/bin/bash
 
 export ROCR_VISIBLE_DEVICES=${SLURM_LOCALID:-0}
+export NEKO_GS_COMM=${NEKO_GS_COMM:-MPI}
+export NEKO_DISABLE_DEVICE_MPI=${NEKO_DISABLE_DEVICE_MPI:-1}
 sleep "${NEKO_STARTUP_DELAY:-20}"
 exec "$@"
 EOF
