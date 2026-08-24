@@ -20,6 +20,9 @@ This variant is trimmed to the remaining high-value checks:
   mixed-launch probes.
 - A host-only Python wrapper that disables GPU-aware MPI on the Python control
   ranks while leaving it enabled for Neko.
+- A split-only Python peer that does the same initial `MPI_COMM_WORLD.Split`
+  as the real driver, but nothing else, to isolate communicator-split issues
+  from the full Python runtime.
 - Optional control binaries run under the same batch harness when available.
 - Full POD MPMD only after the matching `no_pod` MPMD test passes.
 

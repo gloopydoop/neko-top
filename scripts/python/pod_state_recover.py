@@ -1,43 +1,21 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 
 import os
 import sys
 import time
 
-import numpy as np
 from mpi4py import MPI
 
-from pysemtools.datatypes.coef import Coef
-from pysemtools.datatypes.msh import Mesh
-from pysemtools.io.adios2.stream import DataStreamer
-from pysemtools.rom.io_help import IoHelp
-from pysemtools.rom.pod import POD
-
-from neko_communicator import CtrlClient
-from neko_communicator import MODE_ADJOINT
-from neko_communicator import MODE_FORWARD
-from neko_communicator import MODE_STOP
-from neko_communicator import PHASE_ADJ_DONE
-from neko_communicator import PHASE_ADJ_RUNNING
-from neko_communicator import PHASE_FWD_DONE
-from neko_communicator import PHASE_FWD_RUNNING
-from neko_communicator import get_peer_root
-from neko_communicator import make_local_comm
-from pod_state_recover_tools import EnergyState
-from pod_state_recover_tools import PODConfig
-from pod_state_recover_tools import add_snapshot
-from pod_state_recover_tools import build_time_coefficients
-from pod_state_recover_tools import flush_buffer
-from pod_state_recover_tools import load_pod_config
-from pod_state_recover_tools import make_pod
-from pod_state_recover_tools import recv_field
-from pod_state_recover_tools import recv_fields
-from pod_state_recover_tools import report_energy_capture
-from pod_state_recover_tools import set_debug
-from pod_state_recover_tools import stream_mode_fields
-from pod_state_recover_tools import write_modes_to_disk
-from pod_state_recover_tools import write_singular_values
-from pod_state_recover_tools import write_time_coefficients
+def make_local_comm_from_env(world: MPI.Comm) -> MPI.Comm:
+    value = os.getenv("NEKO_COMM_ID")
+    if value is None:
+        return world.Dup()
+    try:
+        color = int(value)
+    except ValueError as exc:
+        raise ValueError("Invalid NEKO_COMM_ID") from exc
+    return world.Split(color, world.Get_rank())
 
 
 def init_runtime(
@@ -51,6 +29,14 @@ def init_runtime(
     IoHelp,
     list[np.ndarray],
 ]:
+    from pysemtools.datatypes.coef import Coef
+    from pysemtools.datatypes.msh import Mesh
+    from pysemtools.io.adios2.stream import DataStreamer
+
+    from pod_state_recover_tools import make_pod
+    from pod_state_recover_tools import recv_field
+    from pod_state_recover_tools import recv_fields
+
     ds = DataStreamer(comm)
 
     x = recv_field(ds, cfg.dtype)
@@ -72,7 +58,33 @@ def main() -> None:
         )
 
     world = MPI.COMM_WORLD
-    comm = make_local_comm(world)
+    comm = make_local_comm_from_env(world)
+
+    import numpy as np
+
+    from neko_communicator import CtrlClient
+    from neko_communicator import MODE_ADJOINT
+    from neko_communicator import MODE_FORWARD
+    from neko_communicator import MODE_STOP
+    from neko_communicator import PHASE_ADJ_DONE
+    from neko_communicator import PHASE_ADJ_RUNNING
+    from neko_communicator import PHASE_FWD_DONE
+    from neko_communicator import PHASE_FWD_RUNNING
+    from neko_communicator import get_peer_root
+    from pod_state_recover_tools import EnergyState
+    from pod_state_recover_tools import add_snapshot
+    from pod_state_recover_tools import build_time_coefficients
+    from pod_state_recover_tools import flush_buffer
+    from pod_state_recover_tools import load_pod_config
+    from pod_state_recover_tools import make_pod
+    from pod_state_recover_tools import recv_fields
+    from pod_state_recover_tools import report_energy_capture
+    from pod_state_recover_tools import set_debug
+    from pod_state_recover_tools import stream_mode_fields
+    from pod_state_recover_tools import write_modes_to_disk
+    from pod_state_recover_tools import write_singular_values
+    from pod_state_recover_tools import write_time_coefficients
+
     rank = comm.Get_rank()
     peer_root = get_peer_root()
 

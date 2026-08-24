@@ -208,6 +208,27 @@ comm = MPI.COMM_WORLD
 print(f"B rank {comm.rank} / {comm.size}", flush=True)
 EOF
 
+cat > "${TEST_DIR}/py_split_peer.py" <<'EOF'
+#!/usr/bin/env python3
+import os
+import time
+from mpi4py import MPI
+
+world = MPI.COMM_WORLD
+color = int(os.environ["NEKO_COMM_ID"])
+local = world.Split(color, world.rank)
+
+print(
+    "split_peer "
+    f"world_rank={world.rank} world_size={world.size} "
+    f"local_rank={local.rank} local_size={local.size} color={color}",
+    flush=True,
+)
+
+time.sleep(int(os.environ.get("SPLIT_PEER_SLEEP_SECONDS", "20")))
+EOF
+chmod +x "${TEST_DIR}/py_split_peer.py"
+
 cat > "${TEST_DIR}/helper_sleep.sh" <<'EOF'
 #!/bin/bash
 set -eu
@@ -349,6 +370,11 @@ EOF
 cat > "${TEST_DIR}/mpmd_current_no_pod_small.conf" <<EOF
 0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_mpmd_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
 8-$((SMALL_TOTAL_RANKS - 1)) /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
+EOF
+
+cat > "${TEST_DIR}/mpmd_current_no_pod_splitpeer.conf" <<EOF
+0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_mpmd_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
+8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${TEST_DIR}/py_split_peer.py
 EOF
 
 cat > "${TEST_DIR}/mpmd_current_no_pod_hostpy.conf" <<EOF
@@ -515,6 +541,18 @@ fi
 run_neko_step "current_no_pod_mpmd_small" "${ATTEMPT_TIMEOUT}" \
     srun --exact -n "${SMALL_TOTAL_RANKS}" --label \
     --unbuffered --multi-prog "${TEST_DIR}/mpmd_current_no_pod_small.conf"
+
+run_neko_step "current_no_pod_mpmd_splitpeer" "${ATTEMPT_TIMEOUT}" \
+    srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
+    "${TEST_DIR}/mpmd_current_no_pod_splitpeer.conf"
+
+run_neko_step "current_no_pod_mpmd_splitpeer_shasta" "${ATTEMPT_TIMEOUT}" \
+    srun --mpi=cray_shasta -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
+    "${TEST_DIR}/mpmd_current_no_pod_splitpeer.conf"
+
+run_neko_step "current_no_pod_mpmd_splitpeer_pmi2" "${ATTEMPT_TIMEOUT}" \
+    srun --mpi=pmi2 -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
+    "${TEST_DIR}/mpmd_current_no_pod_splitpeer.conf"
 
 run_neko_step "current_no_pod_mpmd_hostpy" "${ATTEMPT_TIMEOUT}" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
