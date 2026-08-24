@@ -13,10 +13,14 @@ PY_RANKS=${PY_RANKS:-48}
 TOTAL_RANKS=$((NEKO_RANKS + PY_RANKS))
 SHORT_TIMEOUT=${DEBUG_TIMEOUT_SHORT:-60}
 LONG_TIMEOUT=${DEBUG_TIMEOUT_LONG:-120}
+ATTEMPT_TIMEOUT=${DEBUG_TIMEOUT_ATTEMPT:-60}
 SMOKE_STEPS=${DEBUG_SMOKE_STEPS:-1}
 DOCS_CPUS_PER_TASK=${DEBUG_CPUS_PER_TASK:-7}
 DOCS_GPU_MAP=${DEBUG_LUMI_GPU_MAP:-4,5,2,3,6,7,0,1}
 DOCS_CPU_BIND=${DEBUG_LUMI_CPU_BIND:-cores}
+DOCS_CPU_MASK=${DEBUG_LUMI_CPU_MASK:-mask_cpu:7e000000000000,7e00000000000000,7e0000,7e000000,7e,7e00,7e00000000,7e0000000000}
+SMALL_PY_RANKS=${DEBUG_SMALL_PY_RANKS:-8}
+SMALL_TOTAL_RANKS=$((NEKO_RANKS + SMALL_PY_RANKS))
 TEST_DIR=${DEBUG_TEST_DIR:-./debug_artifacts}
 SMOKE_CASE="${TEST_DIR}/debug_smoke.case"
 NO_POD_CASE="${TEST_DIR}/debug_smoke_no_pod.case"
@@ -66,6 +70,21 @@ function run_step() {
     cat "${log_file}"
     record_step_rc "${name}" "${rc}"
     return 0
+}
+
+function reset_neko_outputs() {
+    rm -rf ./checkpoints ./design ./forward_fields ./adjoint_fields ./sensitivity
+    rm -f ./adjoint_norm.csv ./optimization_data.csv ./joblimit*.chkp
+    rm -f ./core ./core.*
+}
+
+function run_neko_step() {
+    local name=$1
+    local timeout_seconds=$2
+    shift 2
+
+    reset_neko_outputs
+    run_step "${name}" timeout --foreground "${timeout_seconds}s" "$@"
 }
 
 function skip_step() {
@@ -189,6 +208,14 @@ comm = MPI.COMM_WORLD
 print(f"B rank {comm.rank} / {comm.size}", flush=True)
 EOF
 
+cat > "${TEST_DIR}/helper_sleep.sh" <<'EOF'
+#!/bin/bash
+set -eu
+echo "helper rank ${SLURM_PROCID:-?} / local ${SLURM_LOCALID:-?}" >&2
+sleep "${HELPER_SLEEP_SECONDS:-30}"
+EOF
+chmod +x "${TEST_DIR}/helper_sleep.sh"
+
 cat > "${TEST_DIR}/binary_report.sh" <<'EOF'
 #!/bin/bash
 set -eu
@@ -209,6 +236,7 @@ export MPICH_DMAPP_APP_IS_WORLD=${MPICH_DMAPP_APP_IS_WORLD:-1}
 export MPICH_GPU_SUPPORT_ENABLED=${MPICH_GPU_SUPPORT_ENABLED:-1}
 export NEKO_GS_STRTGY=${NEKO_GS_STRTGY:-3}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}
+export OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-PASSIVE}
 exec "$@"
 EOF
 chmod +x "${TEST_DIR}/run_neko_env.sh"
@@ -294,6 +322,16 @@ cat > "${TEST_DIR}/mpmd_current_pod.conf" <<EOF
 8-55 /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${PYTHON_SCRIPT} ${SMOKE_CASE}
 EOF
 
+cat > "${TEST_DIR}/mpmd_current_no_pod_helpers.conf" <<EOF
+0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
+8-55 ${TEST_DIR}/helper_sleep.sh
+EOF
+
+cat > "${TEST_DIR}/mpmd_current_no_pod_small.conf" <<EOF
+0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${CURRENT_NEKO_EXE} ${NO_POD_CASE}
+8-$((SMALL_TOTAL_RANKS - 1)) /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 ${PYTHON_BIN} ${TEST_DIR}/py_mpi_b.py
+EOF
+
 if [ -n "${WORKING_NEKO_EXE:-}" ]; then
     cat > "${TEST_DIR}/mpmd_working_no_pod.conf" <<EOF
 0-7 /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ${TEST_DIR}/run_neko_env.sh ${TEST_DIR}/select_gpu_preserve.sh ${WORKING_NEKO_EXE} ${NO_POD_CASE}
@@ -325,6 +363,7 @@ print(MPI.Get_library_version())
 print(adios2.bindings.__file__)
 PY
 
+run_step "srun_mpi_list" srun --mpi=list
 run_step "mpi4py_ldd" ldd "${MPI4PY_SO}"
 run_step "binary_current" "${TEST_DIR}/binary_report.sh" "${CURRENT_NEKO_EXE}"
 
@@ -376,26 +415,38 @@ run_step "mpmd_python_only" timeout --foreground "${SHORT_TIMEOUT}s" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
     "${TEST_DIR}/mpmd_py_only.conf"
 
-run_step "current_no_pod_alone_wrapper" timeout --foreground "${SHORT_TIMEOUT}s" \
+run_neko_step "current_no_pod_alone_wrapper" "${SHORT_TIMEOUT}" \
     srun -n "${NEKO_RANKS}" --label \
     "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_force.sh" \
     "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
 
-run_step "current_no_pod_alone_docs" timeout --foreground "${SHORT_TIMEOUT}s" \
+run_neko_step "current_no_pod_alone_docs" "${SHORT_TIMEOUT}" \
     srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
     --cpu-bind="${DOCS_CPU_BIND}" --gpu-bind="map:${DOCS_GPU_MAP}" \
     --gres-flags=allow-task-sharing --label \
     "${TEST_DIR}/run_neko_env.sh" "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
 
-run_step "current_no_pod_alone_docs_preserve" timeout --foreground "${SHORT_TIMEOUT}s" \
+run_neko_step "current_no_pod_alone_docs_preserve" "${SHORT_TIMEOUT}" \
     srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
     --cpu-bind="${DOCS_CPU_BIND}" --gpu-bind="map:${DOCS_GPU_MAP}" \
     --gres-flags=allow-task-sharing --label \
     "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_preserve.sh" \
     "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
 
+run_neko_step "current_no_pod_alone_docs_wrapper" "${SHORT_TIMEOUT}" \
+    srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
+    --cpu-bind="${DOCS_CPU_BIND}" --gres-flags=allow-task-sharing --label \
+    "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_force.sh" \
+    "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
+
+run_neko_step "current_no_pod_alone_mask_wrapper" "${SHORT_TIMEOUT}" \
+    srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
+    --cpu-bind="${DOCS_CPU_MASK}" --gres-flags=allow-task-sharing --label \
+    "${TEST_DIR}/run_neko_env.sh" "${TEST_DIR}/select_gpu_force.sh" \
+    "${CURRENT_NEKO_EXE}" "${NO_POD_CASE}"
+
 if [ -n "${WORKING_NEKO_EXE:-}" ]; then
-    run_step "working_no_pod_alone_docs" timeout --foreground "${SHORT_TIMEOUT}s" \
+    run_neko_step "working_no_pod_alone_docs" "${SHORT_TIMEOUT}" \
         srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
         --cpu-bind="${DOCS_CPU_BIND}" --gpu-bind="map:${DOCS_GPU_MAP}" \
         --gres-flags=allow-task-sharing --label \
@@ -405,7 +456,7 @@ else
 fi
 
 if [ -n "${NODEVICE_NEKO_EXE:-}" ]; then
-    run_step "nodevice_no_pod_alone_docs" timeout --foreground "${SHORT_TIMEOUT}s" \
+    run_neko_step "nodevice_no_pod_alone_docs" "${SHORT_TIMEOUT}" \
         srun --exact -n "${NEKO_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
         --cpu-bind="${DOCS_CPU_BIND}" --gpu-bind="map:${DOCS_GPU_MAP}" \
         --gres-flags=allow-task-sharing --label \
@@ -414,12 +465,32 @@ else
     skip_step "nodevice_no_pod_alone_docs" "No no-device-MPI binary available."
 fi
 
-run_step "current_no_pod_mpmd" timeout --foreground "${LONG_TIMEOUT}s" \
+run_neko_step "current_no_pod_mpmd_helpers" "${ATTEMPT_TIMEOUT}" \
+    srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
+    "${TEST_DIR}/mpmd_current_no_pod_helpers.conf"
+
+if [ "${STEP_RC_MAP[current_no_pod_mpmd_helpers]:-1}" != "0" ]; then
+    run_neko_step "current_no_pod_mpmd_helpers_env_display" "${ATTEMPT_TIMEOUT}" \
+        env MPICH_ENV_DISPLAY=1 MPICH_VERSION_DISPLAY=1 MPICH_CPUMASK_DISPLAY=1 \
+        MPICH_ABORT_ON_ERROR=1 \
+        srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
+        "${TEST_DIR}/mpmd_current_no_pod_helpers.conf"
+else
+    skip_step "current_no_pod_mpmd_helpers_env_display" \
+        "Skipped because current_no_pod_mpmd_helpers already passed."
+fi
+
+run_neko_step "current_no_pod_mpmd_small" "${ATTEMPT_TIMEOUT}" \
+    srun --exact -n "${SMALL_TOTAL_RANKS}" --cpus-per-task="${DOCS_CPUS_PER_TASK}" \
+    --cpu-bind="${DOCS_CPU_BIND}" --gres-flags=allow-task-sharing --label \
+    --unbuffered --multi-prog "${TEST_DIR}/mpmd_current_no_pod_small.conf"
+
+run_neko_step "current_no_pod_mpmd" "${LONG_TIMEOUT}" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
     "${TEST_DIR}/mpmd_current_no_pod.conf"
 
 if [ -n "${WORKING_NEKO_EXE:-}" ]; then
-    run_step "working_no_pod_mpmd" timeout --foreground "${LONG_TIMEOUT}s" \
+    run_neko_step "working_no_pod_mpmd" "${LONG_TIMEOUT}" \
         srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
         "${TEST_DIR}/mpmd_working_no_pod.conf"
 else
@@ -427,7 +498,7 @@ else
 fi
 
 if [ -n "${NODEVICE_NEKO_EXE:-}" ]; then
-    run_step "nodevice_no_pod_mpmd" timeout --foreground "${LONG_TIMEOUT}s" \
+    run_neko_step "nodevice_no_pod_mpmd" "${LONG_TIMEOUT}" \
         srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
         "${TEST_DIR}/mpmd_nodevice_no_pod.conf"
 else
@@ -435,7 +506,7 @@ else
 fi
 
 if [ "${STEP_RC_MAP[current_no_pod_mpmd]:-1}" = "0" ]; then
-    run_step "current_pod_mpmd" timeout --foreground "${LONG_TIMEOUT}s" \
+    run_neko_step "current_pod_mpmd" "${LONG_TIMEOUT}" \
         srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
         "${TEST_DIR}/mpmd_current_pod.conf"
 else
@@ -444,7 +515,7 @@ else
 fi
 
 if [ "${STEP_RC_MAP[working_no_pod_mpmd]:-1}" = "0" ]; then
-    run_step "working_pod_mpmd" timeout --foreground "${LONG_TIMEOUT}s" \
+    run_neko_step "working_pod_mpmd" "${LONG_TIMEOUT}" \
         srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
         "${TEST_DIR}/mpmd_working_pod.conf"
 else
@@ -453,7 +524,7 @@ else
 fi
 
 if [ "${STEP_RC_MAP[nodevice_no_pod_mpmd]:-1}" = "0" ]; then
-    run_step "nodevice_pod_mpmd" timeout --foreground "${LONG_TIMEOUT}s" \
+    run_neko_step "nodevice_pod_mpmd" "${LONG_TIMEOUT}" \
         srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
         "${TEST_DIR}/mpmd_nodevice_pod.conf"
 else
