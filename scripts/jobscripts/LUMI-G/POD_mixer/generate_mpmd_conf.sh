@@ -105,6 +105,7 @@ if [ "${python_ranks_per_node}" -lt 1 ]; then
 fi
 
 tasks_per_node=$((neko_ranks_per_node + python_ranks_per_node))
+total_world_size=$((nodes * tasks_per_node))
 if [ "${tasks_per_node}" -ne 56 ]; then
     echo "Error: this LUMI-G helper expects 56 tasks per node." >&2
     echo "Got ${neko_ranks_per_node} Neko ranks + ${python_ranks_per_node} Python ranks." >&2
@@ -130,8 +131,10 @@ for ((node=0; node<nodes; node++)); do
 
     for ((local_rank=0; local_rank<neko_ranks_per_node; local_rank++)); do
         rank=$((node_base + local_rank))
-        printf '%d /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=%d %s %s %s\n' \
-            "${rank}" "${neko_ranks_per_node}" \
+        printf '%d /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=%d NEKO_EXPECT_WORLD_SIZE=%d NEKO_EXPECT_APP_SIZE=%d NEKO_EXPECT_WORLD_NODE_SIZE=%d NEKO_EXPECT_APP_NODE_SIZE=%d %s %s %s\n' \
+            "${rank}" "${neko_ranks_per_node}" "${total_world_size}" \
+            "$((nodes * neko_ranks_per_node))" "${tasks_per_node}" \
+            "${neko_ranks_per_node}" \
             "${select_gpu_path}" "${neko_exe}" "${case_file}" >> "${output_path}"
     done
 
