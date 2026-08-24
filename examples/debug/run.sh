@@ -388,13 +388,13 @@ fi
 run_neko_step "current_no_pod_mpmd_helpers" "${ATTEMPT_TIMEOUT}" \
     srun -n "${TOTAL_RANKS}" --label --unbuffered --multi-prog \
     "${TEST_DIR}/mpmd_current_no_pod_helpers.conf"
-if [ "${STEP_RC_MAP[current_no_pod_mpmd_helpers]:-1}" != "0" ]; then
+if [ "${STEP_RC_MAP[current_no_pod_mpmd_helpers]:-1}" = "143" ]; then
     skip_step "current_no_pod_mpmd_splitpeer" \
-        "Skipped because helper MPMD already failed."
+        "Skipped because helper MPMD hit the PMI assert."
     skip_step "current_no_pod_mpmd_hostpy" \
-        "Skipped because helper MPMD already failed."
+        "Skipped because helper MPMD hit the PMI assert."
     skip_step "current_no_pod_mpmd" \
-        "Skipped because helper MPMD already failed."
+        "Skipped because helper MPMD hit the PMI assert."
     finish_debug
 fi
 
