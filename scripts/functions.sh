@@ -193,11 +193,70 @@ function prepare {
             prep_sh="./select_gpu $prep_sh"
         fi
 
+        # Do not leak Neko startup diagnostics into single-rank preparation
+        # tools such as genmeshbox; restore them before the real launch.
+        local saved_neko_debug_probes=${NEKO_DEBUG_PROBES-__NEKO_UNSET__}
+        local saved_neko_debug_probe_barriers=${NEKO_DEBUG_PROBE_BARRIERS-__NEKO_UNSET__}
+        local saved_neko_stacktrace_mode=${NEKO_STACKTRACE_MODE-__NEKO_UNSET__}
+        local saved_neko_stacktrace_dir=${NEKO_STACKTRACE_DIR-__NEKO_UNSET__}
+        local saved_neko_stacktrace_tag=${NEKO_STACKTRACE_TAG-__NEKO_UNSET__}
+        local saved_neko_stacktrace_only_rank=${NEKO_STACKTRACE_ONLY_RANK-__NEKO_UNSET__}
+        local prep_status
+
+        unset NEKO_DEBUG_PROBES
+        unset NEKO_DEBUG_PROBE_BARRIERS
+        unset NEKO_STACKTRACE_MODE
+        unset NEKO_STACKTRACE_DIR
+        unset NEKO_STACKTRACE_TAG
+        unset NEKO_STACKTRACE_ONLY_RANK
+
         if [[ -n "$SLURM_JOB_NAME" && -n "$CPU_BIND" ]]; then
             srun --nodes=1 --ntasks=1 $prep_sh
             sleep 1 # Make sure SLURM have time to clean up.
         else
             $prep_sh
+        fi
+
+        prep_status=$?
+
+        if [ "$saved_neko_debug_probes" = "__NEKO_UNSET__" ]; then
+            unset NEKO_DEBUG_PROBES
+        else
+            export NEKO_DEBUG_PROBES="$saved_neko_debug_probes"
+        fi
+
+        if [ "$saved_neko_debug_probe_barriers" = "__NEKO_UNSET__" ]; then
+            unset NEKO_DEBUG_PROBE_BARRIERS
+        else
+            export NEKO_DEBUG_PROBE_BARRIERS="$saved_neko_debug_probe_barriers"
+        fi
+
+        if [ "$saved_neko_stacktrace_mode" = "__NEKO_UNSET__" ]; then
+            unset NEKO_STACKTRACE_MODE
+        else
+            export NEKO_STACKTRACE_MODE="$saved_neko_stacktrace_mode"
+        fi
+
+        if [ "$saved_neko_stacktrace_dir" = "__NEKO_UNSET__" ]; then
+            unset NEKO_STACKTRACE_DIR
+        else
+            export NEKO_STACKTRACE_DIR="$saved_neko_stacktrace_dir"
+        fi
+
+        if [ "$saved_neko_stacktrace_tag" = "__NEKO_UNSET__" ]; then
+            unset NEKO_STACKTRACE_TAG
+        else
+            export NEKO_STACKTRACE_TAG="$saved_neko_stacktrace_tag"
+        fi
+
+        if [ "$saved_neko_stacktrace_only_rank" = "__NEKO_UNSET__" ]; then
+            unset NEKO_STACKTRACE_ONLY_RANK
+        else
+            export NEKO_STACKTRACE_ONLY_RANK="$saved_neko_stacktrace_only_rank"
+        fi
+
+        if [ $prep_status -ne 0 ]; then
+            return $prep_status
         fi
 
     fi
