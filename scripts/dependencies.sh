@@ -215,9 +215,13 @@ function find_pfunit() {
 
     # Determine the pFUnit installation directory
     if [[ $# -ge 1 ]]; then
-        PFUNIT_DIR="$(realpath $1)"
+        PFUNIT_DIR="$1"
     elif [ -z "$PFUNIT_DIR" ]; then
-        PFUNIT_DIR="$(realpath $EXTERNAL_DIR/pfunit)"
+        return
+    fi
+
+    if [[ "${PFUNIT_DIR:0:1}" != "/" && "${PFUNIT_DIR:0:1}" != "~" ]]; then
+        PFUNIT_DIR="$(realpath $EXTERNAL_DIR/$PFUNIT_DIR)"
     fi
 
     # Clone pFUnit from the repository if it does not exist.
@@ -858,7 +862,7 @@ function find_neko() {
         find_adios2 $ADIOS2_DIR
     fi
     find_parmetis $PARMETIS_DIR
-    [ "$NEKO_TEST" == true ] && find_pfunit $PFUNIT_DIR
+    [ -n "$PFUNIT_DIR" ] && find_pfunit $PFUNIT_DIR
 
     # Determine the Neko installation directory
     if [[ $# -ge 1 ]]; then
@@ -902,7 +906,7 @@ function find_neko() {
         [ -n "$HDF5_DIR" ] && FEATURES+=" --with-hdf5=$HDF5_DIR"
         [ -n "$ADIOS2_DIR" ] && FEATURES+=" --with-adios2=$ADIOS2_DIR"
         [ -n "$PARMETIS_DIR" ] && FEATURES+=" --with-parmetis=$PARMETIS_DIR"
-        [ "$NEKO_TEST" == true ] && FEATURES+=" --with-pfunit=$PFUNIT_DIR"
+        [ -n "$PFUNIT_DIR" ] && FEATURES+=" --with-pfunit=$PFUNIT_DIR"
 
         # Handle device specific features
         if [ "$DEVICE_TYPE" == "CUDA" ]; then
