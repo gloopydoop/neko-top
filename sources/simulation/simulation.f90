@@ -272,7 +272,8 @@ contains
        call state_recover_create(this%state_recover, this%neko_case, &
             state_recovery_params)
     else if ("state_recovery" .in. parameters) then
-       call neko_error("state_recovery is only supported for unsteady simulations.")
+       call neko_error( &
+            "state_recovery is only supported for unsteady simulations.")
     end if
 
 

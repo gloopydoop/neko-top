@@ -344,7 +344,7 @@ contains
     if (present(simulation)) then
        if (allocated(objective)) deallocate(objective)
        allocate(augmented_lagrangian_objective_t::objective)
-       select type(ALO => objective)
+       select type (ALO => objective)
        class is (augmented_lagrangian_objective_t)
           call json_get_or_default(parameters, &
                "adjoint_fluid.dealias_sensitivity", dealias, .true.)
@@ -386,7 +386,8 @@ contains
           call json_get(constraint_json, "type", type)
           call neko_log%message(type)
 
-          call constraint_factory(constraint, constraint_json, design, simulation)
+          call constraint_factory(constraint, constraint_json, design, &
+               simulation)
           call this%add_constraint(constraint)
        end do
     end if
@@ -524,7 +525,8 @@ contains
     call profiler_start_region("Forward simulation")
     loop_start = MPI_WTIME()
     simulation%n_timesteps = 0
-    do while (simulation%neko_case%time%t .lt. simulation%neko_case%time%end_time)
+    do while (simulation%neko_case%time%t .lt. &
+         simulation%neko_case%time%end_time)
        simulation%n_timesteps = simulation%n_timesteps + 1
        ! step forward
        call simulation_step(simulation%neko_case, dt_controller, loop_start)
@@ -561,7 +563,8 @@ contains
     ! Reset the sensitivity value to zero
     call this%reset_objective_sensitivities()
 
-    cfl = simulation%adjoint_case%fluid_adj%compute_cfl(simulation%adjoint_case%time%dt)
+    cfl = simulation%adjoint_case%fluid_adj%compute_cfl( &
+         simulation%adjoint_case%time%dt)
     loop_start = MPI_WTIME()
 
     if (.not. allocated(simulation%state_recover)) then

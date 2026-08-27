@@ -526,11 +526,11 @@ contains
     n = u%dof%size()
 
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call device_memcpy(u%x, u%x_d, n, DEVICE_TO_HOST, sync=.true.)
-       call device_memcpy(v%x, v%x_d, n, DEVICE_TO_HOST, sync=.true.)
-       call device_memcpy(w%x, w%x_d, n, DEVICE_TO_HOST, sync=.true.)
+       call device_memcpy(u%x, u%x_d, n, DEVICE_TO_HOST, sync = .true.)
+       call device_memcpy(v%x, v%x_d, n, DEVICE_TO_HOST, sync = .true.)
+       call device_memcpy(w%x, w%x_d, n, DEVICE_TO_HOST, sync = .true.)
        if (this%include_scalar) then
-          call device_memcpy(s%x, s%x_d, n, DEVICE_TO_HOST, sync=.true.)
+          call device_memcpy(s%x, s%x_d, n, DEVICE_TO_HOST, sync = .true.)
        end if
     end if
 
@@ -642,7 +642,7 @@ contains
 
       if (mode_cmd /= MODE_ADJOINT) then
          call neko_error('Expected MODE_ADJOINT from Python at ' // &
-              'forward->adjoint boundary.')
+              'forward-to-adjoint boundary.')
       end if
     end if
 
@@ -663,14 +663,14 @@ contains
     if (NEKO_BCKND_DEVICE .eq. 1) then
        do i = 1, this%n_modes
           call device_memcpy(this%u_modes(i)%x, this%u_modes(i)%x_d, n, &
-               HOST_TO_DEVICE, sync=.true.)
+               HOST_TO_DEVICE, sync = .true.)
           call device_memcpy(this%v_modes(i)%x, this%v_modes(i)%x_d, n, &
-               HOST_TO_DEVICE, sync=.true.)
+               HOST_TO_DEVICE, sync = .true.)
           call device_memcpy(this%w_modes(i)%x, this%w_modes(i)%x_d, n, &
-               HOST_TO_DEVICE, sync=.true.)
+               HOST_TO_DEVICE, sync = .true.)
           if (this%include_scalar) then
              call device_memcpy(this%s_modes(i)%x, this%s_modes(i)%x_d, &
-                  n, HOST_TO_DEVICE, sync=.true.)
+                  n, HOST_TO_DEVICE, sync = .true.)
           end if
        end do
     end if
@@ -756,8 +756,8 @@ contains
     integer :: n
     integer :: ierr, file_unit
 
-    open(file = trim(file_in%get_fname()), status='old', &
-         newunit=file_unit, iostat=ierr)
+    open(file = trim(file_in%get_fname()), status = 'old', &
+         newunit = file_unit, iostat = ierr)
     if (ierr .ne. 0) then
        call neko_error("Error opening " // trim(file_in%get_fname()))
     end if
@@ -765,12 +765,12 @@ contains
 
     n = 0
     do
-       read(file_unit, *, iostat=ierr)
+       read(file_unit, *, iostat = ierr)
        if (ierr .ne. 0) exit
        n = n + 1
     end do
 
-    close(unit=file_unit)
+    close(unit = file_unit)
   end function csv_file_count_lines
 
 

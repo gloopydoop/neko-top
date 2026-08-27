@@ -343,7 +343,7 @@ contains
           inquire(file = trim(file_name), exist = exists)
           if (exists) then
              open(newunit = unit, file = trim(file_name), iostat = stat, &
-                  status='old')
+                  status = 'old')
              if (stat .eq. 0) close(unit, status = 'delete')
           end if
        end do
