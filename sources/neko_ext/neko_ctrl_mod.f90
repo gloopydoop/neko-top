@@ -98,7 +98,7 @@ contains
     if (.not. this%debug) return
     call MPI_Comm_rank(neko_comm, r, ierr)
     call MPI_Comm_size(neko_comm, s, ierr)
-    write(*, '(A,I0,A,I0,A,A)') '[neko_ctrl r=', r, '/', s, '] ', trim(msg)
+    write(*, '(A,I0,A,I0,A,A)') '[neko_ctrl r:', r, '/', s, '] ', trim(msg)
   end subroutine ctrl_dbg_print
 
   !> Convert mode enum to human-readable name.
@@ -153,7 +153,7 @@ contains
        call neko_error('NEKO_CTRL_PEER_ROOT must be set for POD MPI control.')
     end if
 
-    read(env_val(1:env_len), *, iostat=ios) this%peer_root
+    read(env_val(1:env_len), *, iostat = ios) this%peer_root
     if (ios /= 0 .or. this%peer_root < 0) then
        call neko_error('Invalid NEKO_CTRL_PEER_ROOT for POD MPI control.')
     end if
@@ -198,9 +198,9 @@ contains
     state_i(2) = int(phase, int32)
     state_i(3) = int(step, int32)
 
-    write(msg, '(A,A,A,A,A,I0,A,ES12.4)') 'ctrl_send: mode=', &
-         trim(mode_name(mode)), ' phase=', trim(phase_name(phase)), &
-         ' step=', int(step), ' t=', real(time, kind=real64)
+    write(msg, '(A,A,A,A,A,I0,A,ES12.4)') 'ctrl_send: mode:', &
+         trim(mode_name(mode)), ' phase:', trim(phase_name(phase)), &
+         ' step:', int(step), ' t:', real(time, real64)
     call ctrl_dbg_print(this, msg)
     ! MPI_COMM_WORLD intentionally crosses from the Neko group to Python.
     call MPI_Send(state_i, size(state_i), MPI_INTEGER4, this%peer_root, &
@@ -222,8 +222,8 @@ contains
 
     call MPI_Comm_rank(neko_comm, rank, ierr)
 
-    write(msg, '(A,A,A,A)') 'ctrl_recieve: enter with defaults mode=', &
-         trim(mode_name(mode_cmd)), ' phase=', trim(phase_name(phase_cmd))
+    write(msg, '(A,A,A,A)') 'ctrl_recieve: enter with defaults mode:', &
+         trim(mode_name(mode_cmd)), ' phase:', trim(phase_name(phase_cmd))
     call ctrl_dbg_print(this, msg)
 
     if (rank == 0) then
@@ -248,8 +248,8 @@ contains
     mode_cmd = mode_i
     phase_cmd = phase_i
 
-    write(msg, '(A,A,A,A)') 'ctrl_recieve: exit with mode=', &
-         trim(mode_name(mode_cmd)), ' phase=', trim(phase_name(phase_cmd))
+    write(msg, '(A,A,A,A)') 'ctrl_recieve: exit with mode:', &
+         trim(mode_name(mode_cmd)), ' phase:', trim(phase_name(phase_cmd))
     call ctrl_dbg_print(this, msg)
   end subroutine ctrl_stream_recieve
 
