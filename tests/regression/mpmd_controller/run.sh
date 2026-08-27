@@ -11,7 +11,7 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 # shellcheck disable=SC1091
 source "${repo_root}/scripts/mpmd_run_helpers.sh"
 
-mpmd_validate_mpi4py
+mpmd_ensure_python_runtime "${repo_root}"
 if ! mpmd_launch_shared "${case_path}" "${python_peer}" "${neko_driver}" \
     1 1 "${log_file}"
 then
