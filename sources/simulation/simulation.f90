@@ -60,7 +60,7 @@ module simulation_m
   use simulation, only: simulation_init, simulation_step, simulation_finalize, &
        simulation_restart
   use state_recover, only: state_recover_t
-  use state_recover_fctry, only: state_recover_factory
+  use state_recover_factory, only: state_recover_create
   use runtime_stats, only: neko_rt_stats
   implicit none
   private
@@ -269,7 +269,7 @@ contains
        end if
 
        call json_get(parameters, 'state_recovery', state_recovery_params)
-       call state_recover_factory(this%state_recover, this%neko_case, &
+       call state_recover_create(this%state_recover, this%neko_case, &
             state_recovery_params)
     else if ("state_recovery" .in. parameters) then
        call neko_error( &
@@ -331,12 +331,6 @@ contains
     call this%neko_case%time%reset()
     call simulation_init(this%neko_case, dt_controller)
 
-    if (this%unsteady) then
-       if (.not. allocated(this%state_recover)) then
-          call neko_error("State recovery not initialized.")
-       end if
-    end if
-
     call profiler_start_region("Forward simulation")
     loop_start = MPI_WTIME()
     this%n_timesteps = 0
@@ -346,7 +340,10 @@ contains
        call simulation_step(this%neko_case, dt_controller, loop_start)
 
        if (this%unsteady) then
-          call this%state_recover%save()
+          if (.not. allocated(this%state_recover)) then
+             call neko_error("State recovery not initialized.")
+          end if
+          call this%state_recover%save(this%neko_case)
        end if
     end do
     call profiler_end_region("Forward simulation")
@@ -367,18 +364,15 @@ contains
 
     call simulation_adjoint_init(this%adjoint_case, dt_controller)
 
-    if (this%unsteady) then
-       if (.not. allocated(this%state_recover)) then
-          call neko_error("State recovery not initialized.")
-       end if
-    end if
-
     call profiler_start_region("Adjoint simulation")
     cfl = this%adjoint_case%fluid_adj%compute_cfl(this%adjoint_case%time%dt)
     loop_start = MPI_WTIME()
     do i = this%n_timesteps, 1, -1
        if (this%unsteady) then
-          call this%state_recover%restore(i)
+          if (.not. allocated(this%state_recover)) then
+             call neko_error("State recovery not initialized.")
+          end if
+          call this%state_recover%restore(this%neko_case, i)
        end if
 
        call simulation_adjoint_step(this%adjoint_case, dt_controller, cfl, &

@@ -98,6 +98,7 @@ target_include_directories(neko-top PUBLIC
 target_link_libraries(neko-top PUBLIC
     PkgConfig::neko
     PkgConfig::json-fortran
+    $<$<BOOL:${HAVE_HDF5}>:HDF5::HDF5>
     MPI::MPI_Fortran
     OpenMP::OpenMP_Fortran
     $<$<BOOL:${BLAS_FOUND}>:BLAS::BLAS>
@@ -106,10 +107,12 @@ target_link_libraries(neko-top PUBLIC
     $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::cudart>
     $<$<BOOL:${hipblas_FOUND}>:roc::hipblas>
     $<$<BOOL:${hipsolver_FOUND}>:roc::hipsolver>
-    neko_cxx_support  # ADIOS2/MPI C++/stdc++ must come after libneko
-    $<$<BOOL:${HDF5_PKG_FOUND}>:PkgConfig::HDF5>
-    $<$<BOOL:${HDF5_FOUND}>:HDF5::HDF5>
 )
+
+if(TARGET neko_cxx_support)
+    # ADIOS2/MPI C++/stdc++ must come after libneko.
+    target_link_libraries(neko-top PUBLIC neko_cxx_support)
+endif()
 
 # ============================================================================ #
 # Specify installation instructions
@@ -119,9 +122,11 @@ add_library(${PROJECT_NAME}::neko-top ALIAS neko-top)
 # Install the neko-top library and its modules.
 # These should adhere to the CMake installation conventions.
 
-install(TARGETS neko_cxx_support
-    EXPORT neko-top-targets
-)
+if(TARGET neko_cxx_support)
+    install(TARGETS neko_cxx_support
+        EXPORT neko-top-targets
+    )
+endif()
 install(TARGETS neko-top
     EXPORT neko-top-targets
     ARCHIVE DESTINATION lib/neko-top

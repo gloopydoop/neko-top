@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Validate the Python packages required by the ADIOS2 POD MPMD runtime."""
+"""Validate the Python packages required by the generic ADIOS2 MPMD runtime."""
 
 import os
 import sys
@@ -24,18 +24,6 @@ CHECKS = (
     ("numpy", "import numpy"),
     ("mpi4py.MPI", "from mpi4py import MPI"),
     ("adios2.bindings", "import adios2.bindings"),
-    ("pysemtools.datatypes.coef", "from pysemtools.datatypes.coef import Coef"),
-    ("pysemtools.datatypes.msh", "from pysemtools.datatypes.msh import Mesh"),
-    (
-        "pysemtools.io.adios2.stream",
-        "from pysemtools.io.adios2.stream import DataStreamer",
-    ),
-    (
-        "pysemtools.io.utils",
-        "from pysemtools.io.utils import get_fld_from_ndarray",
-    ),
-    ("pysemtools.rom.io_help", "from pysemtools.rom.io_help import IoHelp"),
-    ("pysemtools.rom.pod", "from pysemtools.rom.pod import POD"),
 )
 
 

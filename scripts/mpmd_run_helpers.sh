@@ -2,8 +2,8 @@
 
 # Generic helpers for coupled Neko/Python ADIOS2 MPMD launches.
 #
-# This layer locates and validates the runtime recorded by setup.sh, then runs
-# a mixed Python/Neko job through mpirun or srun --multi-prog. Cluster-specific
+# This layer locates and validates the active MPMD runtime, then runs a mixed
+# Python/Neko job through mpirun or srun --multi-prog. Cluster-specific
 # placement remains separate so that it can build on this portable path.
 
 _mpmd_helper_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -50,28 +50,66 @@ function mpmd_find_repo_root() {
     printf '%s\n' "${root_dir}"
 }
 
-function mpmd_runtime_env_file() {
-    local root_dir=$1
-    local repo_root
+function mpmd_prepend_path_var() {
+    local var_name=$1
+    local path_value=$2
+    local current_value
 
-    repo_root=$(mpmd_find_repo_root "${root_dir}") || return 1
-    printf '%s\n' "${repo_root}/build/mpmd_runtime.env"
-}
-
-function mpmd_source_runtime_env() {
-    local root_dir=$1
-    local runtime_env
-
-    runtime_env=$(mpmd_runtime_env_file "${root_dir}") || return 1
-    if [ ! -f "${runtime_env}" ]; then
-        echo "Error: MPMD runtime env not found: ${runtime_env}" >&2
-        echo "Run setup.sh after activating the target Python environment." >&2
-        return 1
+    if [ ! -d "${path_value}" ]; then
+        return 0
     fi
 
-    # shellcheck disable=SC1090
-    source "${runtime_env}"
-    export MPMD_RUNTIME_ENV_FILE="${runtime_env}"
+    current_value=${!var_name:-}
+    case ":${current_value}:" in
+        *:"${path_value}":*) ;;
+        *)
+            if [ -n "${current_value}" ]; then
+                export "${var_name}=${path_value}:${current_value}"
+            else
+                export "${var_name}=${path_value}"
+            fi
+            ;;
+    esac
+}
+
+function mpmd_configure_local_runtime() {
+    local root_dir=$1
+    local repo_root
+    local pyexe
+    local pyver
+
+    repo_root=$(mpmd_find_repo_root "${root_dir}") || return 1
+
+    if [ -z "${NEKO_DIR:-}" ] && [ -d "${repo_root}/external/neko" ]; then
+        export NEKO_DIR="${repo_root}/external/neko"
+    fi
+    if [ -n "${NEKO_DIR:-}" ]; then
+        mpmd_prepend_path_var PATH "${NEKO_DIR}/bin"
+        mpmd_prepend_path_var LD_LIBRARY_PATH "${NEKO_DIR}/lib"
+    fi
+
+    if [ -z "${ADIOS2_DIR:-}" ] && [ -d "${repo_root}/external/adios2" ]; then
+        export ADIOS2_DIR="${repo_root}/external/adios2"
+    fi
+    if [ -n "${ADIOS2_DIR:-}" ]; then
+        ADIOS2_DIR=$(realpath "${ADIOS2_DIR}")
+        export ADIOS2_DIR
+        export ADIOS2_PATH="${ADIOS2_DIR}"
+        mpmd_prepend_path_var PATH "${ADIOS2_DIR}/bin"
+        mpmd_prepend_path_var LD_LIBRARY_PATH "${ADIOS2_DIR}/lib"
+        mpmd_prepend_path_var LD_LIBRARY_PATH "${ADIOS2_DIR}/lib64"
+        mpmd_prepend_path_var PKG_CONFIG_PATH "${ADIOS2_DIR}/lib/pkgconfig"
+        mpmd_prepend_path_var PKG_CONFIG_PATH "${ADIOS2_DIR}/lib64/pkgconfig"
+
+        pyexe=$(mpmd_python_exe 2>/dev/null || true)
+        if [ -n "${pyexe}" ]; then
+            pyver=$("${pyexe}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+            mpmd_prepend_path_var PYTHONPATH \
+                "${ADIOS2_DIR}/lib/python${pyver}/site-packages"
+            mpmd_prepend_path_var PYTHONPATH \
+                "${ADIOS2_DIR}/lib64/python${pyver}/site-packages"
+        fi
+    fi
 }
 
 function mpmd_validate_python_runtime() {
@@ -95,7 +133,7 @@ function mpmd_validate_python_runtime() {
     if ! "${pyexe}" "${validator}"; then
         echo "Error: the active Python runtime is not valid." >&2
         echo "Python: ${pyexe}" >&2
-        echo "Runtime env: ${MPMD_RUNTIME_ENV_FILE:-<unset>}" >&2
+        echo "ADIOS2_DIR: ${ADIOS2_DIR:-<unset>}" >&2
         return 1
     fi
 
@@ -117,22 +155,26 @@ function mpmd_validate_neko_adios2() {
     fi
 }
 
-function mpmd_prepare_python_runtime() {
+function mpmd_prepare_runtime() {
     local root_dir=$1
 
-    mpmd_source_runtime_env "${root_dir}" || return 1
+    mpmd_configure_local_runtime "${root_dir}" || return 1
     mpmd_validate_python_runtime "${root_dir}" || return 1
     mpmd_validate_neko_adios2
 }
 
-function mpmd_ensure_python_runtime() {
+function mpmd_ensure_runtime() {
     local root_dir=${1:-${MAIN_DIR:-.}}
 
-    mpmd_prepare_python_runtime "${root_dir}"
+    mpmd_prepare_runtime "${root_dir}"
+}
+
+function mpmd_ensure_python_runtime() {
+    mpmd_ensure_runtime "$@"
 }
 
 function mpmd_ensure_adios2_python() {
-    mpmd_ensure_python_runtime "$@"
+    mpmd_ensure_runtime "$@"
 }
 
 function mpmd_startup_delay() {
@@ -198,7 +240,9 @@ function mpmd_print_runtime_env() {
     echo "NEKO_LAUNCHER:      ${NEKO_LAUNCHER:-auto}"
     echo "Selected launcher:  $(mpmd_selected_launcher 2>/dev/null || echo \
 '<unavailable>')"
-    echo "Python runtime env: ${MPMD_RUNTIME_ENV_FILE:-<unset>}"
+    echo "CONDA_PREFIX:       ${CONDA_PREFIX:-<unset>}"
+    echo "VIRTUAL_ENV:        ${VIRTUAL_ENV:-<unset>}"
+    echo "ADIOS2_DIR:         ${ADIOS2_DIR:-<unset>}"
     echo "ADIOS2_PATH:        ${ADIOS2_PATH:-<unset>}"
     echo "PYTHONPATH:         ${PYTHONPATH:-<unset>}"
     echo "LD_LIBRARY_PATH:    ${LD_LIBRARY_PATH:-<unset>}"

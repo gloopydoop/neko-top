@@ -118,15 +118,18 @@ function(build_example)
         PkgConfig::neko
         PkgConfig::json-fortran
         MPI::MPI_Fortran
-        MPI::MPI_CXX
         $<$<BOOL:${BLAS_FOUND}>:BLAS::BLAS>
         $<$<BOOL:${LAPACK_FOUND}>:LAPACK::LAPACK>
-        neko_cxx_support
         $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::cusolver>
         $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::cudart>
         $<$<BOOL:${hipblas_FOUND}>:roc::hipblas>
         $<$<BOOL:${hipsolver_FOUND}>:roc::hipsolver>
     )
+
+    if(TARGET neko_cxx_support)
+        # Keep the ADIOS2 C++ libraries after libneko in the final link line.
+        target_link_libraries(${EXAMPLE_NAME} neko_cxx_support)
+    endif()
 
     # Reset the module directory if we set it earlier.
     if (DEFINED EXTRA_SOURCES)

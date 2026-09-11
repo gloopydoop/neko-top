@@ -32,7 +32,7 @@
 
 # -- Notification options
 
-# Set the email to recieve to and when to recieve it
+# Set the email to receive to and when to receive it
 #BSUB -Ne    # Send notification at completion
 
 # -- Mandatory options, change with great care.
