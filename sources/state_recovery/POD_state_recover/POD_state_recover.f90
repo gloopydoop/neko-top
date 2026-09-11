@@ -275,6 +275,7 @@ contains
     integer :: i
     character(len=80) :: str
 
+    this%neko_case => neko_case
     this%enabled = .true.
     this%i_stream = i_stream
     this%n_modes = n_modes
@@ -479,6 +480,7 @@ contains
     this%recon_output_format = 'fld'
     this%recon_file_name = 'pod_reconstruction'
     nullify(this%s)
+    nullify(this%neko_case)
     this%enabled = .false.
   end subroutine POD_state_recover_free
 
@@ -543,10 +545,8 @@ contains
 
   !> Stream forward state for POD updates.
   !! @param[inout] this POD state recovery instance.
-  !! @param[inout] neko_case Case data structure.
-  subroutine POD_state_recover_save(this, neko_case)
+  subroutine POD_state_recover_save(this)
     class(POD_state_recover_t), intent(inout) :: this
-    class(case_t), intent(inout) :: neko_case
     if (.not. this%enabled) return
 
     this%pod_tstep = this%pod_tstep + 1
@@ -564,10 +564,11 @@ contains
     if (this%ctrl%inited) then
        call this%ctrl%send(MODE_FORWARD, PHASE_FWD_RUNNING, &
             int(this%pod_tstep, int32), &
-            real(neko_case%time%t - neko_case%time%start_time, real64))
+            real(this%neko_case%time%t - this%neko_case%time%start_time, &
+            real64))
     end if
 
-    call POD_state_recover_stream_fields(this, neko_case)
+    call POD_state_recover_stream_fields(this, this%neko_case)
 
     call profiler_end_region("POD save")
   end subroutine POD_state_recover_save
@@ -575,11 +576,9 @@ contains
 
   !> Reconstruct and restore state from POD during adjoint.
   !! @param[inout] this POD state recovery instance.
-  !! @param[inout] neko_case Case data structure.
   !! @param[in] tstep Forward-state index to restore.
-  subroutine POD_state_recover_restore(this, neko_case, tstep)
+  subroutine POD_state_recover_restore(this, tstep)
     class(POD_state_recover_t), intent(inout) :: this
-    class(case_t), target, intent(inout) :: neko_case
     integer, intent(in) :: tstep
     type(time_state_t) :: time
     type(time_state_t) :: time_out
@@ -588,12 +587,12 @@ contains
 
     if (.not. this%enabled) return
 
-    n_case_timesteps = nint((neko_case%time%end_time - &
-         neko_case%time%start_time) / neko_case%time%dt)
-    time = neko_case%time
+    n_case_timesteps = nint((this%neko_case%time%end_time - &
+         this%neko_case%time%start_time) / this%neko_case%time%dt)
+    time = this%neko_case%time
     time%tstep = tstep
-    time%t = neko_case%time%end_time - &
-         real(n_case_timesteps - tstep, rp) * neko_case%time%dt
+    time%t = this%neko_case%time%end_time - &
+         real(n_case_timesteps - tstep, rp) * this%neko_case%time%dt
 
     ! First restore() call is the phase boundary forward->adjoint
     if (.not. this%have_received_modes) then
@@ -610,7 +609,7 @@ contains
     call profiler_start_region("POD restore")
     t_pod = time%t - time%start_time
     call interpolate_time_coeffs_vec(this%a_interp, this%time_coefs, t_pod)
-    call reconstruct_from_coeffs(this, neko_case, this%a_interp)
+    call reconstruct_from_coeffs(this, this%neko_case, this%a_interp)
     if (this%output_reconstruction) then
        if (recon_should_output(this, time, time_out)) then
           call this%recon_output%sample(time_out%t)
