@@ -597,7 +597,7 @@ contains
 
     ! First restore() call is the phase boundary forward->adjoint
     if (.not. this%have_received_modes) then
-       call POD_state_recover_recieve_modes(this, time)
+       call POD_state_recover_receive_modes(this, time)
     end if
 
     ! Emit ADJ_RUNNING only once (avoid flooding SST)
@@ -622,13 +622,13 @@ contains
   !> Receive POD modes at the forward-to-adjoint boundary.
   !! @param[inout] this POD state recovery instance.
   !! @param[in] time Target time state.
-  subroutine POD_state_recover_recieve_modes(this, time)
+  subroutine POD_state_recover_receive_modes(this, time)
     class(POD_state_recover_t), intent(inout) :: this
     type(time_state_t), intent(in) :: time
     integer :: i, ierr, n_lines, nrows, ncols, n
     integer(int32) :: mode_cmd, phase_cmd
 
-    call profiler_start_region("POD recieve modes")
+    call profiler_start_region("POD receive modes")
 
     if (this%ctrl%inited) then
       call this%ctrl%send(MODE_FORWARD, PHASE_FWD_DONE, &
@@ -638,7 +638,7 @@ contains
       phase_cmd = PHASE_FWD_DONE
 
       ! BLOCK until Python says "go adjoint"
-      call this%ctrl%recieve(mode_cmd, phase_cmd)
+      call this%ctrl%receive(mode_cmd, phase_cmd)
 
       if (mode_cmd /= MODE_ADJOINT) then
          call neko_error('Expected MODE_ADJOINT from Python at ' // &
@@ -687,8 +687,8 @@ contains
          neko_comm, ierr)
 
     this%have_received_modes = .true.
-    call profiler_end_region("POD recieve modes")
-  end subroutine POD_state_recover_recieve_modes
+    call profiler_end_region("POD receive modes")
+  end subroutine POD_state_recover_receive_modes
 
   logical function recon_should_output(this, time, time_out)
     class(POD_state_recover_t), intent(in) :: this

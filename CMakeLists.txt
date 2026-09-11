@@ -35,7 +35,7 @@
 # ============================================================================ #
 
 cmake_minimum_required(VERSION 3.21)
-project(Neko-TOP VERSION 0.0.1 LANGUAGES C Fortran CXX)
+project(Neko-TOP VERSION 0.0.1 LANGUAGES Fortran)
 
 # Set language standards
 set(CMAKE_Fortran_STANDARD 2008)
@@ -120,42 +120,40 @@ set(CMAKE_PREFIX_PATH ${JSON_FORTRAN_DIR} ${CMAKE_PREFIX_PATH})
 # Find the JSON-Fortran library
 pkg_check_modules(json-fortran REQUIRED IMPORTED_TARGET json-fortran)
 
-# Interface target to collect all C++/ADIOS2 deps needed by libneko
-add_library(neko_cxx_support INTERFACE)
+# ............................................................................ #
+# Optional ADIOS2 support
 
-# ADIOS2 Support
+set(HAVE_ADIOS2 FALSE CACHE INTERNAL "Neko-TOP ADIOS2 support disabled")
 
-if (NOT DEFINED ADIOS2_DIR)
-    if (DEFINED ENV{ADIOS2_DIR} AND IS_ABSOLUTE $ENV{ADIOS2_DIR})
-        set(ADIOS2_DIR $ENV{ADIOS2_DIR} CACHE STRING
-            "Path to the ADIOS2 installation")
-    elseif(DEFINED ENV{ADIOS2_DIR})
-        set(ADIOS2_DIR ${EXTERNAL_DIR}/$ENV{ADIOS2_DIR}
-            CACHE STRING "Path to the ADIOS2 installation")
+if (NOT ADIOS2_DIR AND DEFINED ENV{ADIOS2_DIR})
+    set(ADIOS2_DIR $ENV{ADIOS2_DIR} CACHE STRING
+        "Path to the ADIOS2 installation")
+endif()
+
+if(ADIOS2_DIR)
+    if (NOT IS_ABSOLUTE "${ADIOS2_DIR}")
+        set(ADIOS2_DIR ${EXTERNAL_DIR}/${ADIOS2_DIR}
+            CACHE STRING "Path to the ADIOS2 installation" FORCE)
     endif()
-endif()
 
-if (DEFINED ADIOS2_DIR)
-    set(CMAKE_PREFIX_PATH ${ADIOS2_DIR} ${CMAKE_PREFIX_PATH})
-endif()
+    find_program(ADIOS2_CONFIG_EXECUTABLE
+        NAMES adios2-config
+        HINTS ${ADIOS2_DIR}/bin
+        NO_DEFAULT_PATH
+    )
 
-find_package(ADIOS2 QUIET COMPONENTS CXX MPI)
+    if(NOT ADIOS2_CONFIG_EXECUTABLE)
+        message(FATAL_ERROR "ADIOS2 support was requested, but adios2-config "
+            "was not found in ${ADIOS2_DIR}/bin.")
+    endif()
 
-if (ADIOS2_FOUND)
-    set(HAVE_ADIOS2 TRUE)
-    add_compile_definitions(HAVE_ADIOS2=1)
-endif()
+    # Interface target to collect all C++/ADIOS2 deps needed by libneko.
+    add_library(neko_cxx_support INTERFACE)
+    set(HAVE_ADIOS2 TRUE CACHE INTERNAL "Neko-TOP ADIOS2 support enabled")
 
-# --- ADIOS2 C++ libs (C++ interface that nek_adios2.cpp uses) ---
-
-# Try to locate adios2-config either via ADIOS2_DIR or in PATH
-find_program(ADIOS2_CONFIG_EXECUTABLE
-    NAMES adios2-config
-    HINTS ${ADIOS2_DIR}/bin $ENV{ADIOS2_DIR}/bin
-)
-
-if(ADIOS2_CONFIG_EXECUTABLE)
     message(STATUS "Found adios2-config: ${ADIOS2_CONFIG_EXECUTABLE}")
+    enable_language(C CXX)
+
     execute_process(
         COMMAND ${ADIOS2_CONFIG_EXECUTABLE} --cxx-libs
         OUTPUT_VARIABLE ADIOS2_CXX_LIBS
@@ -166,20 +164,19 @@ if(ADIOS2_CONFIG_EXECUTABLE)
         separate_arguments(ADIOS2_CXX_LIBS)
         target_link_libraries(neko_cxx_support INTERFACE ${ADIOS2_CXX_LIBS})
     endif()
+
+    # MPI C++ and the standard C++ runtime are needed by Neko's ADIOS2 code.
+    find_package(MPI REQUIRED COMPONENTS CXX)
+    target_link_libraries(neko_cxx_support INTERFACE MPI::MPI_CXX stdc++)
+
+    # Some MPI wrappers (e.g., mpifort) do not link libmpi_cxx automatically.
+    # Add it explicitly when available so libneko's C++ MPI symbols resolve.
+    find_library(MPI_CXX_LIB NAMES mpi_cxx)
+    if(MPI_CXX_LIB)
+        target_link_libraries(neko_cxx_support INTERFACE ${MPI_CXX_LIB})
+    endif()
 else()
-    message(STATUS "adios2-config not found; ADIOS2 C++ support will not be linked.")
-endif()
-
-
-# --- MPI C++ and standard C++ runtime ---
-find_package(MPI REQUIRED COMPONENTS CXX)
-target_link_libraries(neko_cxx_support INTERFACE MPI::MPI_CXX stdc++)
-
-# Some MPI wrappers (e.g., mpifort) do not link libmpi_cxx automatically.
-# Add it explicitly when available so libneko's C++ MPI symbols resolve.
-find_library(MPI_CXX_LIB NAMES mpi_cxx)
-if(MPI_CXX_LIB)
-    target_link_libraries(neko_cxx_support INTERFACE ${MPI_CXX_LIB})
+    message(STATUS "ADIOS2_DIR not set; ADIOS2 support disabled.")
 endif()
 
 # ............................................................................ #
@@ -205,37 +202,39 @@ pkg_get_variable(DEVICE_TYPE neko backend)
 
 # ............................................................................ #
 # HDF5 Support
+#
+# Neko-TOP's own HDF5 I/O (sources/IO/hdf5/*.f90) requires an MPI-parallel
+# HDF5. The install prefix is HDF5_ROOT, set by scripts/dependencies.sh or by
+# the site's module system.
 
-if (NOT DEFINED HDF5_DIR)
-    if (DEFINED ENV{HDF5_DIR} AND IS_ABSOLUTE $ENV{HDF5_DIR})
-        set(HDF5_DIR $ENV{HDF5_DIR} CACHE STRING
-            "Path to the HDF5 installation")
-    elseif(DEFINED ENV{HDF5_DIR})
-        set(HDF5_DIR ${EXTERNAL_DIR}/$ENV{HDF5_DIR}
-            CACHE STRING "Path to the HDF5 installation")
-    endif()
+# Record if we explicitly requested HDF5 support.
+if (DEFINED HDF5_ROOT OR DEFINED ENV{HDF5_ROOT})
+    set(_hdf5_requested TRUE)
+else()
+    set(_hdf5_requested FALSE)
 endif()
 
-if (DEFINED HDF5_DIR)
-    set(CMAKE_PREFIX_PATH ${HDF5_DIR} ${CMAKE_PREFIX_PATH})
+# Use FindHDF5's module mode; its config-mode branch can select a different
+# installation than the one HDF5_ROOT points at.
+set(HDF5_NO_FIND_PACKAGE_CONFIG_FILE TRUE)
+find_package(HDF5 COMPONENTS Fortran)
+
+# Determine if the HDF5 found is serial or parallel.
+if (HDF5_FOUND AND DEFINED HDF5_IS_PARALLEL AND NOT HDF5_IS_PARALLEL)
+    set(_hdf5_known_serial TRUE)
+else()
+    set(_hdf5_known_serial FALSE)
 endif()
 
-find_package(HDF5 QUIET COMPONENTS Fortran)
-if (NOT HDF5_FOUND)
-    pkg_check_modules(HDF5 QUIET IMPORTED_TARGET hdf5)
-    if (NOT HDF5_FOUND)
-        pkg_check_modules(HDF5 QUIET IMPORTED_TARGET hdf5_parallel)
-    endif()
-
-    if (HDF5_FOUND)
-        set(HDF5_PKG_FOUND TRUE)
-        set(HDF5_FOUND FALSE)
-    endif()
-endif()
-
-if (HDF5_FOUND OR HDF5_PKG_FOUND)
-    set(HAVE_HDF5 TRUE)
+if (_hdf5_requested AND _hdf5_known_serial)
+    message(fatal_error "Found HDF5 ${HDF5_VERSION}, but it is not parallel.")
+elseif (_hdf5_requested AND NOT HDF5_FOUND)
+    message(fatal_error "HDF5 support was requested, but HDF5 was not found.")
+elseif (HDF5_FOUND)
+    set(HAVE_HDF5 TRUE CACHE INTERNAL "Neko-TOP HDF5 support enabled")
     add_compile_definitions(HAVE_HDF5=1)
+else()
+    set(HAVE_HDF5 FALSE CACHE INTERNAL "Neko-TOP HDF5 support disabled")
 endif()
 
 # ............................................................................ #
@@ -280,15 +279,6 @@ add_custom_target(neko-top_ready
     DEPENDS neko-top
     COMMENT "Neko-TOP library is ready.")
 add_dependencies(neko-top-a neko-top_ready)
-# Anything that links against neko-top-a also needs the full Neko stack
-# (core Neko lib, JSON-Fortran, BLAS/LAPACK and the C++/ADIOS2 bits)
-target_link_libraries(neko-top-a INTERFACE
-    PkgConfig::neko          # libneko.a + its C deps
-    PkgConfig::json-fortran  # JSON-Fortran
-    neko_cxx_support         # ADIOS2 C++ + MPI C++ + libstdc++
-    ${LAPACK_LIBRARIES}
-    ${BLAS_LIBRARIES}
-)
 
 # ============================================================================ #
 # Build the examples
@@ -326,12 +316,12 @@ if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
     message(STATUS "- JSON_FORTRAN_DIR: ${JSON_FORTRAN_DIR}")
     message(STATUS "- NEKO_DIR:         ${NEKO_DIR}")
     message(STATUS "- PFUNIT_DIR:       ${PFUNIT_DIR}")
-    if (DEFINED HDF5_DIR AND IS_DIRECTORY "${HDF5_DIR}")
-        message(STATUS "- HDF5:             ${HDF5_DIR}")
-    elseif (HDF5_FOUND)
-        message(STATUS "- HDF5:             Found (HDF5 support enabled)")
+    if (HAVE_HDF5 AND HDF5_IS_PARALLEL)
+        message(STATUS "- HDF5:             ${HDF5_VERSION} (parallel)")
+    elseif (HAVE_HDF5)
+        message(STATUS "- HDF5:             ${HDF5_VERSION} (parallel assumed)")
     else()
-        message(STATUS "- HDF5:             Not found (HDF5 support disabled)")
+        message(STATUS "- HDF5:             Disabled (not found)")
     endif()
     message(STATUS ${BARRIER})
     message(STATUS "")

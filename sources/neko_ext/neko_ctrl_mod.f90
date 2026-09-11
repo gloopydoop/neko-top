@@ -84,7 +84,7 @@ module neko_ctrl_mod
      procedure, pass(this) :: init => ctrl_stream_init
      procedure, pass(this) :: free => ctrl_stream_free
      procedure, pass(this) :: send => ctrl_stream_send
-     procedure, pass(this) :: recieve => ctrl_stream_recieve
+     procedure, pass(this) :: receive => ctrl_stream_receive
   end type ctrl_stream_t
 
 contains
@@ -209,8 +209,8 @@ contains
          CTRL_TAG_STATE_REAL, MPI_COMM_WORLD, ierr)
   end subroutine ctrl_stream_send
 
-  !> Recieve a control command and broadcast it to all ranks.
-  subroutine ctrl_stream_recieve(this, mode_cmd, phase_cmd)
+  !> Receive a control command and broadcast it to all ranks.
+  subroutine ctrl_stream_receive(this, mode_cmd, phase_cmd)
     class(ctrl_stream_t), intent(inout) :: this
     integer(int32), intent(inout) :: mode_cmd, phase_cmd
     integer :: ierr, rank
@@ -222,12 +222,12 @@ contains
 
     call MPI_Comm_rank(neko_comm, rank, ierr)
 
-    write(msg, '(A,A,A,A)') 'ctrl_recieve: enter with defaults mode:', &
+    write(msg, '(A,A,A,A)') 'ctrl_receive: enter with defaults mode:', &
          trim(mode_name(mode_cmd)), ' phase:', trim(phase_name(phase_cmd))
     call ctrl_dbg_print(this, msg)
 
     if (rank == 0) then
-       call ctrl_dbg_print(this, 'ctrl_recieve: rank0 waiting on MPI cmd')
+       call ctrl_dbg_print(this, 'ctrl_receive: rank0 waiting on MPI cmd')
        ! Only the Neko root receives from Python; the reply is broadcast below.
        call MPI_Recv(cmd_i, size(cmd_i), MPI_INTEGER4, this%peer_root, &
             CTRL_TAG_CMD, MPI_COMM_WORLD, MPI_STATUS_IGNORE, ierr)
@@ -235,22 +235,22 @@ contains
        phase_i = cmd_i(2)
     else
        call ctrl_dbg_print(this, &
-            'ctrl_recieve: non-root waiting for Bcast from rank0')
+            'ctrl_receive: non-root waiting for Bcast from rank0')
        mode_i = 0_int32
        phase_i = 0_int32
     end if
 
-    call ctrl_dbg_print(this, 'ctrl_recieve: MPI_Bcast(mode)')
+    call ctrl_dbg_print(this, 'ctrl_receive: MPI_Bcast(mode)')
     call MPI_Bcast(mode_i, 1, MPI_INTEGER4, 0, neko_comm, ierr)
-    call ctrl_dbg_print(this, 'ctrl_recieve: MPI_Bcast(phase)')
+    call ctrl_dbg_print(this, 'ctrl_receive: MPI_Bcast(phase)')
     call MPI_Bcast(phase_i, 1, MPI_INTEGER4, 0, neko_comm, ierr)
 
     mode_cmd = mode_i
     phase_cmd = phase_i
 
-    write(msg, '(A,A,A,A)') 'ctrl_recieve: exit with mode:', &
+    write(msg, '(A,A,A,A)') 'ctrl_receive: exit with mode:', &
          trim(mode_name(mode_cmd)), ' phase:', trim(phase_name(phase_cmd))
     call ctrl_dbg_print(this, msg)
-  end subroutine ctrl_stream_recieve
+  end subroutine ctrl_stream_receive
 
 end module neko_ctrl_mod

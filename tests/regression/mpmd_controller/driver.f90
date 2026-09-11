@@ -15,7 +15,7 @@ program mpmd_controller_driver
 
   mode_cmd = 0_int32
   phase_cmd = 0_int32
-  call controller%recieve(mode_cmd, phase_cmd)
+  call controller%receive(mode_cmd, phase_cmd)
 
   if (mode_cmd /= MODE_ADJOINT .or. phase_cmd /= PHASE_ADJ_RUNNING) then
      error stop 'Unexpected command from Python MPMD controller peer.'
