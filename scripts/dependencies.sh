@@ -466,6 +466,12 @@ function find_adios2() {
     if [ -n "${pyver:-}" ] && [ -d "$ADIOS2_DIR/lib64/python${pyver}/site-packages" ]; then
         export PYTHONPATH="$ADIOS2_DIR/lib64/python${pyver}/site-packages${PYTHONPATH:+:$PYTHONPATH}"
     fi
+    if [ -n "${pyver:-}" ] && [ -n "${MAIN_DIR:-}" ] && [ -d "$MAIN_DIR/lib/python${pyver}/site-packages" ]; then
+        export PYTHONPATH="$MAIN_DIR/lib/python${pyver}/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+    fi
+    if [ -n "${pyver:-}" ] && [ -n "${MAIN_DIR:-}" ] && [ -d "$MAIN_DIR/lib64/python${pyver}/site-packages" ]; then
+        export PYTHONPATH="$MAIN_DIR/lib64/python${pyver}/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+    fi
 
     echo "Using ADIOS2_DIR=$ADIOS2_DIR"
     echo "Using Python=${pyexe:-<not found>}"

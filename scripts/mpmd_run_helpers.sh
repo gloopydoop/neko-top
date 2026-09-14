@@ -108,6 +108,10 @@ function mpmd_configure_local_runtime() {
                 "${ADIOS2_DIR}/lib/python${pyver}/site-packages"
             mpmd_prepend_path_var PYTHONPATH \
                 "${ADIOS2_DIR}/lib64/python${pyver}/site-packages"
+            mpmd_prepend_path_var PYTHONPATH \
+                "${repo_root}/lib/python${pyver}/site-packages"
+            mpmd_prepend_path_var PYTHONPATH \
+                "${repo_root}/lib64/python${pyver}/site-packages"
         fi
     fi
 }
