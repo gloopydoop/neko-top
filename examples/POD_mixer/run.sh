@@ -55,7 +55,7 @@ fi
 
 source "${MAIN_DIR}/scripts/mpmd_run_helpers.sh"
 
-mpmd_prepare_python_runtime "${MAIN_DIR}"
+mpmd_ensure_adios2_python "${MAIN_DIR}"
 mpmd_print_runtime_env
 
 cat <<'EOF' > select_gpu

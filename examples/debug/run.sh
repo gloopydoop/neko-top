@@ -171,8 +171,8 @@ print_section "DEBUG SETUP"
 
 runtime_log="${TEST_DIR}/prepare_python_runtime.log"
 {
-    printf 'Command: mpmd_prepare_python_runtime %q\n' "${MAIN_DIR}"
-    mpmd_prepare_python_runtime "${MAIN_DIR}"
+    printf 'Command: mpmd_ensure_adios2_python %q\n' "${MAIN_DIR}"
+    mpmd_ensure_adios2_python "${MAIN_DIR}"
 } > "${runtime_log}" 2>&1
 runtime_rc=$?
 printf 'RC: %s\n' "${runtime_rc}" >> "${runtime_log}"
