@@ -150,6 +150,7 @@ if(ADIOS2_DIR)
     # Interface target to collect all C++/ADIOS2 deps needed by libneko.
     add_library(neko_cxx_support INTERFACE)
     set(HAVE_ADIOS2 TRUE CACHE INTERNAL "Neko-TOP ADIOS2 support enabled")
+    add_compile_definitions(HAVE_ADIOS2=1)
 
     message(STATUS "Found adios2-config: ${ADIOS2_CONFIG_EXECUTABLE}")
     enable_language(C CXX)
