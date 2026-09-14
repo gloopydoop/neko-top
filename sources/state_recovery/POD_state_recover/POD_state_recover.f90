@@ -147,7 +147,7 @@ contains
   subroutine POD_state_recover_init_from_json(this, neko_case, params)
     class(POD_state_recover_t), intent(inout) :: this
     class(case_t), target, intent(inout) :: neko_case
-    type(json_file), target, intent(inout) :: params
+    type(json_file), intent(inout) :: params
     integer :: i_stream, n_modes
     logical :: write_modes
     logical :: debug
@@ -275,6 +275,7 @@ contains
     integer :: i
     character(len=80) :: str
 
+    this%neko_case => neko_case
     this%enabled = .true.
     this%i_stream = i_stream
     this%n_modes = n_modes
@@ -467,6 +468,7 @@ contains
     call this%csv_reader%free()
     call this%a_interp%free()
     nullify(this%coef)
+    nullify(this%neko_case)
 
     call this%ctrl%free()
 
@@ -543,11 +545,14 @@ contains
 
   !> Stream forward state for POD updates.
   !! @param[inout] this POD state recovery instance.
-  !! @param[inout] neko_case Case data structure.
-  subroutine POD_state_recover_save(this, neko_case)
+  subroutine POD_state_recover_save(this)
     class(POD_state_recover_t), intent(inout) :: this
-    class(case_t), intent(inout) :: neko_case
+    class(case_t), pointer :: neko_case
     if (.not. this%enabled) return
+    if (.not. associated(this%neko_case)) then
+       call neko_error('POD state recovery is not associated with a case.')
+    end if
+    neko_case => this%neko_case
 
     this%pod_tstep = this%pod_tstep + 1
     call this%set_n_timesteps(max(this%get_n_timesteps(), this%pod_tstep))
@@ -575,18 +580,21 @@ contains
 
   !> Reconstruct and restore state from POD during adjoint.
   !! @param[inout] this POD state recovery instance.
-  !! @param[inout] neko_case Case data structure.
   !! @param[in] tstep Forward-state index to restore.
-  subroutine POD_state_recover_restore(this, neko_case, tstep)
+  subroutine POD_state_recover_restore(this, tstep)
     class(POD_state_recover_t), intent(inout) :: this
-    class(case_t), target, intent(inout) :: neko_case
     integer, intent(in) :: tstep
+    class(case_t), pointer :: neko_case
     type(time_state_t) :: time
     type(time_state_t) :: time_out
     real(kind=rp) :: t_pod
     integer :: n_case_timesteps
 
     if (.not. this%enabled) return
+    if (.not. associated(this%neko_case)) then
+       call neko_error('POD state recovery is not associated with a case.')
+    end if
+    neko_case => this%neko_case
 
     n_case_timesteps = nint((neko_case%time%end_time - &
          neko_case%time%start_time) / neko_case%time%dt)

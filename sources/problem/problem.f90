@@ -522,6 +522,10 @@ contains
     ! Reset the objective value to zero
     call this%reset_objectives()
 
+    if (.not. allocated(simulation%state_recover)) then
+       call neko_error("State recovery not initialized.")
+    end if
+
     call profiler_start_region("Forward simulation")
     loop_start = MPI_WTIME()
     simulation%n_timesteps = 0
@@ -533,10 +537,7 @@ contains
        ! accumulate objective value
        call this%accumulate_objectives(design, simulation%neko_case%time)
        ! save a checkpoint
-       if (.not. allocated(simulation%state_recover)) then
-          call neko_error("State recovery not initialized.")
-       end if
-       call simulation%state_recover%save(simulation%neko_case)
+       call simulation%state_recover%save()
     end do
     call profiler_end_region("Forward simulation")
 
@@ -578,7 +579,7 @@ contains
 
     do i = simulation%n_timesteps, 1, -1
        ! restore primal field
-       call simulation%state_recover%restore(simulation%neko_case, i)
+       call simulation%state_recover%restore(i)
        ! accumulate objective sensitivity
        accumulation_time = simulation%adjoint_case%time
        accumulation_time%t = total_time - simulation%adjoint_case%time%t
