@@ -40,6 +40,8 @@ CASE_NAME="$(basename "${CASE_FILE}")"
 CASE_BASE="${CASE_NAME%.case}"
 LOG_FILE=${LOG_FILE:-"mpmd_${CASE_BASE}.log"}
 
+rm -f globalArray_f2py.sst globalArray_py2f.sst
+
 mpmd_print_runtime_env
 mpmd_launch_shared "${CASE_FILE}" "${PY_SCRIPT}" "${NEKO_EXE}" \
     "${PY_RANKS}" "${NEKO_RANKS}" "${LOG_FILE}"
