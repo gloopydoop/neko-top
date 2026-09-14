@@ -57,13 +57,20 @@ if [ -z "${NEKO_DIR:-}" ]; then
     fi
 fi
 
-if [ -n "${MAIN_DIR:-}" ] && [ -f "${MAIN_DIR}/build/mpmd_runtime.env" ]; then
-    # shellcheck disable=SC1090
-    source "${MAIN_DIR}/build/mpmd_runtime.env"
-fi
-
 if [ -n "${NEKO_DIR:-}" ]; then
     PATH="${NEKO_DIR}/bin:${PATH}"
+    if [ -d "${NEKO_DIR}/lib" ]; then
+        LD_LIBRARY_PATH="${NEKO_DIR}/lib:${LD_LIBRARY_PATH:-}"
+    fi
+
+    neko_external_dir=$(cd -- "${NEKO_DIR}/.." && pwd)
+    for dep in hdf5 json-fortran adios2; do
+        dep_lib="${neko_external_dir}/${dep}/lib"
+        if [ -d "${dep_lib}" ]; then
+            LD_LIBRARY_PATH="${dep_lib}:${LD_LIBRARY_PATH:-}"
+        fi
+    done
+    unset neko_external_dir
 fi
 
 if [ -n "${MAIN_DIR:-}" ]; then
