@@ -1,6 +1,6 @@
 !> @file simulation.f90
 !! @copyright
-!! Copyright (c) 2025, The Neko-TOP Authors
+!! Copyright (c) 2025-2026, The Neko-TOP Authors
 !! All rights reserved.
 !!
 !! Redistribution and use in source and binary forms, with or without
@@ -36,48 +36,30 @@
 ! Here, we simply march forward to steady state solutions
 module simulation_m
   use case, only: case_t
-  use neko, only: neko_solve
   use user_access_singleton, only: neko_user_access
   use adjoint_case, only: adjoint_case_t
   use fluid_scheme_incompressible, only: fluid_scheme_incompressible_t
   use adjoint_fluid_scheme, only: adjoint_fluid_scheme_t
   use adjoint_fluid_pnpn, only: adjoint_fluid_pnpn_t
-  use scalar_pnpn, only: scalar_pnpn_t
-  use adjoint_scalar_pnpn, only: adjoint_scalar_pnpn_t
   use adjoint_scalars, only: adjoint_scalars_t
   use scalars, only: scalars_t
-  use scalar_scheme, only: scalar_scheme_t
   use fluid_pnpn, only: fluid_pnpn_t
   use time_step_controller, only: time_step_controller_t
-  use time_state, only: time_state_t
   use field_output, only: field_output_t
-  use chkp_output, only: chkp_output_t
   use simcomp_executor, only: neko_simcomps
   use neko_ext, only: reset, reset_adjoint
-  use field, only: field_t
-  use field_math, only: field_rzero, field_copy
-  use checkpoint, only: chkp_t
-  use file, only: file_t
-  use utils, only: neko_warning, neko_error
-  use comm, only: pe_rank
   use json_file_module, only: json_file
   use json_utils, only: json_get, json_get_or_default
   use num_types, only: rp, sp, dp
-  use logger, only: LOG_SIZE, neko_log
   use mpi_f08, only: MPI_WTIME
-  use jobctrl, only: jobctrl_time_limit
   use profiler, only: profiler_start, profiler_stop, &
        profiler_start_region, profiler_end_region
   use simulation_adjoint, only: simulation_adjoint_init, &
        simulation_adjoint_step, simulation_adjoint_finalize
   use simulation, only: simulation_init, simulation_step, simulation_finalize, &
        simulation_restart
-  use state_recover, only: state_recover_t
-  use state_recover_factory, only: state_recover_create
-  use simulation_checkpoint, only: simulation_checkpoint_t
+  use state_recover, only: state_recover_t, state_recover_factory
   use runtime_stats, only: neko_rt_stats
-  use scratch_registry, only: neko_scratch_registry
-  use registry, only: neko_registry
   implicit none
   private
 
@@ -279,17 +261,9 @@ contains
 
     ! State recovery is only needed for unsteady runs.
     if (this%unsteady) then
-       if (.not. ("state_recovery" .in. parameters)) then
-          call neko_error("please provide a means of recovering the forward \\ &
-          & state under state_recovery. Current options include checkpoint or \\ &
-          & POD.")
-       end if
-
        call json_get(parameters, 'state_recovery', state_recovery_params)
-       call state_recover_create(this%state_recover, this%neko_case, &
+       call state_recover_factory(this%state_recover, this%neko_case, &
             state_recovery_params)
-    else if ("state_recovery" .in. parameters) then
-       call neko_warning("Ignoring state_recovery for steady simulation.")
     end if
 
 
@@ -355,10 +329,9 @@ contains
 
        call simulation_step(this%neko_case, dt_controller, loop_start)
 
-       if (.not. allocated(this%state_recover)) then
-          call neko_error("State recovery not initialized.")
+       if (this%unsteady) then
+          call this%state_recover%save()
        end if
-       call this%state_recover%save(this%neko_case, this%neko_case%time)
     end do
     call profiler_end_region("Forward simulation")
 
@@ -372,7 +345,6 @@ contains
     type(time_step_controller_t) :: dt_controller
     real(kind=dp) :: loop_start
     real(kind=rp) :: cfl
-    type(time_state_t) :: time
     integer :: i
 
     call dt_controller%init(this%neko_case%params)
@@ -383,12 +355,9 @@ contains
     cfl = this%adjoint_case%fluid_adj%compute_cfl(this%adjoint_case%time%dt)
     loop_start = MPI_WTIME()
     do i = this%n_timesteps, 1, -1
-       time = this%neko_case%time
-       time%tstep = i
-       if (.not. allocated(this%state_recover)) then
-          call neko_error("State recovery not initialized.")
+       if (this%unsteady) then
+          call this%state_recover%restore(i)
        end if
-       call this%state_recover%restore(this%neko_case, time)
 
        call simulation_adjoint_step(this%adjoint_case, dt_controller, cfl, &
             loop_start)
@@ -407,10 +376,9 @@ contains
          this%forward_field_base_fname)
     call reset_adjoint(this%adjoint_case, this%neko_case, &
          this%current_design_iteration, this%adjoint_field_base_fname)
-    if (.not. allocated(this%state_recover)) then
-       call neko_error("State recovery not initialized.")
+    if (this%unsteady) then
+       call this%state_recover%reset()
     end if
-    call this%state_recover%reset()
 
   end subroutine simulation_reset
 

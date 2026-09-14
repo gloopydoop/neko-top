@@ -1,16 +1,10 @@
 #!/bin/bash
 
-# Generic helpers for coupled Neko/Python MPMD launches.
+# Generic helpers for coupled Neko/Python ADIOS2 MPMD launches.
 #
-# This layer only covers:
-# - locating the Python runtime recorded by setup.sh
-# - validating that runtime before launching
-# - simple mixed launches via mpirun or srun --multi-prog
-#
-# Cluster-specific placement policies are intentionally kept out of this file.
-# If scripts/mpmd_slurm_helpers.sh exists, mpmd_launch_shared() will delegate
-# to its mpmd_launch_shared_bound() entry point when that helper declares
-# itself applicable.
+# This layer locates and validates the active MPMD runtime, then runs a mixed
+# Python/Neko job through mpirun or srun --multi-prog. Cluster-specific
+# placement remains separate so that it can build on this portable path.
 
 _mpmd_helper_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 if [ -f "${_mpmd_helper_dir}/mpmd_slurm_helpers.sh" ]; then
@@ -19,6 +13,7 @@ if [ -f "${_mpmd_helper_dir}/mpmd_slurm_helpers.sh" ]; then
 fi
 unset _mpmd_helper_dir
 
+# Find which python should be used
 function mpmd_python_exe() {
     if [ -n "${PYTHON_BIN:-}" ]; then
         if [ -x "${PYTHON_BIN}" ]; then
@@ -43,7 +38,6 @@ function mpmd_find_repo_root() {
     local root_dir
 
     root_dir=$(realpath "${start_dir}")
-
     while [ ! -d "${root_dir}/sources" ] && [ "${root_dir}" != "/" ]; do
         root_dir="$(dirname "${root_dir}")"
     done
@@ -56,29 +50,70 @@ function mpmd_find_repo_root() {
     printf '%s\n' "${root_dir}"
 }
 
-function mpmd_runtime_env_file() {
-    local root_dir=$1
-    local repo_root
+function mpmd_prepend_path_var() {
+    local var_name=$1
+    local path_value=$2
+    local current_value
 
-    repo_root=$(mpmd_find_repo_root "${root_dir}") || return 1
-    printf '%s\n' "${repo_root}/build/mpmd_runtime.env"
-}
-
-function mpmd_source_runtime_env() {
-    local root_dir=$1
-    local runtime_env
-
-    runtime_env=$(mpmd_runtime_env_file "${root_dir}") || return 1
-    if [ ! -f "${runtime_env}" ]; then
-        echo "Error: Python runtime env not found: ${runtime_env}" >&2
-        echo "Run ./setup.sh -e from the repo root after activating the" >&2
-        echo "target Python environment." >&2
-        return 1
+    if [ ! -d "${path_value}" ]; then
+        return 0
     fi
 
-    # shellcheck disable=SC1090
-    source "${runtime_env}"
-    export MPMD_RUNTIME_ENV_FILE="${runtime_env}"
+    current_value=${!var_name:-}
+    case ":${current_value}:" in
+        *:"${path_value}":*) ;;
+        *)
+            if [ -n "${current_value}" ]; then
+                export "${var_name}=${path_value}:${current_value}"
+            else
+                export "${var_name}=${path_value}"
+            fi
+            ;;
+    esac
+}
+
+function mpmd_configure_local_runtime() {
+    local root_dir=$1
+    local repo_root
+    local pyexe
+    local pyver
+
+    repo_root=$(mpmd_find_repo_root "${root_dir}") || return 1
+
+    if [ -z "${NEKO_DIR:-}" ] && [ -d "${repo_root}/external/neko" ]; then
+        export NEKO_DIR="${repo_root}/external/neko"
+    fi
+    if [ -n "${NEKO_DIR:-}" ]; then
+        mpmd_prepend_path_var PATH "${NEKO_DIR}/bin"
+        mpmd_prepend_path_var LD_LIBRARY_PATH "${NEKO_DIR}/lib"
+    fi
+
+    if [ -z "${ADIOS2_DIR:-}" ] && [ -d "${repo_root}/external/adios2" ]; then
+        export ADIOS2_DIR="${repo_root}/external/adios2"
+    fi
+    if [ -n "${ADIOS2_DIR:-}" ]; then
+        ADIOS2_DIR=$(realpath "${ADIOS2_DIR}")
+        export ADIOS2_DIR
+        export ADIOS2_PATH="${ADIOS2_DIR}"
+        mpmd_prepend_path_var PATH "${ADIOS2_DIR}/bin"
+        mpmd_prepend_path_var LD_LIBRARY_PATH "${ADIOS2_DIR}/lib"
+        mpmd_prepend_path_var LD_LIBRARY_PATH "${ADIOS2_DIR}/lib64"
+        mpmd_prepend_path_var PKG_CONFIG_PATH "${ADIOS2_DIR}/lib/pkgconfig"
+        mpmd_prepend_path_var PKG_CONFIG_PATH "${ADIOS2_DIR}/lib64/pkgconfig"
+
+        pyexe=$(mpmd_python_exe 2>/dev/null || true)
+        if [ -n "${pyexe}" ]; then
+            pyver=$("${pyexe}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+            mpmd_prepend_path_var PYTHONPATH \
+                "${ADIOS2_DIR}/lib/python${pyver}/site-packages"
+            mpmd_prepend_path_var PYTHONPATH \
+                "${ADIOS2_DIR}/lib64/python${pyver}/site-packages"
+            mpmd_prepend_path_var PYTHONPATH \
+                "${repo_root}/lib/python${pyver}/site-packages"
+            mpmd_prepend_path_var PYTHONPATH \
+                "${repo_root}/lib64/python${pyver}/site-packages"
+        fi
+    fi
 }
 
 function mpmd_validate_python_runtime() {
@@ -102,27 +137,48 @@ function mpmd_validate_python_runtime() {
     if ! "${pyexe}" "${validator}"; then
         echo "Error: the active Python runtime is not valid." >&2
         echo "Python: ${pyexe}" >&2
-        echo "Runtime env: ${MPMD_RUNTIME_ENV_FILE:-<unset>}" >&2
+        echo "ADIOS2_DIR: ${ADIOS2_DIR:-<unset>}" >&2
         return 1
     fi
 
     export PYTHON_BIN="${pyexe}"
 }
 
-function mpmd_prepare_python_runtime() {
+function mpmd_validate_neko_adios2() {
+    local neko_makefile
+
+    # Neko records enabled optional backends in its generated Makefile, not config.h.
+    neko_makefile="${NEKO_DIR:-}/src/Makefile"
+    if [ ! -f "${neko_makefile}" ] ||
+        ! grep -Eq '^[[:space:]]*io/nek_adios2\.lo([[:space:]]|$)' \
+            "${neko_makefile}"
+    then
+        echo "Error: Neko was not built with ADIOS2 support." >&2
+        echo "Rebuild Neko after setting ADIOS2_DIR." >&2
+        return 1
+    fi
+}
+
+function mpmd_prepare_runtime() {
     local root_dir=$1
 
-    mpmd_source_runtime_env "${root_dir}" || return 1
+    mpmd_configure_local_runtime "${root_dir}" || return 1
     mpmd_validate_python_runtime "${root_dir}" || return 1
+    mpmd_validate_neko_adios2
+}
+
+function mpmd_ensure_runtime() {
+    local root_dir=${1:-${MAIN_DIR:-.}}
+
+    mpmd_prepare_runtime "${root_dir}"
 }
 
 function mpmd_ensure_python_runtime() {
-    local root_dir=${1:-${MAIN_DIR:-.}}
-    mpmd_prepare_python_runtime "${root_dir}"
+    mpmd_ensure_runtime "$@"
 }
 
 function mpmd_ensure_adios2_python() {
-    mpmd_ensure_python_runtime "$@"
+    mpmd_ensure_runtime "$@"
 }
 
 function mpmd_startup_delay() {
@@ -188,40 +244,13 @@ function mpmd_print_runtime_env() {
     echo "NEKO_LAUNCHER:      ${NEKO_LAUNCHER:-auto}"
     echo "Selected launcher:  $(mpmd_selected_launcher 2>/dev/null || echo \
 '<unavailable>')"
-    echo "Python runtime env: ${MPMD_RUNTIME_ENV_FILE:-<unset>}"
     echo "CONDA_PREFIX:       ${CONDA_PREFIX:-<unset>}"
     echo "VIRTUAL_ENV:        ${VIRTUAL_ENV:-<unset>}"
+    echo "ADIOS2_DIR:         ${ADIOS2_DIR:-<unset>}"
     echo "ADIOS2_PATH:        ${ADIOS2_PATH:-<unset>}"
     echo "PYTHONPATH:         ${PYTHONPATH:-<unset>}"
     echo "LD_LIBRARY_PATH:    ${LD_LIBRARY_PATH:-<unset>}"
     echo "---------------------------------------------------------"
-}
-
-function mpmd_resolve_case_file() {
-    local script_dir=$1
-    local requested=${2:-}
-    local case_files
-
-    if [ -n "${requested}" ]; then
-        printf '%s\n' "${requested}"
-        return 0
-    fi
-
-    shopt -s nullglob
-    case_files=( "${script_dir}"/*.case )
-    shopt -u nullglob
-
-    if [ ${#case_files[@]} -eq 1 ]; then
-        printf '%s\n' "$(basename "${case_files[0]}")"
-        return 0
-    fi
-
-    if [ ${#case_files[@]} -eq 0 ]; then
-        echo "Error: no .case file found in ${script_dir}" >&2
-    else
-        echo "Error: multiple .case files found in ${script_dir}" >&2
-    fi
-    return 1
 }
 
 function mpmd_launch_shared() {
@@ -231,149 +260,83 @@ function mpmd_launch_shared() {
     local py_ranks=$4
     local neko_ranks=$5
     local log_file=$6
-
     local total_ranks=$((py_ranks + neko_ranks))
-    local conf_file
     local abs_case_path
     local abs_case_dir
     local abs_py_script
     local abs_neko_exe
-    local runtime_env
     local pyexe
-    local startup_delay
     local launcher
-    local errexit_was_set
+    local startup_delay
+    local py_cmd
+    local neko_cmd
+    local conf_file
     local rc
     local i
-    local neko_cmd
-    local py_cmd
     local -a mpirun_cmd
 
-    abs_case_path=$(realpath "${case_path}")
-    abs_case_dir=$(dirname "${abs_case_path}")
-    abs_py_script=$(realpath "${py_script}")
-    abs_neko_exe=$(realpath "${neko_exe}")
-    runtime_env=${MPMD_RUNTIME_ENV_FILE:-}
-    if [ -z "${runtime_env}" ]; then
-        runtime_env=$(mpmd_runtime_env_file "${abs_case_dir}") || return 1
+    if [ "${py_ranks}" -lt 1 ] || [ "${neko_ranks}" -lt 1 ]; then
+        echo "Error: both Python and Neko need at least one MPI rank." >&2
+        return 1
     fi
-    runtime_env=$(realpath "${runtime_env}")
-    launcher=$(mpmd_selected_launcher) || return 1
 
-    if declare -F mpmd_launch_shared_bound_available >/dev/null 2>&1 &&
-        mpmd_launch_shared_bound_available
-    then
-        mpmd_launch_shared_bound \
-            "${case_path}" "${py_script}" "${neko_exe}" \
-            "${py_ranks}" "${neko_ranks}" "${log_file}"
+    abs_case_path=$(realpath "${case_path}") || return 1
+    abs_case_dir=$(dirname "${abs_case_path}")
+    abs_py_script=$(realpath "${py_script}") || return 1
+    abs_neko_exe=$(realpath "${neko_exe}") || return 1
+    pyexe=$(mpmd_python_exe) || return 1
+    launcher=$(mpmd_selected_launcher) || return 1
+    startup_delay=${NEKO_STARTUP_DELAY:-0}
+
+    # The launcher assigns MPMD roles; it does not split communicators. Neko
+    # and the Python peer must perform matching MPI collectives after startup.
+    # Python ranks are placed first, so the first Neko world rank is py_ranks.
+    printf -v py_cmd \
+        'cd %q && exec /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=%q ' \
+        "${abs_case_dir}" "${py_ranks}"
+    printf -v py_cmd '%s%q %q %q' \
+        "${py_cmd}" "${pyexe}" "${abs_py_script}" "${abs_case_path}"
+
+    printf -v neko_cmd \
+        'cd %q && sleep %q && exec /usr/bin/env NEKO_COMM_ID=0 ' \
+        "${abs_case_dir}" "${startup_delay}"
+    printf -v neko_cmd '%sNEKO_CTRL_PEER_ROOT=0 %q %q' \
+        "${neko_cmd}" "${abs_neko_exe}" "${abs_case_path}"
+
+    if [ "${launcher}" = "mpirun" ]; then
+        mpirun_cmd=(
+            mpirun
+            --tag-output
+            -n "${py_ranks}"
+            /bin/bash
+            -c
+            "${py_cmd}"
+            :
+            -n "${neko_ranks}"
+            /bin/bash
+            -c
+            "${neko_cmd}"
+        )
+
+        printf 'Launching shared MPI job:'
+        printf ' %q' "${mpirun_cmd[@]}"
+        printf '\n'
+        "${mpirun_cmd[@]}" > "${log_file}" 2>&1
         return $?
     fi
 
-    pyexe=$(mpmd_python_exe) || {
-        echo "Error: could not find python in PATH." >&2
-        return 1
-    }
-    startup_delay=$(mpmd_startup_delay)
+    conf_file=$(mktemp "${TMPDIR:-/tmp}/mpmd.XXXXXX.conf") || return 1
+    {
+        for ((i = 0; i < py_ranks; i++)); do
+            printf '%s /bin/bash -c %q\n' "${i}" "${py_cmd}"
+        done
+        for ((i = py_ranks; i < total_ranks; i++)); do
+            printf '%s /bin/bash -c %q\n' "${i}" "${neko_cmd}"
+        done
+    } > "${conf_file}"
 
-    if [ "${launcher}" = "srun" ]; then
-        conf_file=$(mktemp "${TMPDIR:-/tmp}/mpmd.XXXXXX.conf")
-
-        {
-            for ((i=0; i<py_ranks; i++)); do
-                echo "${i} /bin/bash -c 'cd \"${abs_case_dir}\" &&" \
-                    "source \"${runtime_env}\" &&" \
-                    "exec /usr/bin/env NEKO_COMM_ID=1" \
-                    "NEKO_CTRL_PEER_ROOT=${py_ranks} \"${pyexe}\"" \
-                    "\"${abs_py_script}\" \"${abs_case_path}\"'"
-            done
-
-            for ((i=py_ranks; i<total_ranks; i++)); do
-                echo "${i} /bin/bash -c 'cd \"${abs_case_dir}\" &&" \
-                    "source \"${runtime_env}\" &&" \
-                    "sleep ${startup_delay};" \
-                    "exec /usr/bin/env NEKO_COMM_ID=0" \
-                    "NEKO_CTRL_PEER_ROOT=0 \"${abs_neko_exe}\"" \
-                    "\"${abs_case_path}\"'"
-            done
-        } > "${conf_file}"
-
-        echo "Running MPMD job with ${total_ranks} ranks"
-        echo "Launcher: srun --multi-prog"
-        echo "Config:   ${conf_file}"
-        echo "Output:   ${log_file}"
-
-        errexit_was_set=0
-        if [[ $- == *e* ]]; then
-            errexit_was_set=1
-            set +e
-        fi
-
-        srun --unbuffered --multi-prog "${conf_file}" \
-            > "${log_file}" 2>&1
-        rc=$?
-
-        if [ "${errexit_was_set}" -eq 1 ]; then
-            set -e
-        fi
-
-        if [ "${rc}" -ne 0 ]; then
-            echo "Error: shared MPMD launch failed. See ${log_file}." >&2
-        fi
-
-        rm -f "${conf_file}"
-        return ${rc}
-    fi
-
-    printf -v py_cmd \
-        'cd %q && source %q && exec /usr/bin/env NEKO_COMM_ID=1 ' \
-        "${abs_case_dir}" "${runtime_env}"
-    printf -v py_cmd \
-        '%sNEKO_CTRL_PEER_ROOT=%q %q %q %q' \
-        "${py_cmd}" "${py_ranks}" "${pyexe}" "${abs_py_script}" \
-        "${abs_case_path}"
-
-    printf -v neko_cmd \
-        'cd %q && source %q && sleep %q; exec /usr/bin/env NEKO_COMM_ID=0 ' \
-        "${abs_case_dir}" "${runtime_env}" "${startup_delay}"
-    printf -v neko_cmd \
-        '%sNEKO_CTRL_PEER_ROOT=0 %q %q' \
-        "${neko_cmd}" "${abs_neko_exe}" "${abs_case_path}"
-
-    mpirun_cmd=(
-        mpirun
-        --tag-output
-        -n "${py_ranks}"
-        /bin/bash
-        -c
-        "${py_cmd}"
-        :
-        -n "${neko_ranks}"
-        /bin/bash
-        -c
-        "${neko_cmd}"
-    )
-
-    echo "Launching shared MPI job:"
-    printf '  %q' "${mpirun_cmd[@]}"
-    printf '\n'
-    echo "Output:            ${log_file}"
-
-    errexit_was_set=0
-    if [[ $- == *e* ]]; then
-        errexit_was_set=1
-        set +e
-    fi
-
-    "${mpirun_cmd[@]}" > "${log_file}" 2>&1
+    srun --unbuffered --multi-prog "${conf_file}" > "${log_file}" 2>&1
     rc=$?
-
-    if [ "${errexit_was_set}" -eq 1 ]; then
-        set -e
-    fi
-
-    if [ "${rc}" -ne 0 ]; then
-        echo "Error: shared MPMD launch failed. See ${log_file}." >&2
-    fi
-
+    rm -f "${conf_file}"
     return ${rc}
 }

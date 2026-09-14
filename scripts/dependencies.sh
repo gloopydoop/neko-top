@@ -34,23 +34,29 @@ function check_system_dependencies() {
 
 }
 
+# Resolve the Python executable and export it for CMake/configure callers.
 function find_python_executable() {
     local candidate
+    local resolved_python
     local python_path
 
     if [ -n "${PYTHON_BIN:-}" ]; then
         if [ -x "${PYTHON_BIN}" ]; then
             if [[ "${PYTHON_BIN}" = /* ]]; then
-                printf '%s\n' "${PYTHON_BIN}"
+                resolved_python="${PYTHON_BIN}"
             elif [[ "${PYTHON_BIN}" == */* ]]; then
                 python_path=$(cd "$(dirname "${PYTHON_BIN}")" && pwd)
-                printf '%s/%s\n' "${python_path}" "$(basename "${PYTHON_BIN}")"
+                resolved_python="${python_path}/$(basename "${PYTHON_BIN}")"
             else
-                command -v "${PYTHON_BIN}"
+                resolved_python=$(command -v "${PYTHON_BIN}")
             fi
+            export PYTHON_EXECUTABLE="${resolved_python}"
+            printf '%s\n' "${PYTHON_EXECUTABLE}"
             return 0
         elif command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
-            command -v "${PYTHON_BIN}"
+            resolved_python=$(command -v "${PYTHON_BIN}")
+            export PYTHON_EXECUTABLE="${resolved_python}"
+            printf '%s\n' "${PYTHON_EXECUTABLE}"
             return 0
         fi
 
@@ -61,7 +67,9 @@ function find_python_executable() {
 
     for candidate in python3 python; do
         if command -v "${candidate}" >/dev/null 2>&1; then
-            command -v "${candidate}"
+            resolved_python=$(command -v "${candidate}")
+            export PYTHON_EXECUTABLE="${resolved_python}"
+            printf '%s\n' "${PYTHON_EXECUTABLE}"
             return 0
         fi
     done
@@ -76,9 +84,13 @@ function find_json_fortran() {
 
     # Determine the JSON-Fortran installation directory
     if [[ $# -ge 1 ]]; then
-        JSON_FORTRAN_DIR="$(realpath $1)"
+        JSON_FORTRAN_DIR="$1"
     elif [ -z "$JSON_FORTRAN_DIR" ]; then
-        JSON_FORTRAN_DIR="$(realpath $EXTERNAL_DIR/json-fortran)"
+        JSON_FORTRAN_DIR="json-fortran"
+    fi
+
+    if [ "${JSON_FORTRAN_DIR:0:1}" != "/" ]; then
+        JSON_FORTRAN_DIR="$EXTERNAL_DIR/$JSON_FORTRAN_DIR"
     fi
 
     # Ensure JSON-Fortran is installed, if not install it.
@@ -132,14 +144,13 @@ function find_nek5000() {
 
     # Determine the Nek5000 installation directory
     if [[ $# -ge 1 ]]; then
-        if [[ "${1:0:1}" != "/" && "${1:0:1}" != "~" ]]; then
-            NEK5000_DIR="$(realpath $EXTERNAL_DIR/$1)"
-        else
-            NEK5000_DIR="$(realpath $1)"
-        fi
-    else
-        export NEK5000_DIR=""
+        NEK5000_DIR="$1"
+    elif [ -z "$NEK5000_DIR" ]; then
         return
+    fi
+
+    if [ "${NEK5000_DIR:0:1}" != "/" ]; then
+        NEK5000_DIR="$EXTERNAL_DIR/$NEK5000_DIR"
     fi
 
     if [[ ! -d "$NEK5000_DIR" || $(ls -A $NEK5000_DIR | wc -l) -eq 0 ]]; then
@@ -157,14 +168,13 @@ function find_gslib() {
 
     # Determine the GSLib installation directory
     if [[ $# -ge 1 ]]; then
-        if [[ "${1:0:1}" != "/" && "${1:0:1}" != "~" ]]; then
-            GSLIB_DIR="$(realpath $EXTERNAL_DIR/$1)"
-        else
-            GSLIB_DIR="$(realpath $1)"
-        fi
-    else
-        export GSLIB_DIR=""
+        GSLIB_DIR="$1"
+    elif [ -z "$GSLIB_DIR" ]; then
         return
+    fi
+
+    if [ "${GSLIB_DIR:0:1}" != "/" ]; then
+        GSLIB_DIR="$EXTERNAL_DIR/$GSLIB_DIR"
     fi
 
     # Ensure GSLIB is installed, if not install it.
@@ -220,8 +230,8 @@ function find_pfunit() {
         return
     fi
 
-    if [[ "${PFUNIT_DIR:0:1}" != "/" && "${PFUNIT_DIR:0:1}" != "~" ]]; then
-        PFUNIT_DIR="$(realpath $EXTERNAL_DIR/$PFUNIT_DIR)"
+    if [ "${PFUNIT_DIR:0:1}" != "/" ]; then
+        PFUNIT_DIR="$EXTERNAL_DIR/$PFUNIT_DIR"
     fi
 
     # Clone pFUnit from the repository if it does not exist.
@@ -280,56 +290,74 @@ _ACEOF
 # Ensure HDF5 is installed, if not install it.
 function find_hdf5() {
 
-    # Determine the HDF5 installation directory
     check_external_dir
+
+    # Determine the HDF5 installation directory. HDF5_ROOT is the name CMake
+    # and the module systems use; HDF5_DIR is accepted as a legacy spelling.
     if [[ $# -ge 1 ]]; then
-        HDF5_DIR="$1"
-    elif [ -z "$HDF5_DIR" ]; then
-        return
+        HDF5_ROOT="$1"
+    elif [ -n "$HDF5_ROOT" ]; then
+        : # already set in the environment
+    elif [ -n "$HDF5_DIR" ]; then
+        HDF5_ROOT="$HDF5_DIR"
+    else
+        return 0
     fi
 
-    if [[ "${HDF5_DIR:0:1}" != "/" && "${HDF5_DIR:0:1}" != "~" ]]; then
-        HDF5_DIR="$(realpath $EXTERNAL_DIR/$HDF5_DIR)"
+    if [ "${HDF5_ROOT:0:1}" != "/" ]; then
+        HDF5_ROOT="$EXTERNAL_DIR/$HDF5_ROOT"
     fi
 
     # Ensure HDF5 is installed, if not install it.
-    HDF5_LIB=$(find $HDF5_DIR -type d -name 'lib*' \
+    HDF5_LIB=$(find "$HDF5_ROOT" -type d -name 'lib*' \
         -exec test -f '{}'/libhdf5_fortran.so \; -print 2>/dev/null) || true
     if [[ ! -d "$HDF5_LIB" ]]; then
 
+        # Never try to build into a read-only prefix, such as one provided by
+        # a module system.
+        if [[ -d "$HDF5_ROOT" && ! -w "$HDF5_ROOT" ]]; then
+            error "HDF5 not found under the read-only prefix:"
+            error "\t$HDF5_ROOT"
+            error "It looks module-provided. Load a module that supplies the"
+            error "Fortran bindings, or set HDF5_ROOT to a writable path to"
+            error "have one built there."
+            exit 1
+        fi
+
         # Clone HDF5 from the repository if it does not exist.
-        if [ ! -d "$HDF5_DIR" ]; then
+        if [[ ! -d "$HDF5_ROOT" || $(ls -A $HDF5_ROOT | wc -l) -eq 0 ]]; then
             [ -z "$HDF5_VERSION" ] && HDF5_VERSION="hdf5_2.0.0"
             git clone --depth 1 --branch $HDF5_VERSION \
-                https://github.com/HDFGroup/hdf5.git $HDF5_DIR
+                https://github.com/HDFGroup/hdf5.git $HDF5_ROOT
         fi
 
         # Build and install HDF5
-        cmake -B $HDF5_DIR/build -S $HDF5_DIR \
-            --install-prefix $HDF5_DIR -DCMAKE_BUILD_TYPE=Release \
+        cmake -B $HDF5_ROOT/build -S $HDF5_ROOT \
+            --install-prefix $HDF5_ROOT -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=$MPICC -DCMAKE_CXX_COMPILER=$MPICXX \
             -DCMAKE_Fortran_COMPILER=$MPIFC -DHDF5_ENABLE_PARALLEL=ON \
             -DHDF5_BUILD_FORTRAN=ON -DHDF5_ENABLE_SZIP_SUPPORT:BOOL=OFF \
             -DHDF5_BUILD_TOOLS:BOOL=ON
-        cmake --build $HDF5_DIR/build/ --config Release --parallel
-        cmake --install $HDF5_DIR/build/ --config Release
-        rm -fr $HDF5_DIR/build
+        cmake --build $HDF5_ROOT/build/ --config Release --parallel
+        cmake --install $HDF5_ROOT/build/ --config Release
+        rm -fr $HDF5_ROOT/build
     fi
 
     # Add HDF5 to the environment variables
-    HDF5_LIB=$(find $HDF5_DIR -type d -name 'lib*' \
+    HDF5_LIB=$(find "$HDF5_ROOT" -type d -name 'lib*' \
         -exec test -f '{}'/libhdf5_fortran.so \; -print 2>/dev/null) || true
-    if [ -z "$HDF5_LIB" ]; then
+    if [[ ! -d "$HDF5_LIB" ]]; then
         error "HDF5 not found at:"
-        error "\t$HDF5_DIR"
-        error "Please set HDF5_DIR to the directory containing"
-        error "the HDF5 source code."
+        error "\t$HDF5_ROOT"
+        error "Please set HDF5_ROOT to the directory containing"
+        error "the HDF5 installation."
         error "You can download the source code from:"
         error "\thttps://github.com/HDFGroup/hdf5.git"
         exit 1
     fi
 
-    export HDF5_DIR=$(realpath $HDF5_LIB/../)
+    export HDF5_ROOT=$(realpath $HDF5_LIB/../)
+    export HDF5_DIR=$HDF5_ROOT
     export LD_LIBRARY_PATH="$HDF5_LIB:$LD_LIBRARY_PATH"
     export PKG_CONFIG_PATH="$HDF5_LIB/pkgconfig:$PKG_CONFIG_PATH"
 }
@@ -338,56 +366,37 @@ function find_hdf5() {
 # Ensure ADIOS2 is installed, if not install it.
 function find_adios2() {
     check_external_dir
-
     local pyexe
     local pyver
-    local current_dir
     local cmake_args=()
-
-    pyexe=$(find_python_executable 2>/dev/null || true)
-    if [ -n "${pyexe}" ]; then
-        pyver=$("${pyexe}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    fi
 
     if [[ $# -ge 1 && -n "$1" ]]; then
         ADIOS2_DIR="$1"
+    elif [ -z "${ADIOS2_DIR:-}" ]; then
+        return
     fi
 
-    if [ -z "${ADIOS2_DIR:-}" ] && command -v adios2-config >/dev/null 2>&1; then
-        ADIOS2_CONFIG=$(realpath "$(command -v adios2-config)")
-        ADIOS2_DIR=$(dirname "$(dirname "$ADIOS2_CONFIG")")
-    else
-        if [ -z "${ADIOS2_DIR:-}" ]; then
-            ADIOS2_DIR="$EXTERNAL_DIR/adios2"
-        fi
-
-        if [[ "${ADIOS2_DIR:0:1}" != "/" && "${ADIOS2_DIR:0:1}" != "~" ]]; then
-            ADIOS2_DIR="$EXTERNAL_DIR/$ADIOS2_DIR"
-        fi
-
-        mkdir -p "$ADIOS2_DIR"
-        ADIOS2_DIR=$(realpath "$ADIOS2_DIR")
-        ADIOS2_CONFIG="$ADIOS2_DIR/bin/adios2-config"
+    if ! find_python_executable >/dev/null; then
+        echo "Error: could not find python3 or python in PATH." >&2
+        return 1
     fi
+    pyexe="${PYTHON_EXECUTABLE}"
+    pyver=$("${pyexe}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+
+    if [[ "${ADIOS2_DIR:0:1}" != "/" && "${ADIOS2_DIR:0:1}" != "~" ]]; then
+        ADIOS2_DIR="$EXTERNAL_DIR/$ADIOS2_DIR"
+    fi
+
+    ADIOS2_CONFIG="$ADIOS2_DIR/bin/adios2-config"
 
     if [[ ! -x "${ADIOS2_CONFIG}" ]]; then
         [ -z "${ADIOS2_VERSION:-}" ] && ADIOS2_VERSION="2.10.1"
-        [ -z "${ADIOS2_ENABLE_FORTRAN:-}" ] && ADIOS2_ENABLE_FORTRAN="ON"
         [ -z "${ADIOS2_ENABLE_PYTHON:-}" ] && ADIOS2_ENABLE_PYTHON="ON"
         [ -z "${ADIOS2_ENABLE_SST:-}" ] && ADIOS2_ENABLE_SST="ON"
 
-        if [ -z "${pyexe}" ]; then
-            echo "Error: could not find python3 or python in PATH." >&2
-            return 1
-        fi
-
-        current_dir=$(pwd)
-        cd "$ADIOS2_DIR" || return 1
-
-        if [ ! -d ADIOS2/.git ]; then
-            rm -rf ADIOS2
+        if [ ! -d "$ADIOS2_DIR/.git" ]; then
             git clone --depth 1 --branch "v${ADIOS2_VERSION}" \
-                https://github.com/ornladios/ADIOS2.git ADIOS2
+                https://github.com/ornladios/ADIOS2.git "$ADIOS2_DIR"
         fi
 
         cmake_args=(
@@ -398,7 +407,7 @@ function find_adios2() {
             -DADIOS2_USE_MPI=ON
             -DADIOS2_USE_SST="$ADIOS2_ENABLE_SST"
             -DADIOS2_USE_Python="$ADIOS2_ENABLE_PYTHON"
-            -DADIOS2_USE_Fortran="$ADIOS2_ENABLE_FORTRAN"
+            -DADIOS2_USE_Fortran=OFF
             -DADIOS2_USE_BZip2=OFF
             -DBUILD_TESTING=OFF
             -DPython3_EXECUTABLE="$pyexe"
@@ -421,12 +430,11 @@ function find_adios2() {
             )
         fi
 
-        cmake -S ADIOS2 -B build "${cmake_args[@]}"
-        cmake --build build --parallel
-        cmake --install build
-        rm -rf build
+        cmake -S "$ADIOS2_DIR" -B "$ADIOS2_DIR/build" "${cmake_args[@]}"
+        cmake --build "$ADIOS2_DIR/build" --parallel
+        cmake --install "$ADIOS2_DIR/build"
+        rm -rf "$ADIOS2_DIR/build"
 
-        cd "$current_dir" || return 1
         ADIOS2_CONFIG="$ADIOS2_DIR/bin/adios2-config"
     fi
 
@@ -440,7 +448,6 @@ function find_adios2() {
 
     export ADIOS2_DIR="$(realpath "$ADIOS2_DIR")"
     export ADIOS2_PATH="$ADIOS2_DIR"
-    export ADIOS2_FORTRAN_DIR="$ADIOS2_DIR"
     export PATH="$ADIOS2_DIR/bin:$PATH"
 
     [ -d "$ADIOS2_DIR/lib/pkgconfig" ] && \
@@ -459,125 +466,64 @@ function find_adios2() {
     if [ -n "${pyver:-}" ] && [ -d "$ADIOS2_DIR/lib64/python${pyver}/site-packages" ]; then
         export PYTHONPATH="$ADIOS2_DIR/lib64/python${pyver}/site-packages${PYTHONPATH:+:$PYTHONPATH}"
     fi
+    if [ -n "${pyver:-}" ] && [ -n "${MAIN_DIR:-}" ] && [ -d "$MAIN_DIR/lib/python${pyver}/site-packages" ]; then
+        export PYTHONPATH="$MAIN_DIR/lib/python${pyver}/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+    fi
+    if [ -n "${pyver:-}" ] && [ -n "${MAIN_DIR:-}" ] && [ -d "$MAIN_DIR/lib64/python${pyver}/site-packages" ]; then
+        export PYTHONPATH="$MAIN_DIR/lib64/python${pyver}/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+    fi
 
     echo "Using ADIOS2_DIR=$ADIOS2_DIR"
     echo "Using Python=${pyexe:-<not found>}"
     echo "done"
 }
 
-function write_mpmd_runtime_env() {
-    local repo_root
-    local runtime_env
-    local -a py_paths=()
-    local -a ld_paths=()
-    local path_entry
-    local py_path_prefix=""
-    local ld_path_prefix=""
-    local idx
+# Return ADIOS2's C++ link flags in a form that libtool keeps in LIBS.  The
+# installed adios2-config emits absolute library filenames, which libtool moves
+# ahead of libneko.a and which are then discarded by linkers using --as-needed.
+# Converting those filenames to -L/-l pairs preserves their position after
+# libneko.a in the final link command.
+function get_neko_adios2_link_flags() {
+    local adios2_config_flags
+    local adios2_flag
+    local adios2_lib_dir
+    local adios2_lib_name
+    local adios2_libs=()
 
-    if [[ $# -ge 1 && -n "$1" ]]; then
-        repo_root=$(realpath "$1")
-    elif [ -n "${MAIN_DIR:-}" ]; then
-        repo_root=$(realpath "$MAIN_DIR")
-    else
-        repo_root=$(pwd)
+    if ! adios2_config_flags=$("$ADIOS2_CONFIG" --cxx-libs); then
+        error "Failed to query ADIOS2 C++ link flags from:"
+        error "\t$ADIOS2_CONFIG"
+        return 1
     fi
 
-    runtime_env="${repo_root}/build/mpmd_runtime.env"
-    mkdir -p "$(dirname "${runtime_env}")"
-
-    shopt -s nullglob
-    if [ -n "${ADIOS2_DIR:-}" ]; then
-        for path_entry in \
-            "${ADIOS2_DIR}"/lib/python*/site-packages \
-            "${ADIOS2_DIR}"/lib64/python*/site-packages
-        do
-            [ -d "${path_entry}" ] && py_paths+=("$(realpath "${path_entry}")")
-        done
-
-        for path_entry in "${ADIOS2_DIR}"/lib "${ADIOS2_DIR}"/lib64; do
-            [ -d "${path_entry}" ] && ld_paths+=("$(realpath "${path_entry}")")
-        done
-    fi
-
-    if [ -n "${HDF5_DIR:-}" ]; then
-        for path_entry in "${HDF5_DIR}"/lib "${HDF5_DIR}"/lib64; do
-            [ -d "${path_entry}" ] && ld_paths+=("$(realpath "${path_entry}")")
-        done
-    fi
-    shopt -u nullglob
-
-    for ((idx=0; idx<${#py_paths[@]}; idx++)); do
-        py_path_prefix+="${py_path_prefix:+:}${py_paths[idx]}"
+    for adios2_flag in $adios2_config_flags; do
+        case "$adios2_flag" in
+        */lib*.so*|*/lib*.a)
+            adios2_lib_dir=${adios2_flag%/*}
+            adios2_lib_name=${adios2_flag##*/}
+            adios2_lib_name=${adios2_lib_name#lib}
+            adios2_lib_name=${adios2_lib_name%%.so*}
+            adios2_lib_name=${adios2_lib_name%%.a}
+            adios2_libs+=("-L$adios2_lib_dir" "-l$adios2_lib_name")
+            ;;
+        *)
+            adios2_libs+=("$adios2_flag")
+            ;;
+        esac
     done
 
-    for ((idx=0; idx<${#ld_paths[@]}; idx++)); do
-        ld_path_prefix+="${ld_path_prefix:+:}${ld_paths[idx]}"
-    done
+    if [[ " ${adios2_libs[*]} " != *" -lstdc++ "* ]]; then
+        adios2_libs+=("-lstdc++")
+    fi
 
-    {
-        echo "#!/bin/bash"
-        echo "# Generated by setup.sh. Source this after loading modules and"
-        echo "# activating the target Python environment for MPMD runs."
-        printf 'export NEKO_TOP_MPMD_RUNTIME_READY=%q\n' "1"
-        printf 'export PYTHON_BIN=%q\n' "${PYTHON_BIN}"
-        [ -n "${ADIOS2_DIR:-}" ] && printf 'export ADIOS2_DIR=%q\n' "${ADIOS2_DIR}"
-        [ -n "${ADIOS2_PATH:-}" ] && printf 'export ADIOS2_PATH=%q\n' "${ADIOS2_PATH}"
-        [ -n "${ADIOS2_FORTRAN_DIR:-}" ] && printf 'export ADIOS2_FORTRAN_DIR=%q\n' "${ADIOS2_FORTRAN_DIR}"
-        if [ -n "${py_path_prefix}" ]; then
-            printf 'export PYTHONPATH=%q${PYTHONPATH:+:$PYTHONPATH}\n' \
-                "${py_path_prefix}"
-        fi
-        if [ -n "${ld_path_prefix}" ]; then
-            printf 'export LD_LIBRARY_PATH=%q${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\n' \
-                "${ld_path_prefix}"
-        fi
-    } > "${runtime_env}"
+    printf '%s ' "${adios2_libs[@]}"
 }
 
-function find_mpmd_python_runtime() {
-    local repo_root
-    local pyexe
-    local validator
-
-    if [[ $# -ge 1 && -n "$1" ]]; then
-        repo_root=$(realpath "$1")
-    elif [ -n "${MAIN_DIR:-}" ]; then
-        repo_root=$(realpath "$MAIN_DIR")
-    else
-        repo_root=$(pwd)
-    fi
-
-    pyexe=$(find_python_executable) || {
-        error "MPMD Python runtime validation failed."
-        error "Could not find python3 or python in PATH."
-        return 1
-    }
-
-    export PYTHON_BIN="${pyexe}"
-    find_adios2 "${ADIOS2_DIR:-}" || return 1
-
-    validator="${repo_root}/scripts/python/validate_mpmd_runtime.py"
-    if [ ! -f "${validator}" ]; then
-        error "MPMD runtime validator not found at:"
-        error "\t${validator}"
-        return 1
-    fi
-
-    if ! "${PYTHON_BIN}" "${validator}"; then
-        error "MPMD Python runtime validation failed."
-        error "Activate the target Python environment and rerun ./setup.sh -e."
-        return 1
-    fi
-
-    write_mpmd_runtime_env "${repo_root}"
-    echo "Using MPMD Python runtime=${PYTHON_BIN}"
-    echo "Wrote MPMD runtime env=${repo_root}/build/mpmd_runtime.env"
-}
 # ============================================================================ #
 # Ensure ParMETIS is installed, if not install it.
 
 function find_parmetis() {
+
     # Determine the Parmetis installation directory
     check_external_dir
     if [[ $# -ge 1 ]]; then
@@ -601,7 +547,7 @@ function find_parmetis() {
         tar xzf parmetis-4.0.3.tar.gz
         cd parmetis-4.0.3
 
-        # Modify the bundled CMake files to satisfy newer toolchains.
+        # Modify the minimum requirement of cmake
         cmake_lists=$(find . -name CMakeLists.txt)
         for file in $cmake_lists; do
             sed -i 's/cmake_minimum_required(VERSION 2.8)/cmake_minimum_required(VERSION 3.11)/g' $file
@@ -638,237 +584,36 @@ function find_parmetis() {
 }
 
 # ============================================================================ #
-# Patch vendored Neko for ADIOS2/libtool link ordering on newer toolchains.
-function patch_neko_adios2_linking() {
-    local neko_dir="$1"
-    local adios_m4
-
-    adios_m4="${neko_dir}/m4/ax_adios.m4"
-
-    if [ ! -f "${adios_m4}" ]; then
-        return
-    fi
-
-    cat >"${adios_m4}" <<'EOF'
-AC_DEFUN([AX_ADIOS2],[
-	AC_ARG_WITH([adios2],
-	AS_HELP_STRING([--with-adios2=DIR],
-	[Directory for ADIOS2]),
-	[
-	if test -d "$withval"; then
-	   ac_adios2_path="$withval";
-	fi
-	],[with_adios2=no])
-
-	if test "x${with_adios2}" != xno; then
-	   PATH_SAVED="$PATH"
-	   if test -d "$ac_adios2_path"; then
-	      PATH="$ac_adios2_path/bin:$PATH"
-	   fi
-
-	   AC_CHECK_PROG(ADIOS2CONF,adios2-config,yes)
-
-	   if test x"${ADIOS2CONF}" == x"yes"; then
-	      ADIOS2_CXXFLAGS=`adios2-config --cxx-flags`
-	      CXXFLAGS="$ADIOS2_CXXFLAGS $CXXFLAGS"
-
-	      ADIOS2_LIBS=""
-	      for adios2_lib in `adios2-config --cxx-libs`; do
-	         case "$adios2_lib" in
-	            */lib*.so*)
-	               adios2_lib_dir=`dirname "$adios2_lib"`
-	               adios2_lib_name=`basename "$adios2_lib"`
-	               adios2_lib_name=${adios2_lib_name#lib}
-	               adios2_lib_name=${adios2_lib_name%%.so*}
-	               ADIOS2_LIBS="$ADIOS2_LIBS -L$adios2_lib_dir -l$adios2_lib_name"
-	               ;;
-	            *)
-	               ADIOS2_LIBS="$ADIOS2_LIBS $adios2_lib"
-	               ;;
-	         esac
-	      done
-	      LIBS="$LIBS $ADIOS2_LIBS -lstdc++"
-      	      with_adios2=yes
-	      have_adios2=yes
-	      AC_SUBST(have_adios2)
-              AC_DEFINE(HAVE_ADIOS2,1,[Define if you have ADIOS2.])
-	    else
-	      with_adios2=no
-	    fi
-            PATH="$PATH_SAVED"
-
-	fi
-])
-EOF
-}
-
-# ============================================================================ #
-# Patch vendored Neko so MPMD runs can disable device-MPI at runtime.
-function patch_neko_device_mpi_runtime() {
-    local neko_dir="$1"
-    local patch_file
-
-    patch_file=$(mktemp "${TMPDIR:-/tmp}/neko_device_mpi.XXXXXX.patch")
-
-    cat >"${patch_file}" <<'EOF'
-diff --git a/src/config/neko_config.f90.in b/src/config/neko_config.f90.in
-index c06698f..3c76d05 100644
---- a/src/config/neko_config.f90.in
-+++ b/src/config/neko_config.f90.in
-@@ -48,4 +48,24 @@ module neko_config
- 
-   integer, parameter :: NEKO_BLK_SIZE = @blk_size@
- 
-+  public :: neko_device_mpi_enabled
-+
-+contains
-+
-+  logical function neko_device_mpi_enabled()
-+    character(len=32) :: env_val
-+    integer :: env_len
-+
-+    neko_device_mpi_enabled = NEKO_DEVICE_MPI
-+    if (.not. NEKO_DEVICE_MPI) return
-+
-+    call get_environment_variable("NEKO_DISABLE_DEVICE_MPI", env_val, env_len)
-+    if (env_len <= 0) return
-+
-+    select case (trim(adjustl(env_val(1:env_len))))
-+    case ("1", "true", "TRUE", "yes", "YES", "on", "ON")
-+       neko_device_mpi_enabled = .false.
-+    end select
-+  end function neko_device_mpi_enabled
-+
- end module neko_config
-diff --git a/src/gs/gather_scatter.f90 b/src/gs/gather_scatter.f90
-index 6ad71b1..6d6c9d2 100644
---- a/src/gs/gather_scatter.f90
-+++ b/src/gs/gather_scatter.f90
-@@ -33,7 +33,8 @@
- !> Gather-scatter
- module gather_scatter
-   use neko_config, only : NEKO_BCKND_DEVICE, NEKO_BCKND_SX, NEKO_BCKND_HIP, &
--       NEKO_BCKND_CUDA, NEKO_BCKND_OPENCL, NEKO_BCKND_METAL, NEKO_DEVICE_MPI
-+       NEKO_BCKND_CUDA, NEKO_BCKND_OPENCL, NEKO_BCKND_METAL, &
-+       neko_device_mpi_enabled
-   use gs_bcknd, only : gs_bcknd_t, GS_BCKND_CPU, GS_BCKND_SX, GS_BCKND_DEV
-   use gs_device, only : gs_device_t
-   use gs_sx, only : gs_sx_t
-@@ -216,7 +217,7 @@ contains
-     else if (use_utofu) then
-        comm_bcknd_ = GS_COMM_UTOFU
-     else
--       if (NEKO_DEVICE_MPI) then
-+       if (neko_device_mpi_enabled()) then
-           comm_bcknd_ = GS_COMM_MPIGPU
-           use_device_mpi = .true.
-        else
-diff --git a/src/common/projection.f90 b/src/common/projection.f90
-index 312a956..29f44db 100644
---- a/src/common/projection.f90
-+++ b/src/common/projection.f90
-@@ -68,7 +68,7 @@ module projection
-   use bc_list, only : bc_list_t
-   use gather_scatter, only : gs_t, GS_OP_ADD
-   use neko_config, only : NEKO_BCKND_DEVICE, NEKO_BLK_SIZE, &
--       NEKO_DEVICE_MPI, NEKO_BCKND_OPENCL
-+       NEKO_BCKND_OPENCL, neko_device_mpi_enabled
-   use device, only : device_alloc, HOST_TO_DEVICE, device_memcpy, &
-        device_get_ptr, device_free, device_map, device_unmap
-   use device_math, only : device_glsc3, device_add2s2, device_cmult, &
-@@ -569,7 +569,7 @@ contains
- 
-       this%proj_res = sqrt(device_glsc3(b_d, b_d, coef%mult_d, n)/coef%volume)
-       this%proj_m = this%m
--      if (NEKO_DEVICE_MPI .and. (NEKO_BCKND_OPENCL .ne. 1)) then
-+      if (neko_device_mpi_enabled() .and. (NEKO_BCKND_OPENCL .ne. 1)) then
-          call device_proj_on(alpha_d, b_d, xx_d_d, bb_d_d, &
-               coef%mult_d, xbar_d, this%m, n)
-       else
-@@ -649,7 +649,7 @@ contains
- 
-       if (m .le. 0) return
- 
--      if (NEKO_DEVICE_MPI .and. (NEKO_BCKND_OPENCL .ne. 1)) then
-+      if (neko_device_mpi_enabled() .and. (NEKO_BCKND_OPENCL .ne. 1)) then
-          call device_project_ortho(alpha_d, bb_d(m), xx_d_d, bb_d_d, &
-               w_d, xx_d(m), this%m, n, nrm)
-       else
-diff --git a/src/math/operators.f90 b/src/math/operators.f90
-index 00eee84..971fdef 100644
---- a/src/math/operators.f90
-+++ b/src/math/operators.f90
-@@ -33,7 +33,7 @@
- !> Operators
- module operators
-   use neko_config, only : NEKO_BCKND_SX, NEKO_BCKND_DEVICE, NEKO_BCKND_XSMM, &
--       NEKO_DEVICE_MPI
-+       neko_device_mpi_enabled
-   use num_types, only : rp, i8
-   use opr_cpu, only : opr_cpu_cfl, opr_cpu_curl, opr_cpu_opgrad, &
-        opr_cpu_conv1, opr_cpu_convect_scalar, opr_cpu_cdtp, &
-@@ -591,7 +591,7 @@ contains
-        cfl_r4 = opr_cpu_cfl(dt, u, v, w, Xh, coef, nelv, gdim)
-     end if
- 
--    if (.not. NEKO_DEVICE_MPI) then
-+    if (.not. neko_device_mpi_enabled()) then
-        call MPI_Allreduce(MPI_IN_PLACE, cfl_r4, 1, &
-             MPI_REAL_PRECISION, MPI_MAX, NEKO_COMM, ierr)
-     end if
-@@ -609,7 +609,7 @@ contains
- 
-     cfl_d = opr_device_cfl(dt, u_d, v_d, w_d, Xh, coef, nelv, gdim)
- 
--    if (.not. NEKO_DEVICE_MPI) then
-+    if (.not. neko_device_mpi_enabled()) then
-        call MPI_Allreduce(MPI_IN_PLACE, cfl_d, 1, &
-             MPI_REAL_PRECISION, MPI_MAX, NEKO_COMM, ierr)
-     end if
-@@ -633,7 +633,7 @@ contains
-        cfl_f = opr_cpu_cfl(dt, u%x, v%x, w%x, Xh, coef, nelv, gdim)
-     end if
- 
--    if (.not. NEKO_DEVICE_MPI) then
-+    if (.not. neko_device_mpi_enabled()) then
-        call MPI_Allreduce(MPI_IN_PLACE, cfl_f, 1, &
-             MPI_REAL_PRECISION, MPI_MAX, NEKO_COMM, ierr)
-     end if
-EOF
-
-    if git -C "$neko_dir" apply --check "${patch_file}" 2>/dev/null; then
-        git -C "$neko_dir" apply "${patch_file}"
-    elif ! grep -q "NEKO_DISABLE_DEVICE_MPI" \
-        "${neko_dir}/src/config/neko_config.f90.in" 2>/dev/null; then
-        error "Failed to apply the Neko device-MPI runtime patch."
-        rm -f "${patch_file}"
-        return 1
-    fi
-
-    rm -f "${patch_file}"
-}
-
-# ============================================================================ #
 # Ensure Neko is installed, if not install it.
 function find_neko() {
     check_external_dir
-    local force_neko_regen=false
+
+    local neko_adios2_link_flags=""
 
     # Find the required dependencies for Neko
     find_json_fortran $JSON_FORTRAN_DIR
     find_gslib $GSLIB_DIR
     find_hdf5 $HDF5_DIR
-    if [ -n "$ADIOS2_DIR" ] || [ "${NEKO_WITH_ADIOS2:-false}" == true ]; then
-        find_adios2 $ADIOS2_DIR
-    fi
+    find_adios2 $ADIOS2_DIR
     find_parmetis $PARMETIS_DIR
     [ -n "$PFUNIT_DIR" ] && find_pfunit $PFUNIT_DIR
 
+    # ADIOS2 is available only after find_adios2 has run.  Keep its libraries
+    # and any explicitly requested compatibility flags after libneko.a.
+    if [ -n "$ADIOS2_DIR" ]; then
+        neko_adios2_link_flags=$(get_neko_adios2_link_flags)
+        neko_adios2_link_flags+="${NEKO_ADIOS2_EXTRA_LINK_FLAGS:-}"
+    fi
+
     # Determine the Neko installation directory
     if [[ $# -ge 1 ]]; then
-        NEKO_DIR="$(realpath $1)"
+        NEKO_DIR="$1"
     elif [ -z "$NEKO_DIR" ]; then
-        NEKO_DIR="$(realpath $EXTERNAL_DIR/neko)"
+        NEKO_DIR="neko"
+    fi
+
+    if [ "${NEKO_DIR:0:1}" != "/" ]; then
+        NEKO_DIR="$EXTERNAL_DIR/$NEKO_DIR"
     fi
 
     # Check if Neko is installed, if not install it.
@@ -950,20 +695,15 @@ function find_neko() {
 
         [ -z "$CURRENT_DIR" ] && CURRENT_DIR=$(pwd)
         cd $NEKO_DIR
-
-        if [ -n "$ADIOS2_DIR" ] || [ "${NEKO_WITH_ADIOS2:-false}" == true ]; then
-            patch_neko_adios2_linking "$NEKO_DIR"
-            patch_neko_device_mpi_runtime "$NEKO_DIR" || exit 1
-            force_neko_regen=true
-        fi
-
-        if [[ ! -f "configure" || "$CLEAN_NEKO" == true || "$force_neko_regen" == true ]]; then
+        if [[ ! -f "configure" || "$CLEAN_NEKO" == true ]]; then
             ./regen.sh
         fi
         if [[ ! -f Makefile || "$CLEAN_NEKO" == true ]]; then
             ./configure --prefix="$(realpath ./)" $FEATURES \
                 FC=$FC MPIFC=$MPIFC FCFLAGS="$NEKO_FCFLAGS" \
-                CC=$CC MPICC=$MPICC MPICXX=$MPICXX CFLAGS="$NEKO_CFLAGS" \
+                CC=$CC MPICC=$MPICC CFLAGS="$NEKO_CFLAGS" \
+                CXX=$CXX MPICXX=$MPICXX CXXFLAGS="$NEKO_CXXFLAGS" \
+                LIBS="$neko_adios2_link_flags" \
                 HIPCC=$HIPCC HIP_HIPCC_FLAGS="$NEKO_HIPCC_FLAGS" \
                 CUDA_CFLAGS="$NEKO_CUDA_CFLAGS"
         fi
@@ -1132,11 +872,11 @@ function error() {
 function check_external_dir() {
     if [ -z "$EXTERNAL_DIR" ]; then
         echo "Environment EXTERNAL_DIR is not set."
-        echo "Default path will be used: ~/tmp/external"
-        EXTERNAL_DIR=~/tmp/external
+        echo "Default path will be used: $HOME/tmp/external"
+        EXTERNAL_DIR="$HOME/tmp/external"
     fi
 
     mkdir -p "$EXTERNAL_DIR"
-    export EXTERNAL_DIR=$(realpath "$EXTERNAL_DIR")
+    export EXTERNAL_DIR="$(realpath "$EXTERNAL_DIR")"
 
 }

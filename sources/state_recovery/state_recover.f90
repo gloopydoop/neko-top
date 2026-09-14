@@ -1,6 +1,6 @@
 !> @file state_recover.f90
 !! @copyright
-!! Copyright (c) 2025, The Neko-TOP Authors
+!! Copyright (c) 2025-2026, The Neko-TOP Authors
 !! All rights reserved.
 !!
 !! Redistribution and use in source and binary forms, with or without
@@ -33,17 +33,29 @@
 !! POSSIBILITY OF SUCH DAMAGE.
 !
 !> @brief Abstract interface for state recovery strategies.
+!!
+!! @par Factory API
+!! `state_recover_factory(recover, neko_case, params)` allocates a recovery
+!! implementation selected by the `type` entry in `params`, initializes it,
+!! and associates it with `neko_case`. The allocatable `recover` argument is
+!! replaced if it is already allocated.
+!!
+!! `state_recover_allocator(recover, recover_type)` only allocates the
+!! implementation selected by `recover_type`; the caller remains responsible
+!! for initializing it. The allocatable `recover` argument is replaced if it
+!! is already allocated.
 module state_recover
   use case, only: case_t
   use json_file_module, only: json_file
-  use time_state, only: time_state_t
   implicit none
   private
 
   !> Abstract base type for state recovery implementations.
   type, abstract, public :: state_recover_t
      private
-     !> number of time steps in the forward simulation
+     !> Case associated with this recovery strategy at initialization.
+     class(case_t), pointer, public :: neko_case => null()
+     !> Number of states recorded by this recovery strategy.
      integer :: n_timesteps = 0
    contains
      procedure(state_recover_init), pass(this), public, deferred :: init
@@ -66,7 +78,7 @@ module state_recover
        import state_recover_t, case_t, json_file
        class(state_recover_t), intent(inout) :: this
        class(case_t), target, intent(inout) :: neko_case
-       type(json_file), target, intent(inout) :: params
+       type(json_file), intent(inout) :: params
      end subroutine state_recover_init
 
      !> Free state recovery resources.
@@ -85,30 +97,35 @@ module state_recover
 
      !> Save forward state for recovery.
      !! @param[inout] this State recovery instance.
-     !! @param[inout] neko_case Case data structure.
-     !! @param[in] time Current time state.
-     subroutine state_recover_save(this, neko_case, time)
-       import state_recover_t, case_t, time_state_t
+     subroutine state_recover_save(this)
+       import state_recover_t
        class(state_recover_t), intent(inout) :: this
-       class(case_t), intent(inout) :: neko_case
-       type(time_state_t), intent(in) :: time
      end subroutine state_recover_save
 
      !> Restore forward state for adjoint.
      !! @param[inout] this State recovery instance.
-     !! @param[inout] neko_case Case data structure.
-     !! @param[in] time Target time state.
-     subroutine state_recover_restore(this, neko_case, time)
-       import state_recover_t, case_t, time_state_t
+     !! @param[in] tstep Timestep to restore.
+     subroutine state_recover_restore(this, tstep)
+       import state_recover_t
        class(state_recover_t), intent(inout) :: this
-       class(case_t), target, intent(inout) :: neko_case
-       type(time_state_t), intent(in) :: time
+       integer, intent(in) :: tstep
      end subroutine state_recover_restore
   end interface
 
+  interface
+     ! Construct and initialize a state recovery object from JSON parameters.
+     module subroutine state_recover_factory(recover, neko_case, params)
+       class(state_recover_t), allocatable, intent(inout) :: recover
+       class(case_t), target, intent(inout) :: neko_case
+       type(json_file), intent(inout) :: params
+     end subroutine state_recover_factory
+  end interface
+
+  public :: state_recover_factory
+
 contains
 
-  !> Get number of forward time steps.
+  !> Get the number of states recorded by this recovery strategy.
   !! @param[in] this State recovery instance.
   pure function state_recover_get_n_timesteps(this) result(n)
     class(state_recover_t), intent(in) :: this
@@ -117,15 +134,14 @@ contains
     n = this%n_timesteps
   end function state_recover_get_n_timesteps
 
-  !> Set number of forward time steps.
+  !> Set the number of states recorded by this recovery strategy.
   !! @param[inout] this State recovery instance.
-  !! @param[in] n Number of time steps.
+  !! @param[in] n Number of recorded states.
   subroutine state_recover_set_n_timesteps(this, n)
     class(state_recover_t), intent(inout) :: this
     integer, intent(in) :: n
 
     this%n_timesteps = n
   end subroutine state_recover_set_n_timesteps
-
 
 end module state_recover

@@ -18,13 +18,10 @@ top level of the case file:
 }
 ```
 
-Currently supported implementations are:
+The available implementation is `checkpoint`, which restarts the forward
+problem from stored checkpoints.
 
-- `checkpoint`: restart the forward problem from stored checkpoints
-- `pod`: stream forward snapshots to a Python POD driver and reconstruct the
-  state from a reduced basis
-
-## Checkpoint state recovery
+## Checkpoint-based state recovery
 
 A straight forward approach is to simply store the entire forward state at each
 timestep, and then restore it when needed by the adjoint simulation. However,
@@ -77,6 +74,8 @@ used to reconstruct the forward state when it is needed.
 This reduces the amount of stored state substantially, but it introduces extra
 software requirements compared with checkpoint recovery and it changes the
 runtime model from a Neko-only MPI job to a coupled Neko + Python MPI launch.
+POD recovery always includes the initial condition and does not skip an initial
+transient phase.
 
 At the case-file level, POD recovery looks like:
 
@@ -119,35 +118,31 @@ from `case.fluid.output_control` and `case.fluid.output_value`.
 
 ### ADIOS2 requirement
 
-ADIOS2 is required only for POD state recovery. Checkpoint-based state
-recovery and the rest of Neko-TOP can be built without it.
+POD state recovery depends on ADIOS2. The Fortran side uses the Neko-TOP
+streaming layer, and the Python side imports ADIOS2-backed
+[`pySEMTools`](https://github.com/ExtremeFLOW/pySEMTools) streaming support.
+When ADIOS2 is unavailable, Neko-TOP builds with checkpoint state recovery
+only. A case that requests `"type": "pod"` then reports that POD recovery
+requires ADIOS2.
 
-On the Neko-TOP side, CMake enables the real POD implementation only when
-`find_package(ADIOS2 QUIET COMPONENTS CXX MPI)` succeeds. If ADIOS2 is not
-found, Neko-TOP builds the POD stub instead, so `state_recovery.type = "pod"`
-is not available at runtime.
+The build and runtime helpers try to locate ADIOS2 from:
 
-`./setup.sh` always calls the ADIOS2 helper, but that helper returns
-immediately unless `ADIOS2_DIR` is set. In practice this means:
+- `ADIOS2_PATH`
+- `ADIOS2_DIR`
+- `${repo}/external/adios2`
+- `adios2-config` on `PATH`
 
-- leave `ADIOS2_DIR` unset if you do not want ADIOS2 or POD state recovery
-- set `ADIOS2_DIR=/path/to/adios2` to use an existing ADIOS2 installation
-- set `ADIOS2_DIR=/path/where/adios2/should/be/installed` if you want
-  `scripts/dependencies.sh` to clone, build, and install ADIOS2 for you
+If ADIOS2 is not already installed, `scripts/dependencies.sh` can build it.
+The relevant configuration is:
 
-When the helper builds ADIOS2 itself, it uses the currently active Python
-interpreter and MPI compiler wrappers. This is why the Python environment must
-already be activated before running `./setup.sh`. The helper defaults to:
+- `NEKO_WITH_ADIOS2=true`
+- `ADIOS2_DIR=/path/to/adios2` if you want to point at an existing install
+- optional ADIOS2 build options such as `ADIOS2_ENABLE_FORTRAN=ON`,
+  `ADIOS2_ENABLE_PYTHON=ON`, and `ADIOS2_ENABLE_SST=ON`
 
-- `ADIOS2_USE_MPI=ON` because the coupled Neko/Python workflow is launched as
-  an MPI job
-- `ADIOS2_USE_Fortran=ON` because the Neko side uses the ADIOS2 Fortran
-  interface
-- `ADIOS2_USE_Python=ON` because the Python driver imports `adios2.bindings`
-- `ADIOS2_USE_SST=ON` because the POD workflow uses ADIOS2's in-memory
-  streaming transport rather than file-based exchange
-
-If `HDF5_DIR` is set, the helper also builds ADIOS2 with HDF5 support.
+The runtime helper in `scripts/mpmd_run_helpers.sh` also extends
+`PYTHONPATH` and `LD_LIBRARY_PATH` so that `adios2.bindings` can be imported
+on the Python side.
 
 ### Python requirements
 
@@ -191,11 +186,6 @@ The recommended workflow is:
 4. Launch the POD case through the repository-level `run.sh` script from the
    Neko-TOP root, for example `./run.sh POD_rugby_ball`, rather than manually
    piecing together the MPI command.
-
-Cluster-specific placement should stay in the submit scripts under
-`scripts/jobscripts/<cluster>/...`. The generic MPMD helper is intentionally
-limited to launching the mixed Neko/Python job once the allocation and any
-cluster-local wrappers have already been chosen.
 
 The POD helper scripts print the active `python3`, `mpirun`, `CONDA_PREFIX`,
 `PYTHONPATH`, and `LD_LIBRARY_PATH` before launching. If `mpi4py` or ADIOS2

@@ -4,8 +4,6 @@ This example is the POD state-recovery variant of
 [Unsteady rugby ball](@ref unsteady-rugby-ball). It uses the same setup and
 optimization problem, but replaces checkpoint-based state recovery with POD.
 
-Launch it from the repository root with `./run.sh POD_rugby_ball`.
-
 The objective is to minimize the time integral of the dissipation
 
 \f[

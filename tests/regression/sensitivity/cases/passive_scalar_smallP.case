@@ -6,34 +6,36 @@
         "output_at_end": false,
         "output_boundary": false,
         "time": {
-            "end_time": 5.0e-5,
-            "timestep": 1.0e-5
+            "end_time": 10.0,
+            "timestep": 1.0e-3
         },
         "numerics": {
             "time_order": 3,
-            "polynomial_order": 7,
-            "dealias": false
+            "polynomial_order": 2,
+            "dealias": true
         },
         "fluid": {
             "scheme": "pnpn",
-            "Re": 1000.0,
-            "output_control": "never",
-            "output_format": "fld",
-            "pressure_solver": {
-                "type": "gmres",
-                "preconditioner": { "type": "hsmg" },
-                "absolute_tolerance": 1e-7,
-                "max_iterations": 800
-            },
-            "velocity_solver": {
-                "type": "cg",
-                "preconditioner": { "type": "jacobi" },
-                "absolute_tolerance": 1e-6,
-                "max_iterations": 800
-            },
+            "Re": 1.0,
             "initial_condition": {
                 "type": "uniform",
                 "value": [ 0.0, 0.0, 0.0 ]
+            },
+            "velocity_solver": {
+                "type": "cg",
+                "preconditioner": {
+                    "type": "jacobi"
+                },
+                "absolute_tolerance": 1e-16,
+                "max_iterations": 50
+            },
+            "pressure_solver": {
+                "type": "gmres",
+                "preconditioner": {
+                    "type": "hsmg"
+                },
+                "absolute_tolerance": 1e-12,
+                "max_iterations": 50
             },
             "boundary_conditions": [
                 {
@@ -41,29 +43,25 @@
                     "zone_indices": [ 1 ]
                 },
                 {
-                    "type": "no_slip",
-                    "zone_indices": [ 3, 4, 5, 6 ]
-                },
-                {
-                    "type": "outflow+dong",
+                    "type": "outflow",
                     "zone_indices": [ 2 ]
                 }
-            ]
+            ],
+            "output_control": "never"
         },
         "scalar": {
             "enabled": true,
-            "Pe": 1000.0,
+            "Pe": 20.0,
             "solver": {
                 "type": "cg",
                 "preconditioner": {
                     "type": "jacobi"
                 },
-                "absolute_tolerance": 1e-6,
-                "max_iterations": 10
+                "absolute_tolerance": 1e-18,
+                "max_iterations": 50
             },
             "initial_condition": {
-                "type": "uniform",
-                "value": 0.0
+                "type": "user"
             },
             "boundary_conditions": [
                 {
@@ -73,7 +71,7 @@
                 {
                     "type": "neumann",
                     "flux": 0.0,
-                    "zone_indices": [ 2, 3, 4, 5, 6 ]
+                    "zone_indices": [ 2 ]
                 }
             ]
         },
@@ -88,7 +86,7 @@
                 {
                     "type": "neumann",
                     "flux": 0.0,
-                    "zone_indices": [ 2, 3, 4, 5, 6 ]
+                    "zone_indices": [ 2 ]
                 }
             ],
             "initial_condition": {
@@ -97,8 +95,6 @@
             }
         },
         "adjoint_fluid": {
-            "output_control": "never",
-            "output_format": "fld",
             "initial_condition": {
                 "type": "uniform",
                 "value": [ 0.0, 0.0, 0.0 ]
@@ -106,7 +102,7 @@
             "boundary_conditions": [
                 {
                     "type": "no_slip",
-                    "zone_indices": [ 1, 3, 4, 5, 6 ]
+                    "zone_indices": [ 1 ]
                 },
                 {
                     "type": "outflow",
@@ -114,72 +110,73 @@
                 }
             ]
         },
+        "simulation_components": [
+            {
+                "type": "steady",
+                "tol": 1e-9,
+                "compute_control": "tsteps",
+                "compute_value": 1,
+                "scalar_coupled": true
+            }
+        ],
         "point_zones": [
             {
                 "name": "optimization_domain",
                 "geometry": "box",
-                "x_bounds": [ 1.0, 3.0 ],
-                "y_bounds": [ 0.0, 1.0 ],
-                "z_bounds": [ 0.0, 1.0 ]
+                "x_bounds": [ 0.2, 0.8 ],
+                "y_bounds": [ 0.2, 0.8 ],
+                "z_bounds": [ -1.0, 1.0 ]
             },
             {
                 "name": "objective_domain",
                 "geometry": "box",
-                "x_bounds": [ 3.5, 6.5 ],
-                "y_bounds": [ 0.0, 1.0 ],
-                "z_bounds": [ 0.0, 1.0 ]
+                "x_bounds": [ 0.8, 1.0 ],
+                "y_bounds": [ -1.0, 3.0 ],
+                "z_bounds": [ -1.0, 3.0 ]
             },
             {
-                "name": "asym_IC",
-                "geometry": "box",
-                "x_bounds": [ 1.7, 2.0 ],
-                "y_bounds": [ 0.2, 0.5 ],
-                "z_bounds": [ 0.2, 0.5 ]
+                "name": "initial_ball",
+                "geometry": "cylinder",
+                "start": [ 0.5, 0.5, -0.5 ],
+                "end": [ 0.5, 0.5, 1.5 ],
+                "radius": 0.25
             }
         ]
     },
-    "unsteady": true,
-    "state_recovery": {
-        "type": "checkpoint",
-        "enabled": true,
-        "format": "chkp",
-        "n_memory": 3
-    },
     "optimization": {
+        "fd_test_tolerance": 5.0e-3,
+        "domain": {
+            "type": "point_zone",
+            "zone_name": "optimization_domain"
+        },
         "design": {
             "type": "brinkman",
-            "verbose_design": true,
-            "verbose_sensitivity": true,
-            "output_format": "fld",
             "mapping": [
                 {
                     "type": "PDE_filter",
-                    "r": 6.00e-02,
-                    "tol": 1e-15
+                    "r": 0.05,
+                    "tol": 1.0e-20,
+                    "max_iter": 600
                 },
                 {
                     "type": "RAMP",
-                    "f_max": 1.0e3,
-                    "q": 3.0
+                    "f_max": 100.0
                 }
             ],
             "initial_distribution": {
                 "type": "point_zone",
                 "base_value": 0.0,
                 "zone_value": 1.0,
-                "zone_name": "asym_IC"
-            },
-            "domain": {
-                "type": "point_zone",
-                "zone_name": "optimization_domain"
+                "zone_name": "initial_ball"
             }
         },
         "solver": {
             "type": "mma",
-            "max_iterations": 2,
-            "tolerance": 1.0e-13,
+            "max_iterations": 100,
+            "tolerance": 1.0e-3,
+            "subsolve": "dip",
             "mma": {
-                "scale": 1.0,
+                "scale": 1000.0,
                 "xmin": 0.0,
                 "xmax": 1.0
             }
@@ -190,14 +187,6 @@
                 "mask_name": "objective_domain",
                 "phi_ref": 0.5,
                 "weight": 1.0
-            },
-            {
-                "type": "viscous_dissipation",
-                "weight": 0.1
-            },
-            {
-                "type": "brinkman_dissipation",
-                "weight": 0.1
             }
         ]
     }

@@ -1,6 +1,6 @@
-!> @file state_recover_factory.f90
+!> @file state_recover_fctry.f90
 !! @copyright
-!! Copyright (c) 2025, The Neko-TOP Authors
+!! Copyright (c) 2025-2026, The Neko-TOP Authors
 !! All rights reserved.
 !!
 !! Redistribution and use in source and binary forms, with or without
@@ -32,33 +32,39 @@
 !! ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 !! POSSIBILITY OF SUCH DAMAGE.
 !
-!> @brief Factory for state recovery implementations.
-module state_recover_factory
-  use case, only: case_t
-  use json_file_module, only: json_file
+!> @brief Factories for state recovery implementations.
+submodule (state_recover) state_recover_fctry
   use json_utils, only: json_get_or_default
-  use state_recover, only: state_recover_t
-  use simulation_checkpoint, only: simulation_checkpoint_t
+  use state_recover_checkpoint, only: state_recover_checkpoint_t
+#if HAVE_ADIOS2
   use simulation_POD_state_recover, only: POD_state_recover_t
+#endif
   use utils, only: neko_error
   implicit none
-  private
-
-  public :: state_recover_create
 
 contains
 
-  !> Create and initialize a state recovery object from JSON parameters.
+  !> Construct and initialize a state recovery object from JSON parameters.
   !! @param[inout] recover Allocatable state recovery instance.
   !! @param[inout] neko_case Case data structure.
   !! @param[inout] params JSON parameters for state recovery.
-  subroutine state_recover_create(recover, neko_case, params)
+  module subroutine state_recover_factory(recover, neko_case, params)
     class(state_recover_t), allocatable, intent(inout) :: recover
     class(case_t), target, intent(inout) :: neko_case
     type(json_file), intent(inout) :: params
     character(len=:), allocatable :: recover_type
 
     call json_get_or_default(params, "type", recover_type, "checkpoint")
+    call state_recover_allocator(recover, recover_type)
+    call recover%init(neko_case, params)
+  end subroutine state_recover_factory
+
+  !> Allocate a state recovery implementation.
+  !! @param[inout] recover Allocatable state recovery instance.
+  !! @param[in] recover_type State recovery implementation identifier.
+  subroutine state_recover_allocator(recover, recover_type)
+    class(state_recover_t), allocatable, intent(inout) :: recover
+    character(len=*), intent(in) :: recover_type
 
     if (allocated(recover)) then
        call recover%free()
@@ -67,14 +73,18 @@ contains
 
     select case (trim(recover_type))
     case ("checkpoint", "simulation_checkpoint")
-       allocate(simulation_checkpoint_t :: recover)
-    case ("pod", "POD", "pod_state_recover")
+       allocate(state_recover_checkpoint_t :: recover)
+    case ("pod")
+#if HAVE_ADIOS2
        allocate(POD_state_recover_t :: recover)
+#else
+       call neko_error("POD state recovery requires ADIOS2. Rebuild with " // &
+            "ADIOS2 enabled.")
+#endif
     case default
        call neko_error("Unknown state recover type: " // trim(recover_type))
     end select
 
-    call recover%init(neko_case, params)
-  end subroutine state_recover_create
+  end subroutine state_recover_allocator
 
-end module state_recover_factory
+end submodule state_recover_fctry
