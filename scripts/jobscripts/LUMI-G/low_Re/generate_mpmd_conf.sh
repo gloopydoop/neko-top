@@ -115,8 +115,8 @@ cat <<'EOF' > "${select_gpu_path}"
 #!/bin/bash
 
 export ROCR_VISIBLE_DEVICES=${SLURM_LOCALID}
+export MPICH_GPU_SUPPORT_ENABLED=${MPICH_GPU_SUPPORT_ENABLED:-0}
 export NEKO_GS_COMM=${NEKO_GS_COMM:-MPI}
-export NEKO_DISABLE_DEVICE_MPI=${NEKO_DISABLE_DEVICE_MPI:-1}
 sleep "${NEKO_STARTUP_DELAY:-20}"
 exec "$@"
 EOF
@@ -130,15 +130,17 @@ for ((node=0; node<nodes; node++)); do
 
     for ((local_rank=0; local_rank<neko_ranks_per_node; local_rank++)); do
         rank=$((node_base + local_rank))
-        printf '%d /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=%d %s %s %s\n' \
-            "${rank}" "${neko_ranks_per_node}" \
+        printf '%d /usr/bin/env MPICH_GPU_SUPPORT_ENABLED=%s NEKO_GS_COMM=%s NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=%d %s %s %s\n' \
+            "${rank}" "${MPICH_GPU_SUPPORT_ENABLED:-0}" "${NEKO_GS_COMM:-MPI}" \
+            "${neko_ranks_per_node}" \
             "${select_gpu_path}" "${neko_exe}" "${case_file}" >> "${output_path}"
     done
 
     for ((local_rank=0; local_rank<python_ranks_per_node; local_rank++)); do
         rank=$((node_base + neko_ranks_per_node + local_rank))
-        printf '%d /usr/bin/env NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 %s %s %s\n' \
-            "${rank}" "${python_bin}" "${python_script}" "${case_file}" \
+        printf '%d /usr/bin/env MPICH_GPU_SUPPORT_ENABLED=%s NEKO_COMM_ID=1 NEKO_CTRL_PEER_ROOT=0 %s %s %s\n' \
+            "${rank}" "${MPICH_GPU_SUPPORT_ENABLED:-0}" \
+            "${python_bin}" "${python_script}" "${case_file}" \
             >> "${output_path}"
     done
 done
