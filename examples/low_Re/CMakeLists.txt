@@ -1,4 +1,4 @@
-# Compile the POD mixer example with its user-defined setup.
+# Compile the low-Re POD example with its user-defined setup.
 set(DRIVER_TYPE "topopt-user")
 set(EXTRA_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/user.f90

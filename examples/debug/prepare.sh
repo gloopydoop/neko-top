@@ -2,7 +2,7 @@
 
 function help() {
     echo -e "./prepare.sh"
-    echo -e "  Stage the POD mixer inputs used by the debug example."
+    echo -e "  Stage the low-Re POD inputs used by the debug example."
     echo -e ""
     echo -e "  The input arguments are the number of cells in the x, y, and z"
     echo -e "  directions, respectively."

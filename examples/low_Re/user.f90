@@ -76,8 +76,8 @@ contains
 
        do i = 1, bc%msk(0)
           idx = bc%msk(i)
-          y = u%dof%y(idx, 1, 1, 1)
-          z = u%dof%z(idx, 1, 1, 1)
+          y = u%dof%y%x(idx, 1, 1, 1)
+          z = u%dof%z%x(idx, 1, 1, 1)
 
           ! Inflow velocity profile is a paraboloid
           u%x(idx, 1, 1, 1) = inflow_velocity(y, z)
@@ -96,7 +96,7 @@ contains
 
        do i = 1, bc%msk(0)
           idx = bc%msk(i)
-          z = s%dof%z(idx, 1, 1, 1)
+          z = s%dof%z%x(idx, 1, 1, 1)
           ! Inflow scalar profile is a sigmoid separating the two species
           s%x(idx, 1, 1, 1) = scalar_profile(z)
        end do
@@ -119,7 +119,8 @@ contains
        w => fields%get("w")
 
        do i = 1, u%dof%size()
-          u%x(i, 1, 1, 1) = inflow_velocity(u%dof%y(i, 1, 1, 1), u%dof%z(i, 1, 1, 1))
+          u%x(i, 1, 1, 1) = inflow_velocity(u%dof%y%x(i, 1, 1, 1), &
+               u%dof%z%x(i, 1, 1, 1))
           v%x(i, 1, 1, 1) = 0.0_rp
           w%x(i, 1, 1, 1) = 0.0_rp
        end do
@@ -136,7 +137,7 @@ contains
     ! Initial scalar profile is a sigmoid separating the two species
     s => fields%get("s")
     do i = 1, s%dof%size()
-       s%x(i, 1, 1, 1) = scalar_profile(s%dof%z(i, 1, 1, 1))
+       s%x(i, 1, 1, 1) = scalar_profile(s%dof%z%x(i, 1, 1, 1))
     end do
 
     if (NEKO_BCKND_DEVICE .eq. 1) then

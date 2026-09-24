@@ -415,9 +415,9 @@ contains
     call this%dstream%init(this%coef)
 
     ! Send mesh once
-    call this%dstream%stream(this%coef%dof%x)
-    call this%dstream%stream(this%coef%dof%y)
-    call this%dstream%stream(this%coef%dof%z)
+    call this%dstream%stream(this%coef%dof%x%x)
+    call this%dstream%stream(this%coef%dof%y%x)
+    call this%dstream%stream(this%coef%dof%z%x)
 
     ! Stream the initial condition before the forward time loop begins.
     call POD_state_recover_stream_fields(this, neko_case)

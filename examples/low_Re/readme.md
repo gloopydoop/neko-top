@@ -1,14 +1,13 @@
-# POD Mixer {#pod-mixer}
+# Low-Re POD {#low-re-pod}
 
-This example is the POD state-recovery mixer case derived from the
-`low_Re` setup used on LUMI. It is the cluster-oriented POD example in this
-split stack.
+This example is the POD state-recovery low-Re mixer case used on LUMI. It is
+the cluster-oriented POD example in this split stack.
 
 For manual testing outside Slurm, launch it from the repository root with
-`./run.sh POD_mixer`, overriding `NEKO_RANKS` and `PY_RANKS` if needed.
+`./run.sh low_Re`, overriding `NEKO_RANKS` and `PY_RANKS` if needed.
 
-For a LUMI submission, run `./run.sh --submit LUMI-G POD_mixer`. The
-example-specific job script under `scripts/jobscripts/LUMI-G/POD_mixer` sets up
+For a LUMI submission, run `./run.sh --submit LUMI-G low_Re`. The
+example-specific job script under `scripts/jobscripts/LUMI-G/low_Re` sets up
 the full-node layout used by the coupled run:
 
 - 8 Neko ranks per node, one GPU-backed rank per MI250x GCD

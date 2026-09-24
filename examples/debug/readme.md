@@ -1,4 +1,4 @@
-Debug batch example for the split POD mixer branch.
+Debug batch example for the split low-Re POD branch.
 
 Run it with:
 

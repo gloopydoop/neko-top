@@ -1,6 +1,6 @@
 #!/bin/bash -l
 
-# LUMI-G submit settings for the POD mixer example. This case uses a full-node
+# LUMI-G submit settings for the low-Re POD example. This case uses a full-node
 # MPMD layout: eight GPU-backed Neko ranks plus forty-eight CPU-only Python
 # ranks per node.
 
@@ -52,11 +52,12 @@ source functions.sh
 export MPICH_GPU_SUPPORT_ENABLED=1
 # Cray MPICH on LUMI requires this for srun --multi-prog MPMD launches.
 export MPICH_DMAPP_APP_IS_WORLD=1
-export ATP_ENABLED=true
+export NEKO_GS_COMM="${NEKO_GS_COMM:-MPI}"
+export NEKO_DISABLE_DEVICE_MPI="${NEKO_DISABLE_DEVICE_MPI:-1}"
 
 # Match the working pySEMTools/checkpointing launch path: the example-local
 # run.sh owns the shared MPMD launch and the delayed select_gpu wrapper.
-export CASE_FILE="${CASE_FILE:-POD_mixer.case}"
+export CASE_FILE="${CASE_FILE:-low_Re.case}"
 export PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || command -v python)}"
 export PYTHON_SCRIPT="${PYTHON_SCRIPT:-${MAIN_DIR}/scripts/python/pod_state_recover.py}"
 export NEKO_RANKS="${NEKO_RANKS:-8}"

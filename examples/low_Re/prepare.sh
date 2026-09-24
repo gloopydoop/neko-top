@@ -2,7 +2,7 @@
 
 function help() {
     echo -e "./prepare.sh"
-    echo -e "  Generate the mesh used by the POD mixer example."
+    echo -e "  Generate the mesh used by the low-Re POD example."
     echo -e ""
     echo -e "  The input arguments are the number of cells in the x, y, and z"
     echo -e "  directions, respectively."

@@ -5,7 +5,7 @@ if [ -z "${MAIN_DIR:-}" ]; then
     MAIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 fi
 
-CASE_FILE=${CASE_FILE:-POD_mixer.case}
+CASE_FILE=${CASE_FILE:-low_Re.case}
 PYTHON_SCRIPT=${PYTHON_SCRIPT:-"${MAIN_DIR}/scripts/python/pod_state_recover.py"}
 NEKO_EXE=${NEKO_BIN:-./neko}
 NEKO_RANKS=${NEKO_RANKS:-8}
@@ -34,7 +34,7 @@ fi
 
 if [ ! -x "${NEKO_EXE}" ]; then
     echo "Error: Neko executable not found or not executable: ${NEKO_EXE}" >&2
-    echo "Build examples/POD_mixer or set NEKO_BIN explicitly." >&2
+    echo "Build examples/low_Re or set NEKO_BIN explicitly." >&2
     exit 1
 fi
 
@@ -73,7 +73,7 @@ chmod +x ./select_gpu
 rm -f ./mpmd.conf
 
 for ((rank=0; rank<NEKO_RANKS; rank++)); do
-    echo "${rank} /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} NEKO_EXPECT_WORLD_SIZE=${TOTAL_RANKS} NEKO_EXPECT_APP_SIZE=${NEKO_RANKS} NEKO_EXPECT_WORLD_NODE_SIZE=${TOTAL_RANKS} NEKO_EXPECT_APP_NODE_SIZE=${NEKO_RANKS} ./select_gpu ${NEKO_EXE} ${CASE_FILE}" >> mpmd.conf
+    echo "${rank} /usr/bin/env NEKO_COMM_ID=0 NEKO_CTRL_PEER_ROOT=${NEKO_RANKS} ./select_gpu ${NEKO_EXE} ${CASE_FILE}" >> mpmd.conf
 done
 
 for ((rank=NEKO_RANKS; rank<NEKO_RANKS + PY_RANKS; rank++)); do
