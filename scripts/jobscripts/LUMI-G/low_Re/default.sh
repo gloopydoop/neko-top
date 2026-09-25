@@ -14,7 +14,7 @@
 #SBATCH --mem=480GB
 
 # Time specifications (dd-hh:mm:ss)
-#SBATCH --time=00-00:30:00
+#SBATCH --time=00-15:10:00
 
 # Notification options
 #SBATCH --mail-type=END
@@ -52,8 +52,6 @@ source functions.sh
 export MPICH_GPU_SUPPORT_ENABLED=1
 # Cray MPICH on LUMI requires this for srun --multi-prog MPMD launches.
 export MPICH_DMAPP_APP_IS_WORLD=1
-export NEKO_GS_COMM="${NEKO_GS_COMM:-MPI}"
-export NEKO_DISABLE_DEVICE_MPI="${NEKO_DISABLE_DEVICE_MPI:-1}"
 
 # Match the working pySEMTools/checkpointing launch path: the example-local
 # run.sh owns the shared MPMD launch and the delayed select_gpu wrapper.
