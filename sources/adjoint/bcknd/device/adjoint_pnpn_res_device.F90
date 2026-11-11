@@ -46,7 +46,7 @@ module adjoint_pnpn_res_device
   use mesh, only : mesh_t
   use num_types, only : rp
   use space, only : space_t
-  use device_math, only : device_cfill, device_cmult, device_cmult2, &
+  use device_math, only : device_cfill, device_cmult, device_cmult2, device_copy, &
        device_col2, device_add2
   use device, only : device_event_sync
   use, intrinsic :: iso_c_binding, only : c_ptr
@@ -187,14 +187,11 @@ contains
     real(kind=rp), intent(in) :: bd
     real(kind=rp), intent(in) :: dt
     integer, intent(in) :: n
-    real(kind=rp) :: mu_val, rho_val
-
-    ! We assume the material properties are constant
-    mu_val = mu%x(1,1,1,1)
-    rho_val = rho%x(1,1,1,1)
-
-    call device_cfill(c_Xh%h1_d, mu_val, n)
-    call device_cfill(c_Xh%h2_d, rho_val * (bd / dt), n)
+    ! Keep the viscosity and density as fields.  This is required by the
+    ! coupled full-stress operator and is identical to the old path when the
+    ! fields are constant.
+    call device_copy(c_Xh%h1_d, mu%x_d, n)
+    call device_cmult2(c_Xh%h2_d, rho%x_d, bd / dt, n)
     c_Xh%ifh2 = .true.
 
     call Ax%compute_vector(u_res%x, v_res%x, w_res%x, u%x, v%x, w%x, c_Xh, &

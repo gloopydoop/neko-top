@@ -310,20 +310,21 @@ contains
     allocate(this%ext_bdf)
     call this%ext_bdf%init(integer_val)
 
-    call json_get_or_default(params, "case.fluid.full_stress_formulation", &
+    call json_get_or_default(params, "case.adjoint_fluid.full_stress_formulation", &
          this%full_stress_formulation, .false.)
+    if (.not. this%full_stress_formulation) then
+       call json_get_or_default(params, "case.fluid.full_stress_formulation", &
+            this%full_stress_formulation, .false.)
+    end if
 
     if (this%full_stress_formulation .eqv. .true.) then
-       call neko_error( &
-            "Full stress formulation is not supported in the adjoint module.")
-       !  ! Setup backend dependent Ax routines
-       !  call ax_helm_allocator(this%Ax_vel, type_name = "full")
-
-       !  ! Setup backend dependent prs residual routines
-       !  call pnpn_prs_res_stress_factory(this%prs_res)
-
-       !  ! Setup backend dependent vel residual routines
-       !  call pnpn_vel_res_stress_factory(this%vel_res)
+       ! The coupled full-stress Ax action is symmetric in the velocity
+       ! components.  The adjoint residual supplies the transpose pressure and
+       ! forcing terms while this operator supplies the variable-coefficient
+       ! stress divergence.
+       call ax_helm_allocator(this%Ax_vel, type_name = "full")
+       call adjoint_pnpn_prs_res_factory(this%prs_res)
+       call adjoint_pnpn_vel_res_factory(this%vel_res)
     else
        ! Setup backend dependent Ax routines
        call ax_helm_allocator(this%Ax_vel, type_name = "standard")
@@ -335,7 +336,9 @@ contains
        call adjoint_pnpn_vel_res_factory(this%vel_res)
     end if
 
-    if (params%valid_path('case.fluid.nut_field')) then
+    if (params%valid_path('case.adjoint_fluid.nut_field')) then
+       call json_get(params, 'case.adjoint_fluid.nut_field', this%nut_field_name)
+    else if (params%valid_path('case.fluid.nut_field')) then
        if (this%full_stress_formulation .eqv. .false.) then
           call neko_error("You need to set full_stress_formulation to " // &
                "true for the fluid to have a spatially varying " // &

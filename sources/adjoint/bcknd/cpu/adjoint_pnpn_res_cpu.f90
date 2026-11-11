@@ -46,7 +46,7 @@ module adjoint_pnpn_res_cpu
   use mesh, only : mesh_t
   use num_types, only : rp
   use space, only : space_t
-  use math, only : cfill, col3, cmult, col2, chsign, add2
+  use math, only : cfill, col3, cmult, cmult2, copy, col2, chsign, add2
   use, intrinsic :: iso_c_binding, only : c_ptr
   implicit none
   private
@@ -214,18 +214,18 @@ contains
     real(kind=rp), intent(in) :: bd
     real(kind=rp), intent(in) :: dt
     integer, intent(in) :: n
-    real(kind=rp) :: rho_val, mu_val
-    ! We assume the material properties are constant
-    rho_val = rho%x(1,1,1,1)
-    mu_val = mu%x(1,1,1,1)
-
-    call cfill(c_Xh%h1, mu_val, n)
-    call cfill(c_Xh%h2, rho_val * bd / dt, n)
+    ! The full-stress path accepts spatially varying dynamic viscosity.  The
+    ! standard path also benefits from the same assignment and remains
+    ! equivalent for constant fields.
+    call copy(c_Xh%h1, mu%x, n)
+    call cmult2(c_Xh%h2, rho%x, bd / dt, n)
     c_Xh%ifh2 = .true.
 
-    call Ax%compute(u_res%x, u%x, c_Xh, msh, Xh)
-    call Ax%compute(v_res%x, v%x, c_Xh, msh, Xh)
-    call Ax%compute(w_res%x, w%x, c_Xh, msh, Xh)
+    ! The full-stress operator is a coupled vector operator.  Calling the
+    ! scalar compute entry here silently dispatches to ax_helm_full's error
+    ! path, even when the Krylov solver itself is coupled.
+    call Ax%compute_vector(u_res%x, v_res%x, w_res%x, u%x, v%x, w%x, &
+         c_Xh, msh, Xh)
 
     call chsign(u_res%x, n)
     call chsign(v_res%x, n)

@@ -108,10 +108,10 @@ function mpmd_configure_local_runtime() {
                 "${ADIOS2_DIR}/lib/python${pyver}/site-packages"
             mpmd_prepend_path_var PYTHONPATH \
                 "${ADIOS2_DIR}/lib64/python${pyver}/site-packages"
-            mpmd_prepend_path_var PYTHONPATH \
-                "${repo_root}/lib/python${pyver}/site-packages"
-            mpmd_prepend_path_var PYTHONPATH \
-                "${repo_root}/lib64/python${pyver}/site-packages"
+            # Prefer the Python bindings installed beside the selected ADIOS2
+            # library.  A stale repository-local lib/ tree can otherwise win
+            # import resolution while LD_LIBRARY_PATH points at another ADIOS2
+            # build, producing opaque SST/core-library mismatches.
         fi
     fi
 }

@@ -64,7 +64,7 @@ module adjoint_scalar_scheme
   use field_series, only : field_series_t
   use math, only : cfill, add2s2
   use field_math, only : field_cmult, field_col3, field_cfill, field_add2, &
-       field_col2
+       field_col2, field_copy
   use device_math, only : device_cfill, device_add2s2
   use neko_config, only : NEKO_BCKND_DEVICE
   use field_series, only : field_series_t
@@ -129,10 +129,12 @@ module adjoint_scalar_scheme
      type(chkp_t), pointer :: chkp => null()
      !> The turbulent kinematic viscosity field name
      character(len=:), allocatable :: nut_field_name
+     character(len=:), allocatable :: gammat_field_name
      !> Density.
      type(field_t), pointer :: rho => null()
      !> Thermal diffusivity.
      type(field_t) :: lambda
+     type(field_t) :: lambda_molecular
      !> Specific heat capacity.
      type(field_t) :: cp
      !> Turbulent Prandtl number.
@@ -328,6 +330,19 @@ contains
     this%Xh => this%u%Xh
     this%dm_Xh => this%u%dof
     this%params => params_adjoint
+
+    call json_get_or_default(params_adjoint, 'variable_material_properties', &
+         this%variable_material_properties, .false.)
+    if (this%variable_material_properties) then
+       call json_get_or_default(params_adjoint, 'gammat_field', &
+            this%gammat_field_name, 'adjoint_gammat')
+       call json_get_or_default(params_adjoint, 'nut_field', &
+            this%nut_field_name, 'adjoint_nut')
+       call json_get_or_default(params_adjoint, 'pr_turb', this%pr_turb, 1.0_rp)
+       if (this%pr_turb <= 0.0_rp) then
+          call neko_error('Adjoint scalar pr_turb must be positive')
+       end if
+    end if
     this%msh => msh
 
     if (.not. neko_registry%field_exists(this%name)) then
@@ -352,12 +367,6 @@ contains
     !
     ! Turbulence modelling and variable material properties
     !
-    params_selected => json_key_fallback(params_adjoint, params_primal, &
-         'variable_material_properties')
-    if (params_selected%valid_path('variable_material_properties')) then
-       call neko_error('variable material properties no supported for adjoint')
-    end if
-
     write(log_buf, '(A,L1)') 'LES        : ', this%variable_material_properties
     call neko_log%message(log_buf)
 
@@ -451,6 +460,7 @@ contains
 
     call this%cp%free()
     call this%lambda%free()
+    call this%lambda_molecular%free()
     call this%s_adj_lag%free()
 
     nullify(bc)
@@ -547,9 +557,16 @@ contains
          time)
 
     ! factor = rho * cp / pr_turb
-    if (this%variable_material_properties .and. &
-         len(trim(this%nut_field_name)) > 0) then
-       nut => neko_registry%get_field(this%nut_field_name)
+    if (this%variable_material_properties) then
+       if (neko_registry%field_exists(this%gammat_field_name)) then
+          nut => neko_registry%get_field(this%gammat_field_name)
+       else if (neko_registry%field_exists(this%nut_field_name)) then
+          nut => neko_registry%get_field(this%nut_field_name)
+       else
+          call neko_error('Configured turbulent scalar diffusivity field is missing')
+       end if
+
+       call field_copy(this%lambda, this%lambda_molecular)
 
        ! lambda = lambda + rho * cp * nut / pr_turb
        call neko_scratch_registry%request_field(lambda_factor, index, .false.)
@@ -592,6 +609,7 @@ contains
 
     ! Fill lambda field with the physical value
     call this%lambda%init(this%dm_Xh, "lambda")
+    call this%lambda_molecular%init(this%dm_Xh, "lambda_molecular")
     call this%cp%init(this%dm_Xh, "cp")
 
     call this%material_properties%init(2)
@@ -658,6 +676,7 @@ contains
        call device_memcpy(this%cp%x, this%cp%x_d, this%cp%size(), &
             DEVICE_TO_HOST, sync=.false.)
     end if
+    call field_copy(this%lambda_molecular, this%lambda)
   end subroutine adjoint_scalar_scheme_set_material_properties
 
 end module adjoint_scalar_scheme

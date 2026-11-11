@@ -144,15 +144,12 @@
             "max_iterations": 50,
             "tolerance": 1.0e-12,
             "mma": {
-                "asyinit": 0.02,
-                "asyincr": 1.2,
-                "asydecr": 0.7,
                 "scale": 1.0,
-                "auto_scale": false,
+                "asyinit": 0.8,
+                "asyincr": 1.05,
+                "asydecr": 0.65,
                 "xmin": 0.0,
                 "xmax": 1.0,
-                "c": 1000.0,
-                "d": 1.0
             }
         },
         "objectives": [

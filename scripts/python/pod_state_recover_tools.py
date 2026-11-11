@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+
+try:
+    from statistical_closure import reynolds_stress, fit_scalar_gammat
+except ModuleNotFoundError:  # imported as scripts.python.* from the repo root
+    from .statistical_closure import reynolds_stress, fit_scalar_gammat
 from mpi4py import MPI
 
 from pysemtools.datatypes.msh import Mesh
@@ -147,10 +152,31 @@ class PODConfig:
     include_scalar: bool
     debug: bool
     snapshot_dt: float
+    input_mode: str = "instantaneous"
+    window_duration: float = 0.0
+    statistics_start_time: float = 0.0
+    keep_partial_window: bool = False
+    closure_enabled: bool = False
+    closure_regularisation: float = 1.0e-12
+    closure_nut_max: float | None = None
+    closure_field_scale: float = 1.0
+    scalar_closure: str = "off"
+    gammat_regularisation: float = 1.0e-12
+    gammat_max: float | None = None
+    gammat_field_scale: float = 1.0
+    turbulent_schmidt: float = 0.7
 
     @property
     def n_fields(self) -> int:
+        return (4 if self.include_scalar else 3) + int(self.closure_enabled) + int(self.scalar_closure_enabled)
+
+    @property
+    def n_input_fields(self) -> int:
         return 4 if self.include_scalar else 3
+
+    @property
+    def scalar_closure_enabled(self) -> bool:
+        return self.scalar_closure != "off"
 
 
 @dataclass
@@ -224,8 +250,160 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
         include_scalar=include_scalar,
         debug=as_bool(state_recovery.get("debug")),
         snapshot_dt=timestep * i_stream,
+        input_mode=str(state_recovery.get("input_mode", "instantaneous")).lower(),
+        window_duration=float(state_recovery.get("window_duration", 0.0)),
+        statistics_start_time=float(state_recovery.get("statistics_start_time", 0.0)),
+        keep_partial_window=as_bool(state_recovery.get("keep_partial_window")),
+        closure_enabled=(
+            str(state_recovery.get("closure", "off")).lower()
+            not in ("off", "none", "false", "0")
+            or as_bool(state_recovery.get("fit_eddy_viscosity"))
+        ),
+        closure_regularisation=float(
+            state_recovery.get("strain_regularisation", 1.0e-12)
+        ),
+        closure_nut_max=(
+            float(state_recovery["nut_max"])
+            if state_recovery.get("nut_max") is not None else None
+        ),
+        closure_field_scale=float(state_recovery.get("closure_field_scale", 1.0)),
+        scalar_closure=str(state_recovery.get("scalar_closure", "off")).lower(),
+        gammat_regularisation=float(
+            state_recovery.get("gammat_regularisation", state_recovery.get("strain_regularisation", 1.0e-12))
+        ),
+        gammat_max=(
+            float(state_recovery["gammat_max"])
+            if state_recovery.get("gammat_max") is not None else None
+        ),
+        gammat_field_scale=float(state_recovery.get("gammat_field_scale", 1.0)),
+        turbulent_schmidt=float(state_recovery.get("turbulent_schmidt", 0.7)),
     )
+    if cfg.input_mode not in ("instantaneous", "windowed_statistics"):
+        raise ValueError("input_mode must be instantaneous or windowed_statistics")
+    if cfg.closure_enabled and cfg.input_mode != "windowed_statistics":
+        raise ValueError("eddy-viscosity closure requires input_mode=windowed_statistics")
+    if cfg.scalar_closure not in ("off", "flux_least_squares", "schmidt"):
+        raise ValueError("scalar_closure must be off, flux_least_squares, or schmidt")
+    if cfg.scalar_closure_enabled and not cfg.include_scalar:
+        raise ValueError("scalar_closure requires an enabled scalar")
+    if cfg.scalar_closure_enabled and cfg.input_mode != "windowed_statistics":
+        raise ValueError("scalar_closure requires input_mode=windowed_statistics")
+    if cfg.scalar_closure == "schmidt" and not cfg.closure_enabled:
+        raise ValueError("scalar_closure=schmidt requires fit_eddy_viscosity")
+    if cfg.turbulent_schmidt <= 0.0:
+        raise ValueError("turbulent_schmidt must be positive")
+    if cfg.input_mode == "windowed_statistics" and cfg.window_duration <= 0.0:
+        raise ValueError("window_duration must be positive for windowed_statistics")
     return case, cfg
+
+
+class WindowStatistics:
+    """Time-weighted, non-spatially-averaged velocity/scalar accumulator."""
+
+    def __init__(self, duration: float, start_time: float, dtype: type, keep_partial: bool = False):
+        self.duration = float(duration)
+        self.next_start = float(start_time)
+        self.dtype = dtype
+        self.keep_partial_window = keep_partial
+        self.sum_weight = 0.0
+        self.samples = 0
+        self.sum_u = None
+        self.sum_raw = None
+        self.sum_phi = None
+        self.sum_flux = None
+        self.previous_time = None
+        self.pending_fields = None
+        self.windows = []
+
+    def _start(self, fields: list[np.ndarray]) -> None:
+        shape = fields[0].shape
+        self.sum_u = [np.zeros(shape, dtype=self.dtype) for _ in range(3)]
+        self.sum_raw = [np.zeros(shape, dtype=self.dtype) for _ in range(6)]
+        if len(fields) >= 4:
+            self.sum_phi = np.zeros(shape, dtype=self.dtype)
+            self.sum_flux = [np.zeros(shape, dtype=self.dtype) for _ in range(3)]
+        self.sum_weight = 0.0
+        self.samples = 0
+
+    def _add(self, fields: list[np.ndarray], weight: float) -> None:
+        if self.sum_u is None:
+            self._start(fields)
+        u, v, w = fields[:3]
+        self.sum_u[0] += weight * u
+        self.sum_u[1] += weight * v
+        self.sum_u[2] += weight * w
+        self.sum_raw[0] += weight * u * u
+        self.sum_raw[1] += weight * v * v
+        self.sum_raw[2] += weight * w * w
+        self.sum_raw[3] += weight * u * v
+        self.sum_raw[4] += weight * u * w
+        self.sum_raw[5] += weight * v * w
+        if self.sum_phi is not None:
+            phi = fields[3]
+            self.sum_phi += weight * phi
+            self.sum_flux[0] += weight * u * phi
+            self.sum_flux[1] += weight * v * phi
+            self.sum_flux[2] += weight * w * phi
+        self.sum_weight += weight
+        self.samples += 1
+
+    def _finish(self, end_time: float, partial: bool = False) -> None:
+        if self.sum_u is None or self.samples < 2:
+            return
+        mean = np.asarray(self.sum_u) / self.sum_weight
+        raw = np.asarray(self.sum_raw) / self.sum_weight
+        reynolds = reynolds_stress(raw, mean)
+        item = {
+            "start": self.next_start,
+            "end": float(end_time),
+            "center": 0.5 * (self.next_start + float(end_time)),
+            "samples": self.samples,
+            "weight": self.sum_weight,
+            "mean": [np.asarray(x, dtype=self.dtype) for x in mean],
+            "raw": [np.asarray(x, dtype=self.dtype) for x in raw],
+            "reynolds": reynolds,
+            "partial": partial,
+        }
+        if self.sum_phi is not None:
+            scalar_mean = self.sum_phi / self.sum_weight
+            scalar_flux_raw = np.asarray(self.sum_flux) / self.sum_weight
+            item["scalar_mean"] = np.asarray(scalar_mean, dtype=self.dtype)
+            item["scalar_raw_flux"] = [np.asarray(x, dtype=self.dtype) for x in scalar_flux_raw]
+            item["scalar_flux"] = np.asarray(scalar_flux_raw) - mean * scalar_mean
+        self.windows.append(item)
+        self.sum_u = None
+        self.sum_raw = None
+        self.sum_phi = None
+        self.sum_flux = None
+        self.sum_weight = 0.0
+        self.samples = 0
+
+    def add(self, fields: list[np.ndarray], time_value: float) -> None:
+        t = float(time_value)
+        if t < self.next_start:
+            self.previous_time = t
+            return
+        if self.previous_time is None:
+            self.pending_fields = fields
+            self.previous_time = t
+            return
+        weight = max(t - self.previous_time, 0.0)
+        if self.pending_fields is not None and weight > 0.0:
+            self._add(self.pending_fields, weight)
+        self.previous_time = t
+        self.pending_fields = fields
+        while t >= self.next_start + self.duration:
+            end = self.next_start + self.duration
+            self._finish(end)
+            self.next_start = end
+            # The sample exactly at the boundary is the first sample of the
+            # next interval; its following interval is assigned on the next
+            # call.  This keeps window weights equal to elapsed time.
+
+    def finish(self) -> list[dict]:
+        if self.samples and self.keep_partial_window:
+            self._finish(self.next_start + self.duration, partial=True)
+        return self.windows
 
 
 def recv_field(ds: DataStreamer, dtype: type) -> np.ndarray:
@@ -508,7 +686,9 @@ def ensure_mode_output_dir(comm: MPI.Comm, out_dir: str) -> None:
     comm.Barrier()
 
 
-def fld_mode_field_names(n_total: int) -> list[str]:
+def fld_mode_field_names(n_total: int, closure_enabled: bool = False,
+                         include_scalar: bool = False,
+                         scalar_closure_enabled: bool = False) -> list[str]:
     if n_total < 1 or n_total > 99:
         raise ValueError(
             f"Unsupported number of POD output fields: {n_total}"
@@ -520,6 +700,22 @@ def fld_mode_field_names(n_total: int) -> list[str]:
         return ["p", "t"]
     if n_total == 3:
         return ["u", "v", "w"]
+    if closure_enabled or scalar_closure_enabled:
+        n_per_mode = 3 + int(include_scalar) + int(closure_enabled) + int(scalar_closure_enabled)
+        if n_total % n_per_mode:
+            raise ValueError("closure POD field count is not mode-aligned")
+        n_modes = n_total // n_per_mode
+        names = []
+        for mode_idx in range(n_modes):
+            suffix = f"_mode{mode_idx + 1:04d}"
+            names.extend([f"u{suffix}", f"v{suffix}", f"w{suffix}"])
+            if include_scalar:
+                names.append(f"t{suffix}")
+            if closure_enabled:
+                names.append(f"nut{suffix}")
+            if scalar_closure_enabled:
+                names.append(f"gammat{suffix}")
+        return names
     if n_total == 4:
         return ["p", "u", "v", "w"]
 
@@ -578,6 +774,10 @@ def vtk_mode_field_names(cfg: PODConfig) -> list[str]:
         )
         if cfg.include_scalar:
             names.append(f"s_mode_{mode_idx + 1}")
+        if cfg.closure_enabled:
+            names.append(f"nut_mode_{mode_idx + 1}")
+        if cfg.scalar_closure_enabled:
+            names.append(f"gammat_mode_{mode_idx + 1}")
     return names
 
 
@@ -676,7 +876,12 @@ def write_modes_to_disk(
             cfg,
             zero_field,
             n_avail,
-            fld_mode_field_names(cfg.keep_modes * cfg.n_fields),
+            fld_mode_field_names(
+                cfg.keep_modes * cfg.n_fields,
+                closure_enabled=cfg.closure_enabled,
+                include_scalar=cfg.include_scalar,
+                scalar_closure_enabled=cfg.scalar_closure_enabled,
+            ),
         )
 
         write_data(

@@ -61,7 +61,7 @@ module adjoint_fluid_scheme_incompressible
 
   use math, only: glsum
   use device_math, only: device_cfill, device_add2s2
-  use field_math, only: field_cfill, field_add2s2, field_addcol3
+  use field_math, only: field_cfill, field_add2s2, field_addcol3, field_copy
 
   use json_utils_ext, only: json_key_fallback
   use device, only : device_event_sync, glb_cmd_event, DEVICE_TO_HOST, &
@@ -94,6 +94,7 @@ module adjoint_fluid_scheme_incompressible
 
      !> The turbulent kinematic viscosity field name
      character(len=:), allocatable :: nut_field_name
+     type(field_t) :: mu_molecular
 
      !> Global number of GLL points for the fluid (not unique)
      integer(kind=i8) :: glb_n_points
@@ -467,6 +468,7 @@ contains
 
     call this%rho%free()
     call this%mu%free()
+    call this%mu_molecular%free()
     call this%dm_Xh%free()
     call this%dm_Xh_GL%free()
     call this%Xh%free()
@@ -646,6 +648,9 @@ contains
 
     if (len(trim(this%nut_field_name)) > 0) then
        nut => neko_registry%get_field(this%nut_field_name)
+       ! Restore the immutable molecular viscosity before adding the current
+       ! closure field; copying effective mu here would accumulate rho*nut.
+       call field_copy(this%mu, this%mu_molecular)
        call field_addcol3(this%mu, nut, this%rho)
     end if
 
@@ -680,6 +685,7 @@ contains
 
     call this%mu%init(this%dm_Xh, "mu")
     call this%rho%init(this%dm_Xh, "rho")
+    call this%mu_molecular%init(this%dm_Xh, "mu_molecular")
     call this%material_properties%init(2)
     call this%material_properties%assign_to_field(1, this%rho)
     call this%material_properties%assign_to_field(2, this%mu)
@@ -754,6 +760,7 @@ contains
        call device_memcpy(this%mu%x, this%mu%x_d, this%mu%size(), &
             DEVICE_TO_HOST, sync=.false.)
     end if
+    call field_copy(this%mu_molecular, this%mu)
   end subroutine adjoint_fluid_scheme_set_material_properties
 
 end module adjoint_fluid_scheme_incompressible

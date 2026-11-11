@@ -39,6 +39,7 @@ module simulation_POD_state_recover
   use json_file_module, only: json_file
   use json_utils, only: json_get, json_get_or_default
   use field, only: field_t
+  use registry, only: neko_registry
   use file, only: file_t
   use matrix, only: matrix_t
   use field_output, only: field_output_t
@@ -89,6 +90,8 @@ module simulation_POD_state_recover
      integer :: n_flds = 3
      integer :: pod_tstep = 0
      logical :: include_scalar = .false.
+     logical :: include_nut = .false.
+     logical :: include_gammat = .false.
      character(len=16) :: dtype = "double"
      type(coef_t), pointer :: coef => null()
 
@@ -98,7 +101,11 @@ module simulation_POD_state_recover
      ! POD mode storage
      type(field_t), allocatable :: u_modes(:), v_modes(:), w_modes(:)
      type(field_t), allocatable :: s_modes(:)
+     type(field_t), allocatable :: nut_modes(:)
+     type(field_t), allocatable :: gammat_modes(:)
      type(field_t), pointer :: s => null()
+     type(field_t), pointer :: nut => null()
+     type(field_t), pointer :: gammat => null()
 
      ! CSV coeffs
      type(file_t)   :: csv_reader
@@ -163,11 +170,18 @@ contains
     character(len=:), allocatable :: recon_file_name
     integer :: mode_output_precision
     integer :: recon_output_precision
+    logical :: fit_eddy_viscosity
+    logical :: fit_scalar_diffusivity
+    character(len=:), allocatable :: scalar_closure
 
     call json_get(params, "i_stream", i_stream)
     call json_get(params, "n_modes", n_modes)
     call json_get_or_default(params, "dtype", dtype, "double")
     call json_get_or_default(params, "write_modes", write_modes, .false.)
+    call json_get_or_default(params, "fit_eddy_viscosity", fit_eddy_viscosity, .false.)
+    call json_get_or_default(params, "scalar_closure", scalar_closure, "off")
+    fit_scalar_diffusivity = trim(lower_string(scalar_closure)) .ne. 'off' .and. &
+         trim(lower_string(scalar_closure)) .ne. 'none'
     call json_get_or_default(params, "debug", debug, .false.)
     call json_get_or_default(params, "output_reconstruction", &
          output_reconstruction, .false.)
@@ -231,7 +245,8 @@ contains
          write_modes, output_reconstruction, output_control, output_value, &
          debug, mode_output_precision, &
          mode_output_format, mode_file_name, recon_output_precision, &
-         recon_output_format, recon_file_name)
+         recon_output_format, recon_file_name, fit_eddy_viscosity, &
+         fit_scalar_diffusivity)
   end subroutine POD_state_recover_init_from_json
 
 
@@ -256,7 +271,8 @@ contains
        i_stream, n_modes, dtype, write_modes, output_reconstruction, &
        output_control, output_value, debug, &
        mode_output_precision, mode_output_format, mode_file_name, &
-       recon_output_precision, recon_output_format, recon_file_name)
+       recon_output_precision, recon_output_format, recon_file_name, &
+       fit_eddy_viscosity, fit_scalar_diffusivity)
     class(POD_state_recover_t), intent(inout), target :: this
     class(case_t), target, intent(inout) :: neko_case
     integer, intent(in) :: i_stream, n_modes
@@ -272,6 +288,8 @@ contains
     integer, intent(in), optional :: recon_output_precision
     character(len=*), intent(in), optional :: recon_output_format
     character(len=*), intent(in), optional :: recon_file_name
+    logical, intent(in), optional :: fit_eddy_viscosity
+    logical, intent(in), optional :: fit_scalar_diffusivity
     integer :: i
     character(len=80) :: str
 
@@ -297,6 +315,23 @@ contains
     this%coef => neko_case%fluid%c_Xh
 
     this%include_scalar = allocated(neko_case%scalars)
+    this%include_nut = .false.
+    if (present(fit_eddy_viscosity)) this%include_nut = fit_eddy_viscosity
+    this%include_gammat = .false.
+    if (present(fit_scalar_diffusivity)) this%include_gammat = fit_scalar_diffusivity
+    this%n_flds = 3 + merge(1, 0, this%include_scalar) + &
+         merge(1, 0, this%include_nut) + merge(1, 0, this%include_gammat)
+
+    if (this%include_nut) then
+       call neko_registry%add_field(this%coef%dof, 'adjoint_nut', .true.)
+       this%nut => neko_registry%get_field('adjoint_nut')
+       call field_rzero(this%nut)
+    end if
+    if (this%include_gammat) then
+       call neko_registry%add_field(this%coef%dof, 'adjoint_gammat', .true.)
+       this%gammat => neko_registry%get_field('adjoint_gammat')
+       call field_rzero(this%gammat)
+    end if
 
     if (present(mode_output_precision)) then
        if (mode_output_precision .ne. sp .and. &
@@ -344,7 +379,6 @@ contains
                'exactly one scalar.')
        end if
        this%s => neko_case%scalars%scalar_fields(1)%scalar%s
-       this%n_flds = 4
     else
        nullify(this%s)
     end if
@@ -353,6 +387,8 @@ contains
     allocate(this%v_modes(this%n_modes))
     allocate(this%w_modes(this%n_modes))
     if (this%include_scalar) allocate(this%s_modes(this%n_modes))
+    if (this%include_nut) allocate(this%nut_modes(this%n_modes))
+    if (this%include_gammat) allocate(this%gammat_modes(this%n_modes))
 
     do i = 1, this%n_modes
        write(str, '(A,I0)') "u_mode_", i
@@ -368,10 +404,19 @@ contains
           write(str, '(A,I0)') "s_mode_", i
           call this%s_modes(i)%init(this%s%dof, trim(str))
        end if
+       if (this%include_nut) then
+          write(str, '(A,I0)') "nut_mode_", i
+          call this%nut_modes(i)%init(this%coef%dof, trim(str))
+       end if
+       if (this%include_gammat) then
+          write(str, '(A,I0)') "gammat_mode_", i
+          call this%gammat_modes(i)%init(this%coef%dof, trim(str))
+       end if
     end do
 
     if (this%output_reconstruction) then
-       call this%recon_output%init(trim(this%recon_file_name), this%n_flds, &
+       call this%recon_output%init(trim(this%recon_file_name), 3 + &
+            merge(1, 0, this%include_scalar), &
             precision = this%recon_output_precision, &
             path = trim(neko_case%output_directory), &
             format = trim(this%recon_output_format))
@@ -462,6 +507,14 @@ contains
        do i = 1, size(this%s_modes); call this%s_modes(i)%free(); end do
        deallocate(this%s_modes)
     end if
+    if (allocated(this%nut_modes)) then
+       do i = 1, size(this%nut_modes); call this%nut_modes(i)%free(); end do
+       deallocate(this%nut_modes)
+    end if
+    if (allocated(this%gammat_modes)) then
+       do i = 1, size(this%gammat_modes); call this%gammat_modes(i)%free(); end do
+       deallocate(this%gammat_modes)
+    end if
 
     call this%recon_output%free()
     call this%dstream%free()
@@ -473,6 +526,8 @@ contains
     call this%ctrl%free()
 
     this%include_scalar = .false.
+    this%include_nut = .false.
+    this%include_gammat = .false.
     this%pod_tstep = 0
     this%mode_output_precision = sp
     this%mode_output_format = 'fld'
@@ -481,6 +536,8 @@ contains
     this%recon_output_format = 'fld'
     this%recon_file_name = 'pod_reconstruction'
     nullify(this%s)
+    nullify(this%nut)
+    nullify(this%gammat)
     this%enabled = .false.
   end subroutine POD_state_recover_free
 
@@ -511,6 +568,8 @@ contains
        call field_rzero(this%v_modes(i))
        call field_rzero(this%w_modes(i))
        if (this%include_scalar) call field_rzero(this%s_modes(i))
+       if (this%include_nut) call field_rzero(this%nut_modes(i))
+       if (this%include_gammat) call field_rzero(this%gammat_modes(i))
     end do
 
   end subroutine POD_state_recover_reset
@@ -664,6 +723,8 @@ contains
        if (this%include_scalar) then
           call this%dstream%recieve(this%s_modes(i)%x)
        end if
+       if (this%include_nut) call this%dstream%recieve(this%nut_modes(i)%x)
+       if (this%include_gammat) call this%dstream%recieve(this%gammat_modes(i)%x)
     end do
 
     ! Move modes back to GPU
@@ -678,6 +739,14 @@ contains
                HOST_TO_DEVICE, sync = .true.)
           if (this%include_scalar) then
              call device_memcpy(this%s_modes(i)%x, this%s_modes(i)%x_d, &
+                  n, HOST_TO_DEVICE, sync = .true.)
+          end if
+          if (this%include_nut) then
+             call device_memcpy(this%nut_modes(i)%x, this%nut_modes(i)%x_d, &
+                  n, HOST_TO_DEVICE, sync = .true.)
+          end if
+          if (this%include_gammat) then
+             call device_memcpy(this%gammat_modes(i)%x, this%gammat_modes(i)%x_d, &
                   n, HOST_TO_DEVICE, sync = .true.)
           end if
        end do
@@ -862,11 +931,19 @@ contains
     v => neko_case%fluid%v
     w => neko_case%fluid%w
     if (this%include_scalar) s => this%s
+    if (this%include_nut) then
+       this%nut => neko_registry%get_field('adjoint_nut')
+    end if
+    if (this%include_gammat) then
+       this%gammat => neko_registry%get_field('adjoint_gammat')
+    end if
 
     call field_rzero(u)
     call field_rzero(v)
     call field_rzero(w)
     if (this%include_scalar) call field_rzero(s)
+    if (this%include_nut) call field_rzero(this%nut)
+    if (this%include_gammat) call field_rzero(this%gammat)
 
     do j = 1, this%n_modes
        call field_add2s2(u, this%u_modes(j), a%x(j))
@@ -874,6 +951,12 @@ contains
        call field_add2s2(w, this%w_modes(j), a%x(j))
        if (this%include_scalar) then
           call field_add2s2(s, this%s_modes(j), a%x(j))
+       end if
+       if (this%include_nut) then
+          call field_add2s2(this%nut, this%nut_modes(j), a%x(j))
+       end if
+       if (this%include_gammat) then
+          call field_add2s2(this%gammat, this%gammat_modes(j), a%x(j))
        end if
     end do
   end subroutine reconstruct_from_coeffs
