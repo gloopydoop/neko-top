@@ -40,15 +40,21 @@ add_dependencies(Tests Unit)
 
 # Add the more complex tests that require additional setup or dependencies.
 add_subdirectory(sensitivity)
+add_subdirectory(objectives)
 add_subdirectory(checkpointing)
 add_subdirectory(optimizer)
 add_subdirectory(mapping)
+add_subdirectory(adjoint)
+add_subdirectory(mma)
+add_subdirectory(constraints)
 
 # ============================================================================ #
 # Add the listed tests to the CMake project.
 
 # Create a file list of the pFUnit test sources. These should be relative paths.
 set(PFUNIT_TEST_SOURCES "" CACHE INTERNAL "List of pFUnit test source files.")
+
+list(APPEND PFUNIT_TEST_SOURCES problem/time_window.pf)
 
 if (HAVE_HDF5)
     list(APPEND PFUNIT_TEST_SOURCES mma/io_hdf5.pf)
@@ -81,7 +87,7 @@ foreach(pf_file ${PFUNIT_TEST_SOURCES})
     add_pfunit_ctest(${test_name}
         TEST_SOURCES ${pf_file}
         LINK_LIBRARIES Neko-TOP::neko-top
-        MAX_PES $<IF:$<STREQUAL:${DEVICE_TYPE},CPU>,2,1>
+        MAX_PES $<IF:$<NOT:$<STREQUAL:${DEVICE_TYPE},CPU>>,1,2>
     )
 
     # Disable treating unused-variable as error for pfunit tests
@@ -101,3 +107,30 @@ foreach(pf_file ${PFUNIT_TEST_SOURCES})
     )
     add_dependencies(Unit ${test_name})
 endforeach()
+
+# ============================================================================ #
+# Tests that need a single rank only. These run with one rank on every backend,
+# rather than with two on CPU and one on a device like the tests above.
+
+add_pfunit_ctest(problem-functional_name
+    TEST_SOURCES problem/functional_name.pf
+    LINK_LIBRARIES Neko-TOP::neko-top
+    MAX_PES 1
+)
+
+if (CMAKE_Fortran_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(problem-functional_name PRIVATE
+        $<$<COMPILE_LANGUAGE:Fortran>:-Wno-unused-variable>
+    )
+endif()
+
+set_target_properties(problem-functional_name PROPERTIES
+    FOLDER "Tests/Unit"
+)
+set_tests_properties(problem-functional_name PROPERTIES
+    LABELS "unit"
+    ENVIRONMENT
+    "NEKO_LOG_FILE=${CMAKE_BINARY_DIR}/tests/unit/problem-functional_name.log"
+    TIMEOUT 120
+)
+add_dependencies(Unit problem-functional_name)

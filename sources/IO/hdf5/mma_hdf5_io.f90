@@ -43,14 +43,16 @@ submodule (mma) mma_hdf5_io
        MPI_IN_PLACE
   use math, only: abscmp
   use comm, only: pe_size
+  use hdf5_session, only: hdf5_session_init, hdf5_session_finalize
 
 contains
 
   !> Write the MMA object to an HDF5 file (parallel-aware).
-  !! This routine will first ensure device-host synchronization for all
-  !! vectors and matrices, then perform the write. Currently the low-level
-  !! HDF5 write is delegated to the project's I/O layer. If no I/O layer is
-  !! available at link time a runtime error will be raised.
+  !! For the device backend this routine first copies all vectors and
+  !! matrices from the device to the host, then performs the write; the cpu
+  !! backend keeps its state on the host (see mma_copy_from). Currently the
+  !! low-level HDF5 write is delegated to the project's I/O layer. If no I/O
+  !! layer is available at link time a runtime error will be raised.
   !! @param object The MMA object to save.
   !! @param filename The HDF5 file to write to.
   !! @param overwrite Logical flag to allow overwriting existing files.
@@ -69,7 +71,8 @@ contains
     overwrite_flag = .false.
     if (present(overwrite)) overwrite_flag = overwrite
 
-    ! Ensure device state is on host
+    ! For the device backend, copy the state to the host; the cpu backend
+    ! keeps its state on the host (see mma_copy_from)
     call object%copy_from(DEVICE_TO_HOST, sync = .true.)
 
     ! Gather the per-rank n values
@@ -81,7 +84,7 @@ contains
     ! ------------------------------------------------------------------------ !
     ! Prepare the HDF5 file, settings for MPIO access and groups
 
-    call h5open_f(ierr)
+    call hdf5_session_init()
     call h5pcreate_f(H5P_FILE_ACCESS_F, fapl_id, ierr)
     info = MPI_INFO_NULL%mpi_val
     call h5pset_fapl_mpio_f(fapl_id, NEKO_COMM%mpi_val, info, ierr)
@@ -328,13 +331,15 @@ contains
     call h5gclose_f(grp_id, ierr)
     call h5fclose_f(file_id, ierr)
     call h5pclose_f(fapl_id, ierr)
-    call h5close_f(ierr)
+
+    call hdf5_session_finalize()
 
   end subroutine mma_save_checkpoint_hdf5
 
   !> Read the MMA object from an HDF5 file (parallel-aware).
-  !! This routine will perform the read and then ensure device-host
-  !! synchronization for all vectors and matrices.
+  !! This routine performs the read and then, for the device backend, copies
+  !! all vectors and matrices from the host to the device; the cpu backend
+  !! keeps its state on the host (see mma_copy_from).
   !! @param object The MMA object to load data into.
   !! @param filename The HDF5 file to read from.
   module subroutine mma_load_checkpoint_hdf5(object, filename)
@@ -370,7 +375,7 @@ contains
     mpi_comm = NEKO_COMM%mpi_val
 
     ! Open file and prepare reading
-    call h5open_f(ierr)
+    call hdf5_session_init()
     call h5pcreate_f(H5P_FILE_ACCESS_F, fapl_id, ierr)
     call h5pset_fapl_mpio_f(fapl_id, mpi_comm, info, ierr)
     call h5fopen_f(trim(filename), H5F_ACC_RDONLY_F, file_id, ierr, &
@@ -580,9 +585,11 @@ contains
     call h5gclose_f(grp_id, ierr)
     call h5fclose_f(file_id, ierr)
     call h5pclose_f(fapl_id, ierr)
-    call h5close_f(ierr)
 
-    ! Ensure device state is updated
+    call hdf5_session_finalize()
+
+    ! For the device backend, copy the state to the device; the cpu backend
+    ! keeps its state on the host (see mma_copy_from)
     call object%copy_from(HOST_TO_DEVICE, sync = .true.)
 
   end subroutine mma_load_checkpoint_hdf5

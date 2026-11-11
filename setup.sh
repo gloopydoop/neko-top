@@ -6,7 +6,9 @@ function help() {
     echo -e "Usage: $0 [options]"
     echo -e "Options:"
     echo -e "\t-h, --help        Show this help message and exit"
-    echo -e "\t-t, --tests       Run the tests after the installation"
+    echo -e "\t-t, --tests       Build with tests enabled and default the build"
+    echo -e "\t                  type to Testing; it does not itself run the"
+    echo -e "\t                  suite (see 'ctest --test-dir build')"
     echo -e "\t    --test-neko   Run the Neko tests after the installation"
     echo -e "\t-c, --clean       Clean the build directory before compiling"
     echo -e "\t-q, --quiet       Suppress output"
@@ -31,6 +33,10 @@ function help() {
     echo -e "\tBLAS_DIR          The directory where BLAS is installed"
     echo -e "\tCMAKE_VARIABLES   Additional variables to pass to CMake"
     echo -e "\tNEKO_CONFIG_FLAGS Additional features to pass to neko configure"
+    echo -e "\tCMAKE_BUILD_TYPE  Neko-TOP build type: Debug, Testing or"
+    echo -e "\t                  Release (default Release, Testing with -t)"
+    echo -e "\tNEKO_FCFLAGS      Override Fortran flags for Neko's own configure"
+    echo -e "\tNEKO_CFLAGS       Override C flags for Neko's own configure"
 }
 
 # ============================================================================ #
@@ -46,11 +52,12 @@ export EXTERNAL_DIR="$MAIN_DIR/external"
 # Assign default values to the options
 DEVICE_TYPE="CPU"
 CLEAN=false
-CLEAN_NEKO=false
 QUIET=false
 TEST=OFF
 DOCS=OFF
 EXAMPLES=OFF
+
+NEKO_CLEAN=false
 NEKO_TEST=OFF
 
 # Load the environment files.
@@ -77,7 +84,7 @@ while true; do
 
     # Purely long settings
     "--docs") DOCS="ON" && shift ;;             # Build the documentation
-    "--clean-neko") CLEAN_NEKO=true && shift ;; # Clean Neko
+    "--clean-neko") NEKO_CLEAN=true && shift ;; # Clean Neko
     "--test-neko") NEKO_TEST="true" && shift ;; # Test Neko
 
     # End of options
@@ -86,14 +93,14 @@ while true; do
 done
 
 # Set Dependent Variables
-[ "$CLEAN_NEKO" == true ] && CLEAN=true
+[ "$NEKO_CLEAN" == true ] && CLEAN=true
 
-export TEST CLEAN CLEAN_NEKO QUIET DEVICE_TYPE NEKO_TEST
+export TEST CLEAN NEKO_CLEAN QUIET DEVICE_TYPE NEKO_TEST
 
 # Check for valid settings
 
-if [[ "$TEST" == "ON" || "$NEKO_TEST" == "true" ]] && [ -z "$PFUNIT_DIR" ]; then
-    export PFUNIT_DIR="$EXTERNAL_DIR/pfunit"
+if [[ "$TEST" == "ON" || "$NEKO_TEST" == "true" ]]; then
+    export PFUNIT_DIR=${PFUNIT_DIR:-"pfunit"}
 fi
 
 # ============================================================================ #
@@ -127,12 +134,12 @@ fi
 printf "=%.0s" {1..80} && printf "\n"
 printf "Setting up external dependencies\n"
 
-check_system_dependencies           # Check for system dependencies.
-find_json_fortran $JSON_FORTRAN_DIR # Re-defines the JSON_FORTRAN_DIR variable.
-find_adios2 $ADIOS2_DIR             # Re-defines the ADIOS2_DIR variable.
-find_hdf5 $HDF5_DIR                 # Re-defines the HDF5_DIR variable.
-find_neko $NEKO_DIR                 # Re-defines the NEKO_DIR variable.
-find_pfunit $PFUNIT_DIR             # Re-defines the PFUNIT_DIR variable.
+check_system_dependencies          # Check for system dependencies.
+find_json_fortran                  # Re-defines the JSON_FORTRAN_DIR variable.
+find_adios2                        # Re-defines the ADIOS2_DIR variable.
+find_hdf5                          # Re-defines the HDF5_DIR variable.
+find_neko --build                  # Re-defines the NEKO_DIR variable.
+[ "$TEST" == "ON" ] && find_pfunit # Re-defines the PFUNIT_DIR variable.
 
 # Done setting up external dependencies
 # ============================================================================ #
@@ -144,17 +151,18 @@ printf "Compiling the example codes and Neko-TOP\n"
 # Clean the build directory if the clean flag is set
 [ "$CLEAN" == true ] && rm -fr $MAIN_DIR/build
 
-# If CMAKE_VARIABLES is a string, convert it to an array
-if [ -n "$CMAKE_VARIABLES" ]; then
-    CMAKE_VARIABLES=($CMAKE_VARIABLES)
-else
-    CMAKE_VARIABLES=()
-fi
-
 # Enable desired features
+CMAKE_VARIABLES=()
 CMAKE_VARIABLES+=("-DBUILD_DOCS=$DOCS")
 CMAKE_VARIABLES+=("-DBUILD_TESTING=$TEST")
 CMAKE_VARIABLES+=("-DBUILD_EXAMPLES=$EXAMPLES")
+
+# Enable conditional cmake settings
+if [ -n "$CMAKE_BUILD_TYPE" ]; then
+    CMAKE_VARIABLES+=("-DCMAKE_BUILD_TYPE=$CMAKE_BUILD_TYPE")
+elif [ "$TEST" == "ON" ]; then
+    CMAKE_VARIABLES+=("-DCMAKE_BUILD_TYPE=Testing")
+fi
 
 # Run the cmake command to configure the build
 cmake -B $MAIN_DIR/build -S $MAIN_DIR "${CMAKE_VARIABLES[@]}"

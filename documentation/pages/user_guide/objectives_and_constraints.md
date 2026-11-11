@@ -46,16 +46,70 @@ have currently been implemented in `neko-top`·
 ## Objectives {#objectives}
 
 ### Time integration for unsteady objectives {#objectives_time_integration}
-For unsteady simulations, the instantaneous objective is time integrated as
+For unsteady simulations, the instantaneous objective is averaged over time,
 \f[
-\mathcal{F} = \int_0^T  f(t) dt,
+\mathcal{F} = \frac{1}{|W|} \int_W f(t) \, dt,
 \f]
-where \f$T\f$ is the final simulation time.
+where \f$W\f$ is the objective's own time window and \f$|W|\f$ its length.
+Averaging rather than integrating keeps the objective on the same scale as the
+instantaneous quantity it is built from.
 
-The time window can be restricted with the optional input parameters
-`start_time` and `end_time`. Their defaults are `0.0` and `+\infty`,
-respectively, meaning that the full simulated time horizon is used unless a
-smaller window is prescribed.
+The window can be restricted with the optional input parameters `start_time`
+and `end_time`. Their defaults are `0.0` and `+\infty`, so the full simulated
+horizon is used unless a smaller window is prescribed.
+
+The objective is sampled once per completed timestep, and \f$|W|\f$ is the
+total length of time actually sampled. A window is therefore truncated to the
+part of it that was simulated, and the reported number is the mean over what
+was simulated. In particular the average is normalised by the window, not by
+the length of the run, so **a windowed objective does not change when the run
+is made longer**: an objective windowed to \f$[2.5, 6.0]\f$ reports the same
+value whether the simulation stops at \f$t = 6\f$ or continues to \f$t = 20\f$.
+
+A window that never overlaps the simulated interval accumulates nothing. The
+objective then reports zero and a warning is written to the log.
+
+The unsteady adjoint applies an objective's forcing at exactly the timesteps
+its average samples, decided by the same test. A window boundary placed on a
+timestep therefore needs no special care, and an `end_time` equal to the
+simulation's own behaves as the `+\infty` default. The forcing is also scaled
+by the length of the run over \f$|W|\f$. The term that couples the adjoint to
+the design is averaged over the whole run, and the scaling keeps the
+sensitivity that of the window average. The adjoint fields of a windowed
+objective are larger by the same factor.
+
+The window only applies to unsteady problems. A steady problem evaluates its
+objectives once, on the converged field, so `start_time` and `end_time` have no
+effect there.
+
+The two paths agree wherever they are asking the same question. Once a problem
+has reached a steady state, an unsteady objective averaged over a window inside
+the converged part of the run reports what the steady path reports for the same
+problem: the field no longer changes, so its average over the window is its
+converged value. `tests/unit/objectives/steady_unsteady_converged` is exactly
+this check, and it holds to the iterative solvers' own round-off. Note that
+`steady_simcomp` freezes the fluid on convergence but not the scalar, so set
+`scalar_coupled` when a scalar objective is involved, or the objective may be
+evaluated on a scalar that has not settled.
+
+They also agree trivially at the end of any run, converged or not: an unsteady
+objective windowed to the final timestep alone reports exactly what the steady
+path reports, because a one-sample average is the sample. Selecting that single
+step is easier than it looks. The time loop stops at the *first* step reaching
+the simulation's `end_time`, so unless `end_time` falls exactly on a step, the
+run overshoots it by up to one `dt` -- with `end_time` \f$0.0475\f$ and `dt`
+\f$0.005\f$ it takes ten steps and finishes at \f$t = 0.05\f$. A window whose
+`start_time` is the simulation's own `end_time` therefore captures precisely
+that last step and nothing before it.
+
+An `end_time` falling exactly on a step needs no special care. The time is
+accumulated by repeated addition of `dt`, so it lands a few ULP either side of
+such an `end_time`, and the end-of-run check allows for that: `end_time`
+\f$0.05\f$ with `dt` \f$0.005\f$ takes ten steps and finishes at
+\f$t = 0.05\f$, on the steady and the unsteady path alike. Earlier versions
+compared without that allowance on the unsteady path, took an eleventh step
+and finished at \f$t = 0.055\f$, which is why some test cases place `end_time`
+half a step off a boundary. That is no longer required.
 
 For example,
 
@@ -69,7 +123,7 @@ For example,
 ```
 
 accumulates the scalar-mixing objective only over the interval
-\f$2.5 \le t \le 6.0\f$.
+\f$2.5 \le t \le 6.0\f$, and reports its mean over that interval.
 
 For the underlying adjoint formulation and how objective functions generate
 adjoint forcing terms, please refer to
@@ -144,10 +198,18 @@ based on lubrication theory written by Gersborg-Hansen et al.
 | `weight`| The weight used in the objective. | Real | `1.0` |
 | `mask_name` | The name of the `point_zone` indicating \f$\Omega_\text{obj}\f$. | String | `""`|
 | `name`| The name that will appear in `objective_data.csv` | String | `Out of plane stresses`|
-| `dealias_forcing`| If dealiasing should be applied to adjoint forcing term | logical | `.true.`|
-| `dealias_sensitivity`| If dealiasing should be applied to sensitivity contribution | logical | `.true.`|
+| `dealias_forcing`| If the objective is integrated on the over-integration (Gauss-Legendre) points rather than the GLL points. Must equal `dealias_sensitivity`. See [Adjoint over-integration](@ref configuration-adjoint-dealias) | logical | `case.numerics.dealias`|
+| `dealias_sensitivity`| Must equal `dealias_forcing`. See [Adjoint over-integration](@ref configuration-adjoint-dealias) | logical | `case.numerics.dealias`|
 | `start_time` | Start of the active time window for unsteady accumulation. | Real | `0.0` |
 | `end_time` | End of the active time window for unsteady accumulation. | Real | `+\infty` |
+
+`dealias_forcing` and `dealias_sensitivity` select a single quadrature for
+the objective's value, its adjoint forcing and its sensitivity. The
+sensitivity is the gradient of the reported value only when all three use the
+same one, so a case that sets the two keys differently is rejected. The
+adjoint solver builds its over-integration space on demand and this objective
+requests it when the keys are `true`, so they act whether or not
+`numerics.dealias` is set.
 
 ### Scalar mixing {#objective_scalar_mixing}
 

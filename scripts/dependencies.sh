@@ -24,14 +24,6 @@ function check_system_dependencies() {
         exit 1
     fi
 
-    # Check for correct version of cmake executable (>= 3.21)
-    CMAKE_VERSION=$(cmake --version | grep -oP '(?<=version )\d+\.\d+')
-    if [ $(echo "$CMAKE_VERSION < 3.21" | bc) -eq 1 ]; then
-        printf "CMake version >= 3.21 is required.\n"
-        printf "Please update your CMake installation.\n"
-        exit 1
-    fi
-
 }
 
 # Resolve the Python executable and export it for CMake/configure callers.
@@ -83,12 +75,7 @@ function find_json_fortran() {
     check_environment
 
     # Determine the JSON-Fortran installation directory
-    if [[ $# -ge 1 ]]; then
-        JSON_FORTRAN_DIR="$1"
-    elif [ -z "$JSON_FORTRAN_DIR" ]; then
-        JSON_FORTRAN_DIR="json-fortran"
-    fi
-
+    JSON_FORTRAN_DIR=${JSON_FORTRAN_DIR:-"json-fortran"}
     if [ "${JSON_FORTRAN_DIR:0:1}" != "/" ]; then
         JSON_FORTRAN_DIR="$EXTERNAL_DIR/$JSON_FORTRAN_DIR"
     fi
@@ -141,13 +128,9 @@ function find_nek5000() {
     check_environment
 
     # Determine the Nek5000 installation directory
-    if [[ $# -ge 1 ]]; then
-        NEK5000_DIR="$1"
-    elif [ -z "$NEK5000_DIR" ]; then
+    if [ -z "$NEK5000_DIR" ]; then
         return
-    fi
-
-    if [ "${NEK5000_DIR:0:1}" != "/" ]; then
+    elif [ "${NEK5000_DIR:0:1}" != "/" ]; then
         NEK5000_DIR="$EXTERNAL_DIR/$NEK5000_DIR"
     fi
 
@@ -163,13 +146,9 @@ function find_gslib() {
     check_environment
 
     # Determine the GSLib installation directory
-    if [[ $# -ge 1 ]]; then
-        GSLIB_DIR="$1"
-    elif [ -z "$GSLIB_DIR" ]; then
+    if [ -z "$GSLIB_DIR" ]; then
         return
-    fi
-
-    if [ "${GSLIB_DIR:0:1}" != "/" ]; then
+    elif [ "${GSLIB_DIR:0:1}" != "/" ]; then
         GSLIB_DIR="$EXTERNAL_DIR/$GSLIB_DIR"
     fi
 
@@ -220,13 +199,9 @@ function find_pfunit() {
     check_environment
 
     # Determine the pFUnit installation directory
-    if [[ $# -ge 1 ]]; then
-        PFUNIT_DIR="$1"
-    elif [ -z "$PFUNIT_DIR" ]; then
+    if [ -z "$PFUNIT_DIR" ]; then
         return
-    fi
-
-    if [ "${PFUNIT_DIR:0:1}" != "/" ]; then
+    elif [ "${PFUNIT_DIR:0:1}" != "/" ]; then
         PFUNIT_DIR="$EXTERNAL_DIR/$PFUNIT_DIR"
     fi
 
@@ -252,15 +227,15 @@ index 7df7b65..4f7dbf5 100644
  #endif
        end if
 _ACEOF
-        git apply pfunit_error_stop.patch
+        if git apply --check pfunit_error_stop.patch 2>/dev/null; then
+            git apply pfunit_error_stop.patch
+        fi
         cd $CURRENT_DIR
     fi
 
     if [[ -z "$(find $PFUNIT_DIR -name libpfunit.a)" ]]; then
-        cmake -B $PFUNIT_DIR/build -S $PFUNIT_DIR -G "Unix Makefiles" \
-            -DCMAKE_INSTALL_PREFIX=$PFUNIT_DIR \
-            -DCMAKE_C_COMPILER=$CC \
-            -DCMAKE_Fortran_COMPILER=$FC
+        cmake -B $PFUNIT_DIR/build -S $PFUNIT_DIR -Wno-dev \
+            --install-prefix=$PFUNIT_DIR -DCMAKE_BUILD_TYPE=Release -DMPI=YES
         cmake --build $PFUNIT_DIR/build
         cmake --install $PFUNIT_DIR/build
     fi
@@ -288,17 +263,10 @@ function find_hdf5() {
 
     # Determine the HDF5 installation directory. HDF5_ROOT is the name CMake
     # and the module systems use; HDF5_DIR is accepted as a legacy spelling.
-    if [[ $# -ge 1 ]]; then
-        HDF5_ROOT="$1"
-    elif [ -n "$HDF5_ROOT" ]; then
-        : # already set in the environment
-    elif [ -n "$HDF5_DIR" ]; then
-        HDF5_ROOT="$HDF5_DIR"
-    else
-        return 0
-    fi
-
-    if [ "${HDF5_ROOT:0:1}" != "/" ]; then
+    HDF5_ROOT=${HDF5_ROOT:-$HDF5_DIR}
+    if [ -z "$HDF5_ROOT" ]; then
+        return
+    elif [ "${HDF5_ROOT:0:1}" != "/" ]; then
         HDF5_ROOT="$EXTERNAL_DIR/$HDF5_ROOT"
     fi
 
@@ -325,12 +293,12 @@ function find_hdf5() {
         fi
 
         # Build and install HDF5
-        cmake -B $HDF5_ROOT/build -S $HDF5_ROOT \
-            --install-prefix $HDF5_ROOT -DCMAKE_BUILD_TYPE=Release \
+        cmake -B $HDF5_ROOT/build -S $HDF5_ROOT --install-prefix $HDF5_ROOT \
+            -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=$MPICC -DCMAKE_CXX_COMPILER=$MPICXX \
             -DCMAKE_Fortran_COMPILER=$MPIFC -DHDF5_ENABLE_PARALLEL=ON \
             -DHDF5_BUILD_FORTRAN=ON -DHDF5_ENABLE_SZIP_SUPPORT:BOOL=OFF \
-            -DHDF5_BUILD_TOOLS:BOOL=ON
+            -DHDF5_BUILD_TOOLS:BOOL=ON -DHDF5_BUILD_HL_LIB=OFF
         cmake --build $HDF5_ROOT/build/ --config Release --parallel
         cmake --install $HDF5_ROOT/build/ --config Release
         rm -fr $HDF5_ROOT/build
@@ -519,14 +487,9 @@ function find_parmetis() {
     check_environment
 
     # Determine the Parmetis installation directory
-    if [[ $# -ge 1 ]]; then
-        PARMETIS_DIR="$1"
-    elif [ -z "$PARMETIS_DIR" ]; then
-        PARMETIS_DIR="parmetis"
-    fi
-
-    if [[ "${PARMETIS_DIR:0:1}" != "/" && "${PARMETIS_DIR:0:1}" != "~" ]]; then
-        PARMETIS_DIR="$(realpath $EXTERNAL_DIR/$PARMETIS_DIR)"
+    PARMETIS_DIR=${PARMETIS_DIR:-"parmetis"}
+    if [[ "${PARMETIS_DIR:0:1}" != "/" ]]; then
+        PARMETIS_DIR="$EXTERNAL_DIR/$PARMETIS_DIR"
     fi
 
     if [[ -z "$(find $PARMETIS_DIR -name libparmetis.a)" ]]; then
@@ -584,12 +547,12 @@ function find_neko() {
     local neko_adios2_link_flags=""
 
     # Find the required dependencies for Neko
-    find_json_fortran $JSON_FORTRAN_DIR
-    find_gslib $GSLIB_DIR
-    find_hdf5 $HDF5_DIR
-    find_adios2 $ADIOS2_DIR
-    find_parmetis $PARMETIS_DIR
-    [ -n "$PFUNIT_DIR" ] && find_pfunit $PFUNIT_DIR
+    find_json_fortran
+    find_gslib
+    find_hdf5
+    find_adios2
+    find_parmetis
+    [ -n "$PFUNIT_DIR" ] && find_pfunit
 
     # ADIOS2 is available only after find_adios2 has run.  Keep its libraries
     # and any explicitly requested compatibility flags after libneko.a.
@@ -599,12 +562,7 @@ function find_neko() {
     fi
 
     # Determine the Neko installation directory
-    if [[ $# -ge 1 ]]; then
-        NEKO_DIR="$1"
-    elif [ -z "$NEKO_DIR" ]; then
-        NEKO_DIR="neko"
-    fi
-
+    NEKO_DIR=${NEKO_DIR:-"neko"}
     if [ "${NEKO_DIR:0:1}" != "/" ]; then
         NEKO_DIR="$EXTERNAL_DIR/$NEKO_DIR"
     fi
@@ -612,7 +570,17 @@ function find_neko() {
     # Check if Neko is installed, if not install it.
     NEKO_LIB=$(find $NEKO_DIR -type d -name 'lib*' -maxdepth 1 \
         -exec test -f '{}'/libneko.a \; -print 2>/dev/null) || true
-    if [[ ! -d "$NEKO_LIB" || "$CLEAN_NEKO" == true ]]; then
+
+    if [[ $# -ge 1 ]]; then
+        if [[ -d "$NEKO_LIB" && ! -f "$NEKO_DIR/configure.ac" ]]; then
+            BUILD_NEKO="false"
+        elif [ "$1" == "--build" ]; then
+            BUILD_NEKO="true"
+        fi
+    fi
+
+    # Build neko if requested.
+    if [[ "$BUILD_NEKO" == true ]]; then
 
         # Clone Neko from the repository if it does not exist.
         if [[ ! -d "$NEKO_DIR" || $(ls -A $NEKO_DIR | wc -l) -eq 0 ]]; then
@@ -681,21 +649,32 @@ function find_neko() {
 
         [ -z "$CURRENT_DIR" ] && CURRENT_DIR=$(pwd)
         cd $NEKO_DIR
-        if [[ ! -f "configure" || "$CLEAN_NEKO" == true ]]; then
+        if [[ ! -f "configure" || "$NEKO_CLEAN" == true ]]; then
             ./regen.sh
         fi
-        if [[ ! -f Makefile || "$CLEAN_NEKO" == true ]]; then
+        if [[ ! -f Makefile || "$NEKO_CLEAN" == true ]]; then
+
+            # Only apply the user-defined flags if they are set, otherwise use
+            # the default internally.
+            [ "${NEKO_FCFLAGS+set}" ] && export FCFLAGS="$NEKO_FCFLAGS"
+            [ "${NEKO_CFLAGS+set}" ] && export CFLAGS="$NEKO_CFLAGS"
+            [ "${NEKO_HIPCC_FLAGS+set}" ] && export HIP_HIPCC_FLAGS="$NEKO_HIPCC_FLAGS"
+            [ "${NEKO_CUDA_CFLAGS+set}" ] && export CUDA_CFLAGS="$NEKO_CUDA_CFLAGS"
+
             ./configure --prefix="$(realpath ./)" $FEATURES \
-                FC=$FC MPIFC=$MPIFC FCFLAGS="$NEKO_FCFLAGS" \
-                CC=$CC MPICC=$MPICC CFLAGS="$NEKO_CFLAGS" \
-                CXX=$CXX MPICXX=$MPICXX CXXFLAGS="$NEKO_CXXFLAGS" \
-                LIBS="$neko_adios2_link_flags" \
+                FC=$FC MPIFC=$MPIFC \
+                FCFLAGS="$NEKO_FCFLAGS" \
+                CC=$CC MPICC=$MPICC \
+                CFLAGS="$NEKO_CFLAGS" \
+                CXX=$CXX MPICXX=$MPICXX \
+                CXXFLAGS="$NEKO_CXXFLAGS" \
                 HIPCC=$HIPCC HIP_HIPCC_FLAGS="$NEKO_HIPCC_FLAGS" \
-                CUDA_CFLAGS="$NEKO_CUDA_CFLAGS"
+                CUDA_CFLAGS="$NEKO_CUDA_CFLAGS" \
+                LIBS="$neko_adios2_link_flags"
         fi
 
         # Update compile dependencies if makedepf90 is installed
-        if command -v makedepf90 2>&1 1>/dev/null; then
+        if [[ -n "$(which makedepf90)" && "$NEKO_CLEAN" == true ]]; then
             size_pre=$(stat -c %s src/.depends)
             cd src/ && make depend && cd ../
             if [ "$size_pre" != "$(stat -c %s src/.depends)" ]; then
@@ -704,10 +683,12 @@ function find_neko() {
             fi
         fi
 
-        [ "$CLEAN_NEKO" == true ] && make clean
-        [ "$QUIET" == true ] && make -s -j || make -j
-        [ "$NEKO_TEST" == true ] && make check -j
-        make install
+        echo "Building and installing Neko, see logs for output"
+        rm -f build.log check.log install.log
+        [ "$NEKO_CLEAN" == true ] && make clean >> build.log
+        make -j >> build.log
+        [ "$NEKO_TEST" == true ] && make check -j >> check.log
+        make install >> install.log
 
         cd $CURRENT_DIR
 
@@ -774,7 +755,7 @@ function find_cubit() {
 # ============================================================================ #
 # Ensure ExodusII to Nek5000 is installed, if not install it.
 function find_exo2nek() {
-    find_nek5000 $NEK5000_DIR
+    find_nek5000
 
     # Check if exo2nek is available
     if command -v exo2nek 2>&1 1>/dev/null; then
@@ -800,8 +781,8 @@ function find_exo2nek() {
 # ============================================================================ #
 # Ensure Rea2Nbin is installed.
 function find_rea2nbin() {
-    find_json_fortran $JSON_FORTRAN_DIR
-    find_hdf5 $HDF5_DIR
+    find_json_fortran
+    find_hdf5
 
     # Check if rea2nbin is available
     if command -v rea2nbin 2>&1 1>/dev/null; then
@@ -861,20 +842,12 @@ function check_external_dir() {
 
 function check_environment() {
     # Check the main directory and source the dependency versions file
-    export MAIN_DIR=${MAIN_DIR:-$(cd $(dirname $0)/.. && pwd)}
+    export MAIN_DIR=${MAIN_DIR:-$(realpath $(dirname $0)/../)}
     export EXTERNAL_DIR=${EXTERNAL_DIR:-$HOME/tmp/external}
 
     if [ -f "$MAIN_DIR/config/dependency-versions.env" ]; then
         source $MAIN_DIR/config/dependency-versions.env
     fi
-
-    if [ -z "$EXTERNAL_DIR" ]; then
-        echo "Environment EXTERNAL_DIR is not set."
-        echo "Default path will be used: $HOME/tmp/external"
-        EXTERNAL_DIR="$HOME/tmp/external"
-    fi
-
     mkdir -p "$EXTERNAL_DIR"
     export EXTERNAL_DIR="$(realpath "$EXTERNAL_DIR")"
-
 }

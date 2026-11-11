@@ -39,8 +39,9 @@
 !! constraints that are evaluated based on the design variables. The problem
 !! also handles the output of the problem and the simulation.
 module problem
-  use num_types, only: rp, dp
+  use num_types, only: rp, dp, xp
   use design, only: design_t
+  use base_functional, only: base_functional_t
   use objective, only: objective_t, objective_wrapper_t, objective_factory
   use constraint, only: constraint_t, constraint_wrapper_t, constraint_factory
   use augmented_lagrangian_objective, only: augmented_lagrangian_objective_t
@@ -50,7 +51,7 @@ module problem
   use json_module, only: json_file
   use json_utils, only: json_extract_item, json_get, json_get_or_default
   use simulation_m, only: simulation_t
-  use logger, only: neko_log
+  use logger, only: neko_log, LOG_SIZE
   use math, only: copy
   use time_state, only: time_state_t
   use vector_math, only: vector_add2, vector_cfill
@@ -74,6 +75,10 @@ module problem
      integer :: n_objectives = 0
      !> Number of constraints in the problem.
      integer :: n_constraints = 0
+     !> Length of the last unsteady forward run. It is summed step by step
+     !! as the functionals sum `value_weight`, so that it equals that of a
+     !! functional without a time window bit for bit.
+     real(kind=xp) :: run_time = 0.0_xp
 
      !> The objective of the problem.
      class(objective_wrapper_t), allocatable, dimension(:) :: objective_list
@@ -107,6 +112,9 @@ module problem
      !! sensitivity.
      procedure, pass(this), public :: run_backward_unsteady => &
           problem_run_backward_unsteady
+     !> Warn about objectives whose time window never overlapped the run.
+     procedure, pass(this) :: check_objective_windows => &
+          problem_check_objective_windows
      ! ----------------------------------------------------------------------- !
      ! Base class methods
 
@@ -232,6 +240,7 @@ contains
     this%n_design = 0
     this%n_objectives = 0
     this%n_constraints = 0
+    this%run_time = 0.0_xp
 
     ! Free the objective list
     if (allocated(this%objective_list)) then
@@ -321,7 +330,7 @@ contains
     character(len=:), allocatable :: path, type
     type(json_file) :: objective_json
     integer :: n_objectives, i
-    logical :: dealias
+    logical :: dealias, dealias_fallback
 
     call neko_log%section("Reading objectives")
 
@@ -346,8 +355,10 @@ contains
        allocate(augmented_lagrangian_objective_t::objective)
        select type (ALO => objective)
        class is (augmented_lagrangian_objective_t)
+          call json_get(parameters, 'case.numerics.dealias', dealias_fallback)
           call json_get_or_default(parameters, &
-               "adjoint_fluid.dealias_sensitivity", dealias, .true.)
+               "optimization.augmented_lagrangian.dealias_sensitivity", &
+               dealias, dealias_fallback)
           call ALO%init_from_attributes(design, simulation, weight = 1.0_rp, &
                name = "Augmented Lagrangian", mask_name = "", &
                dealias = dealias)
@@ -529,11 +540,13 @@ contains
     call profiler_start_region("Forward simulation")
     loop_start = MPI_WTIME()
     simulation%n_timesteps = 0
-    do while (simulation%neko_case%time%t .lt. &
-         simulation%neko_case%time%end_time)
+    this%run_time = 0.0_xp
+    do while (.not. simulation%neko_case%time%is_done())
        simulation%n_timesteps = simulation%n_timesteps + 1
        ! step forward
        call simulation_step(simulation%neko_case, dt_controller, loop_start)
+       this%run_time = this%run_time + &
+            real(simulation%neko_case%time%dt, kind=xp)
        ! accumulate objective value
        call this%accumulate_objectives(design, simulation%neko_case%time)
        ! save a checkpoint
@@ -541,9 +554,31 @@ contains
     end do
     call profiler_end_region("Forward simulation")
 
+    call this%check_objective_windows()
+
     call simulation_finalize(simulation%neko_case)
 
   end subroutine problem_run_forward_unsteady
+
+  !> Warn about objectives whose time window never overlapped the run.
+  !!
+  !! Such an objective accumulates nothing and reports zero, which is easy to
+  !! mistake for a well-performing design. Say so rather than staying silent.
+  !! @param this The problem.
+  subroutine problem_check_objective_windows(this)
+    class(problem_t), intent(inout) :: this
+    character(len=LOG_SIZE) :: log_buf
+    integer :: i
+
+    do i = 1, this%n_objectives
+       if (this%objective_list(i)%objective%value_weight .gt. 0.0_rp) cycle
+
+       write (log_buf, '(A,A,A)') "Objective '", &
+            this%objective_list(i)%objective%get_name(), &
+            "' was never sampled; its time window misses the run."
+       call neko_log%warning(trim(log_buf))
+    end do
+  end subroutine problem_check_objective_windows
 
   !> Run the adjoint backwards
   subroutine problem_run_backward_unsteady(this, simulation, design)
@@ -554,7 +589,7 @@ contains
     real(kind=dp) :: loop_start
     real(kind=rp) :: cfl
     real(kind=rp) :: total_time
-    integer :: i
+    integer :: i, j
     type(time_state_t) :: accumulation_time
 
     call dt_controller%init(simulation%neko_case%params)
@@ -584,9 +619,20 @@ contains
        accumulation_time = simulation%adjoint_case%time
        accumulation_time%t = total_time - simulation%adjoint_case%time%t
        call this%accumulate_objective_sensitivities(design, accumulation_time)
+       ! The step's forcings consume the same primal sample, so each
+       ! objective gates and scales its forcing by its own window there.
+       do j = 1, this%n_objectives
+          call this%objective_list(j)%objective%update_forcing_scale( &
+               accumulation_time, this%run_time)
+       end do
        ! step the adjoint backwards
        call simulation_adjoint_step(simulation%adjoint_case, dt_controller, &
             cfl, loop_start, total_time)
+    end do
+
+    ! Leave every forcing scale at one, as the steady path assumes
+    do j = 1, this%n_objectives
+       call this%objective_list(j)%objective%reset_forcing_scale()
     end do
 
     call profiler_end_region("Adjoint simulation")
@@ -925,50 +971,66 @@ contains
   function problem_get_log_header(this, include_constraints) result(buff)
     class(problem_t), intent(in) :: this
     logical, intent(in), optional :: include_constraints
-    character(len=4096) :: buff
-    character(len=128) :: mini_buff
-    character(len=128), allocatable :: headers(:)
-    integer :: i, j, n
+    character(len=:), allocatable :: buff
+    integer :: i
     logical :: do_constraints
 
     buff = "Total objective function"
     if (present(include_constraints)) then
        do_constraints = include_constraints
     else
-       do_constraints = .true.
+       do_constraints = this%get_n_constraints() .gt. 0
     end if
 
     do i = 1, this%get_n_objectives()
-       n = this%objective_list(i)%objective%get_log_size()
-       if (n .gt. 0) then
-          allocate(headers(n))
-          call this%objective_list(i)%objective%get_log_headers(headers)
-          do j = 1, n
-             mini_buff = ""
-             write(mini_buff, '(", ", A)') trim(headers(j))
-             buff = trim(buff) // trim(mini_buff)
-          end do
-          deallocate(headers)
-       end if
+       call problem_append_log_headers(buff, this%objective_list(i)%objective)
     end do
 
     if (do_constraints) then
        do i = 1, this%get_n_constraints()
-          n = this%constraint_list(i)%constraint%get_log_size()
-          if (n .gt. 0) then
-             allocate(headers(n))
-             call this%constraint_list(i)%constraint%get_log_headers(headers)
-             do j = 1, n
-                mini_buff = ""
-                write(mini_buff, '(", ", A)') trim(headers(j))
-                buff = trim(buff) // trim(mini_buff)
-             end do
-             deallocate(headers)
-          end if
+          call problem_append_log_headers(buff, &
+               this%constraint_list(i)%constraint)
        end do
     end if
 
   end function problem_get_log_header
+
+  !> Append the log headers of a functional to a comma-separated header.
+  !!
+  !! The headers are the functional's name plus a suffix of its own choosing,
+  !! such as `.weight`. Their buffer holds at least `min_width` characters,
+  !! the room every header has always had, and grows with the name to leave
+  !! `suffix_len` characters after it. A name of any length therefore
+  !! arrives in full, and a short name still leaves room for a long suffix.
+  !! Only a header longer than both can be cut, and that cut is made inside
+  !! `get_log_headers`, which fills a buffer of fixed length. A header that
+  !! fills its buffer is reported, since it may have been cut. A cut that
+  !! leaves a blank as the last character kept looks like padding, and
+  !! cannot be detected through this interface.
+  !! @param[inout] buff The header to append to.
+  !! @param[in] functional The functional whose headers are appended.
+  subroutine problem_append_log_headers(buff, functional)
+    character(len=:), allocatable, intent(inout) :: buff
+    class(base_functional_t), intent(in) :: functional
+    integer, parameter :: width = 256
+    character(len=width), allocatable :: headers(:)
+    integer :: j, n
+
+    n = functional%get_log_size()
+    if (n .lt. 1) return
+
+    allocate(headers(n))
+    call functional%get_log_headers(headers)
+
+    do j = 1, n
+       if (len_trim(headers(j)) .eq. width) then
+          call neko_log%warning("Log header may be truncated: " // headers(j))
+       end if
+       buff = buff // ", " // trim(headers(j))
+    end do
+
+    deallocate(headers)
+  end subroutine problem_append_log_headers
 
   !> Return the base log size (excluding iter and optimizer extras).
   !! @param[in] this The problem object.

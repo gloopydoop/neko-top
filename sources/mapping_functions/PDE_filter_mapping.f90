@@ -1,6 +1,6 @@
 !> @file PDE_filter_mapping.f90
 !! @copyright
-!! Copyright (c) 2024-2025, The Neko-TOP Authors
+!! Copyright (c) 2024-2026, The Neko-TOP Authors
 !! All rights reserved.
 !!
 !! Redistribution and use in source and binary forms, with or without
@@ -41,8 +41,7 @@ module PDE_filter_mapping
   use coefs, only: coef_t
   use ax_product, only: ax_t, ax_helm_allocator
   use krylov, only: ksp_t, ksp_monitor_t, krylov_solver_factory
-  use precon, only: pc_t, precon_allocator, precon_destroy
-  use bc_list, only: bc_list_t
+  use precon, only: pc_t, precon_allocator
   use scalar_bc_projector, only: scalar_bc_projector_t
   use neumann, only: neumann_t
   use profiler, only: profiler_start_region, profiler_end_region
@@ -81,8 +80,6 @@ module PDE_filter_mapping
      !> Filter Preconditioner
      class(pc_t), allocatable :: pc_filt
      !> Filter boundary conditions (they will all be Neumann, so empty)
-     type(bc_list_t) :: bclst_filt
-     !> Scalar constraint projector for the filter solve.
      type(scalar_bc_projector_t) :: bc_projector_filt
 
      ! Inputs from the user
@@ -96,6 +93,8 @@ module PDE_filter_mapping
      character(len=:), allocatable :: ksp_solver
      ! > preconditioner type
      character(len=:), allocatable :: precon_type_filt
+     !> Whether a filter solve that does not converge is an error
+     logical :: strict_convergence = .false.
      integer :: ksp_n, n, i
 
 
@@ -132,27 +131,40 @@ contains
     real(kind=rp) :: r, tol
     integer :: max_iter
     character(len=:), allocatable :: ksp_solver, precon_type
+    logical :: strict_convergence
 
     call nekotop_continuation%json_get_or_register(json, 'r', this%r, r)
     call json_get_or_default(json, 'tol', tol, 0.0000000001_rp)
     call json_get_or_default(json, 'max_iter', max_iter, 200)
     call json_get_or_default(json, 'solver', ksp_solver, "cg")
     call json_get_or_default(json, 'preconditioner', precon_type, "jacobi")
+    call json_get_or_default(json, 'strict_convergence', strict_convergence, &
+         .false.)
 
     call this%init_base(json, coef, "PDE_filter_mapping")
     call this%init_from_attributes(coef, r, tol, max_iter, &
-         ksp_solver, precon_type)
+         ksp_solver, precon_type, strict_convergence)
 
   end subroutine PDE_filter_init_from_json
 
   !> Actual constructor.
+  !! @param this The filter.
+  !! @param coef The SEM coefficients.
+  !! @param r The filter radius.
+  !! @param tol The absolute tolerance of the filter solve.
+  !! @param max_iter The maximum number of iterations of the filter solve.
+  !! @param ksp_solver The Krylov solver of the filter solve.
+  !! @param precon_type The preconditioner of the filter solve.
+  !! @param strict_convergence Whether a filter solve that does not converge
+  !! is an error rather than a warning.
   subroutine PDE_filter_init_from_attributes(this, coef, r, tol, max_iter, &
-       ksp_solver, precon_type)
+       ksp_solver, precon_type, strict_convergence)
     class(PDE_filter_t), intent(inout) :: this
     type(coef_t), intent(inout) :: coef
     real(kind=rp), intent(in) :: r, tol
     integer, intent(in) :: max_iter
     character(len=*), intent(in) :: ksp_solver, precon_type
+    logical, intent(in) :: strict_convergence
     integer :: n
 
     this%r = r
@@ -160,12 +172,10 @@ contains
     this%ksp_max_iter = max_iter
     this%ksp_solver = ksp_solver
     this%precon_type_filt = precon_type
+    this%strict_convergence = strict_convergence
 
     ! set the number of dofs
     n = this%coef%dof%size()
-
-    ! init the bc list (all Neuman BCs, will remain empty)
-    call this%bclst_filt%init()
 
     ! Setup backend dependent Ax routines
     call ax_helm_allocator(this%Ax, type_name = "standard")
@@ -176,8 +186,8 @@ contains
 
     ! set up preconditioner
     call filter_precon_factory(this%pc_filt, this%ksp_filt, &
-         this%coef, this%coef%dof, this%coef%gs_h, this%bclst_filt, &
-         this%precon_type_filt)
+         this%coef, this%coef%dof, this%coef%gs_h, &
+         this%bc_projector_filt, this%precon_type_filt)
 
   end subroutine PDE_filter_init_from_attributes
 
@@ -195,11 +205,10 @@ contains
     end if
 
     if (allocated(this%pc_filt)) then
-       call precon_destroy(this%pc_filt)
+       call this%pc_filt%free()
        deallocate(this%pc_filt)
     end if
 
-    call this%bclst_filt%free()
     call this%bc_projector_filt%free()
 
     call this%free_base()
@@ -235,7 +244,8 @@ contains
 
     ! set up Helmholtz operators and RHS
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call device_cfill(this%coef%h1_d, (this%r / (2.0_rp * sqrt(3.0_rp)))**2, n)
+       call device_cfill(this%coef%h1_d, &
+            (this%r / (2.0_rp * sqrt(3.0_rp)))**2, n)
        call device_cfill(this%coef%h2_d, 1.0_rp, n)
     else
        ! h1 is already negative in its definition
@@ -297,7 +307,7 @@ contains
 
     call neko_scratch_registry%relinquish_field(temp_indices)
 
-
+    call PDE_filter_check_convergence(this, 'forward')
 
   end subroutine PDE_filter_forward_mapping
 
@@ -337,7 +347,8 @@ contains
 
     ! set up Helmholtz operators and RHS
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call device_cfill(this%coef%h1_d, (this%r / (2.0_rp * sqrt(3.0_rp)))**2, n)
+       call device_cfill(this%coef%h1_d, &
+            (this%r / (2.0_rp * sqrt(3.0_rp)))**2, n)
        call device_cfill(this%coef%h2_d, 1.0_rp, n)
     else
        ! h1 is already negative in its definition
@@ -398,28 +409,53 @@ contains
 
     call neko_scratch_registry%relinquish_field(temp_indices)
 
+    call PDE_filter_check_convergence(this, 'backward')
+
   end subroutine PDE_filter_backward_mapping
 
-  subroutine filter_precon_factory(pc, ksp, coef, dof, gs, bclst, pctype)
+  !> Report a filter solve that did not converge, as Neko does for the fluid
+  !! solvers: a warning in the log, or an error with strict convergence.
+  !! @param this The filter, holding the result of its last solve.
+  !! @param direction The mapping that ran the solve, forward or backward.
+  subroutine PDE_filter_check_convergence(this, direction)
+    class(PDE_filter_t), intent(in) :: this
+    character(len=*), intent(in) :: direction
+    character(len=:), allocatable :: msg
 
-    implicit none
+    if (this%ksp_results(1)%converged) return
+
+    msg = 'PDE filter solver did not converge in the ' // direction // &
+         ' mapping'
+    if (this%strict_convergence) then
+       call neko_error(msg)
+    else
+       call neko_log%warning(msg)
+    end if
+
+    deallocate(msg)
+
+  end subroutine PDE_filter_check_convergence
+
+  !> Initialize a Krylov preconditioner
+  subroutine filter_precon_factory(pc, ksp, coef, dof, gs, bc_projector, &
+       pctype)
     class(pc_t), allocatable, target, intent(inout) :: pc
     class(ksp_t), target, intent(inout) :: ksp
     type(coef_t), target, intent(in) :: coef
     type(dofmap_t), target, intent(in) :: dof
     type(gs_t), target, intent(inout) :: gs
-    type(bc_list_t), target, intent(inout) :: bclst
+    type(scalar_bc_projector_t), target, intent(inout) :: bc_projector
     character(len=*) :: pctype
 
     call precon_allocator(pc, pctype)
 
     select type (pcp => pc)
     type is (jacobi_t)
-       call pcp%init(coef, dof, gs)
+       call pcp%init_from_components(coef, dof, gs)
     type is (sx_jacobi_t)
-       call pcp%init(coef, dof, gs)
+       call pcp%init_from_components(coef, dof, gs)
     type is (device_jacobi_t)
-       call pcp%init(coef, dof, gs)
+       call pcp%init_from_components(coef, dof, gs)
     end select
 
     call ksp%set_pc(pc)

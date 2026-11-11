@@ -1,6 +1,6 @@
 !> @file base_functional.f90
 !! @copyright
-!! Copyright (c) 2025, The Neko-TOP Authors
+!! Copyright (c) 2025-2026, The Neko-TOP Authors
 !! All rights reserved.
 !!
 !! Redistribution and use in source and binary forms, with or without
@@ -37,13 +37,14 @@ module base_functional
   use design, only: design_t
   use json_module, only: json_file
   use json_utils, only: json_get
-  use num_types, only: rp
+  use num_types, only: rp, dp, xp
   use point_zone, only: point_zone_t
   use simulation_m, only: simulation_t
   use time_state, only: time_state_t
   use vector, only: vector_t
   use utils, only: neko_error
-  use vector_math, only: vector_copy, vector_add2s1
+  use scratch_registry, only: neko_scratch_registry
+  use vector_math, only: vector_copy, vector_add3s2, vector_rzero
   implicit none
   private
 
@@ -59,24 +60,33 @@ module base_functional
   !! All of which should be prepared in the `init` method.
   type, abstract, public :: base_functional_t
 
+     !> Name of object in the logfile. Unallocated until the object is
+     !! initialised; read it through `get_name`.
+     character(len=:), allocatable :: name
+
      !> Value of the base_functional
-     real(kind=rp) :: value = 0.0_rp
-     !> Old value for time integration
-     real(kind=rp) :: value_old = 0.0_rp
+     real(kind=rp) :: value = 0.0_dp
      !> Sensitivity field
      type(vector_t) :: sensitivity
-     !> Old sensitivity field for time integration
-     type(vector_t) :: sensitivity_old
-     !> Name of constraint/objective in the logfile
-     character(len=25) :: name = ""
      !> containing a mask
      logical :: has_mask = .false.
      !> A mask for where the objective function is evaluated
      class(point_zone_t), pointer :: mask => null()
+
+     ! ----------------------------------------------------------------------- !
+     ! Variables related to time averaging of the functional value and
+     ! sensitivity
+
      !> Time window start for accumulation
-     real(kind=rp) :: start_time = 0.0_rp
+     real(kind=dp) :: start_time = 0.0_dp
      !> Time window end for accumulation
-     real(kind=rp) :: end_time = huge(0.0_rp)
+     real(kind=dp) :: end_time = huge(0.0_dp)
+     !> Length of time actually sampled by `accumulate_value`, used to
+     !! normalise the running time average.
+     real(kind=xp) :: value_weight = 0.0_xp
+     !> Length of time actually sampled by `accumulate_sensitivity`, used to
+     !! normalise the running time average.
+     real(kind=xp) :: sensitivity_weight = 0.0_xp
 
    contains
 
@@ -99,6 +109,8 @@ module base_functional
      procedure(functional_update_sensitivity), pass(this), deferred :: &
           update_sensitivity
 
+     !> Get the name of the function
+     procedure, pass(this) :: get_name => functional_get_name
      !> Get the value of the function
      procedure, pass(this) :: get_value => functional_get_value
      !> Get the sensitivity of the function
@@ -119,6 +131,8 @@ module base_functional
      procedure, pass(this) :: accumulate_sensitivity => &
           functional_accumulate_sensitivity
 
+     !> Check if a time is within the functional's time window
+     procedure, pass(this) :: in_window => functional_in_window
   end type base_functional_t
 
   ! -------------------------------------------------------------------------- !
@@ -176,6 +190,20 @@ contains
          "' does not support initialization with simulation")
   end subroutine functional_init_json_sim
 
+  !> Get the name of the function.
+  !! @param this The functional.
+  !! @return The full name, or an empty string if none has been set.
+  function functional_get_name(this) result(name)
+    class(base_functional_t), intent(in) :: this
+    character(len=:), allocatable :: name
+
+    if (allocated(this%name)) then
+       name = this%name
+    else
+       name = ""
+    end if
+  end function functional_get_name
+
   !> Get the value of the function
   function functional_get_value(this) result(v)
     class(base_functional_t), intent(in) :: this
@@ -210,7 +238,7 @@ contains
     character(len=*), intent(out) :: headers(:)
 
     if (size(headers) .eq. 0) return
-    headers(1) = trim(this%name)
+    headers(1) = this%get_name()
   end subroutine functional_get_log_headers
 
   !> Populate log values for this functional.
@@ -228,47 +256,117 @@ contains
   subroutine functional_reset_value(this)
     class(base_functional_t), intent(inout) :: this
 
-    this%value = 0.0_rp
+    this%value = 0.0_dp
+    this%value_weight = 0.0_dp
   end subroutine functional_reset_value
 
   !> Zero sensitivity of the function
   subroutine functional_reset_sensitivity(this)
     class(base_functional_t), intent(inout) :: this
 
-    this%sensitivity = 0.0_rp
+    call vector_rzero(this%sensitivity)
+    this%sensitivity_weight = 0.0_dp
   end subroutine functional_reset_sensitivity
 
   !> Accumulate the value of the function
+  !!
+  !! Updates the value in place as the running mean of the function.
+  !!
+  !! The result is the running mean of the function over the part of the
+  !! functional's own time window that has been simulated so far, normalised
+  !! by the length of time actually sampled. It is therefore invariant to the
+  !! length of the run: extending `end_time` of the simulation past the
+  !! functional's window leaves the value unchanged, and a windowed
+  !! functional reports the mean over its window rather than over the run.
+  !! @param this The functional.
+  !! @param design The design.
+  !! @param time The current time state.
   subroutine functional_accumulate_value(this, design, time)
     class(base_functional_t), intent(inout) :: this
     class(design_t), intent(in) :: design
     type(time_state_t), intent(in) :: time
+    real(kind=xp) :: value_new, value_old, weight_new, weight_old, dt
 
-    if (time%t .lt. this%start_time .or. time%t .gt. this%end_time) return
+    if (.not. this%in_window(time)) return
 
-    this%value_old = this%value
+    ! Store the old value and compute the new value.
+    value_old = real(this%value, kind=xp)
     call this%update_value(design)
+    value_new = real(this%value, kind=xp)
 
-    ! could potentially use higher order trapezoidal/Simpson etc, but this
-    ! should suffice
-    this%value = this%value_old + this%value * time%dt / &
-         (time%end_time - time%start_time)
+    ! Compute the weights for the old and new values.
+    dt = real(time%dt, kind=xp)
+    weight_new = dt / (this%value_weight + dt)
+    weight_old = this%value_weight / (this%value_weight + dt)
+
+    ! Rectangle rule; could potentially use higher order trapezoidal/Simpson
+    ! etc, but this should suffice.
+    this%value = real(value_old * weight_old + value_new * weight_new, kind=rp)
+    this%value_weight = this%value_weight + dt
   end subroutine functional_accumulate_value
 
   !> Accumulate the sensitivity of the function
+  !!
+  !! Normalised exactly as `accumulate_value`, so that the sensitivity stays
+  !! consistent with the value it differentiates.
+  !! @param this The functional.
+  !! @param design The design.
+  !! @param time The current time state.
   subroutine functional_accumulate_sensitivity(this, design, time)
     class(base_functional_t), intent(inout) :: this
     class(design_t), intent(in) :: design
     type(time_state_t), intent(in) :: time
+    real(kind=xp) :: weight_new, weight_old, dt
+    type(vector_t), pointer :: sensitivity_new, sensitivity_old
+    integer :: n, idx(2)
 
-    if (time%t .lt. this%start_time .or. time%t .gt. this%end_time) return
+    if (.not. this%in_window(time)) return
 
-    call vector_copy(this%sensitivity_old, this%sensitivity)
+    n = this%sensitivity%size()
+    call neko_scratch_registry%request(sensitivity_new, idx(1), n, .false.)
+    call neko_scratch_registry%request(sensitivity_old, idx(2), n, .false.)
+
+    ! Store old sensitivity and compute new sensitivity.
+    call vector_copy(sensitivity_old, this%sensitivity)
     call this%update_sensitivity(design)
+    call vector_copy(sensitivity_new, this%sensitivity)
 
-    ! could potentially use higher order trapezoidal/Simpson etc, but this
-    ! should suffice
-    call vector_add2s1(this%sensitivity, this%sensitivity_old, time%dt / &
-         (time%end_time - time%start_time))
+    ! Compute the weights for the old and new sensitivities.
+    dt = real(time%dt, kind=xp)
+    weight_new = dt / (this%sensitivity_weight + dt)
+    weight_old = this%sensitivity_weight / (this%sensitivity_weight + dt)
+
+    ! Rectangle rule; could potentially use higher order trapezoidal/Simpson
+    ! etc, but this should suffice.
+    call vector_add3s2(this%sensitivity, &
+         sensitivity_new, sensitivity_old, weight_new, weight_old)
+    this%sensitivity_weight = this%sensitivity_weight + dt
+
+    nullify(sensitivity_new)
+    nullify(sensitivity_old)
+    call neko_scratch_registry%relinquish(idx)
   end subroutine functional_accumulate_sensitivity
+
+  ! -------------------------------------------------------------------------- !
+  ! Helper methods
+
+  !> Whether a sample at the current time contributes to the average.
+  !!
+  !! A tolerance of a small fraction of the timestep is applied to both ends
+  !! of the window, so that a boundary placed exactly on a timestep is
+  !! included deterministically rather than at the mercy of the round-off
+  !! accumulated in `time%t`.
+  !! @param this The functional.
+  !! @param time The current time state.
+  !! @return Whether `time%t` lies inside the accumulation window.
+  pure function functional_in_window(this, time) result(inside)
+    class(base_functional_t), intent(in) :: this
+    type(time_state_t), intent(in) :: time
+    logical :: inside
+    real(kind=rp) :: tol
+
+    tol = 1.0e-6_rp * time%dt
+    inside = time%t .ge. this%start_time - tol .and. &
+         time%t .le. this%end_time + tol
+  end function functional_in_window
 end module base_functional

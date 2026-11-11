@@ -16,7 +16,7 @@
 
 # ============================================================================ #
 # Include the build_example function
-include(build_example)
+include(NekoTopBuildExamples)
 
 # Set the examples directory
 set(EXAMPLES_DIR ${CMAKE_CURRENT_SOURCE_DIR} CACHE INTERNAL "Examples directory")
@@ -52,7 +52,10 @@ add_subdirectory(${EXAMPLES_DIR}/unsteady_rugby_ball)
 add_subdirectory(${EXAMPLES_DIR}/low_Re)
 add_subdirectory(${EXAMPLES_DIR}/low_Re_2nodes)
 add_subdirectory(${EXAMPLES_DIR}/POD_rugby_ball)
-add_subdirectory(${EXAMPLES_DIR}/debug)
+if (EXISTS ${EXAMPLES_DIR}/debug/CMakeLists.txt)
+    add_subdirectory(${EXAMPLES_DIR}/debug)
+endif()
+add_subdirectory(${EXAMPLES_DIR}/heat_compliance)
 add_subdirectory(${EXAMPLES_DIR}/wiggles)
 
 # If the benchmark_mixer folder exists, add it as well

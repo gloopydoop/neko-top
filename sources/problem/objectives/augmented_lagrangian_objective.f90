@@ -45,7 +45,7 @@ module augmented_lagrangian_objective
   use device_math, only: device_copy, device_col2, device_invcol2
   use design, only: design_t
   use json_module, only: json_file
-  use json_utils, only: json_get_or_default
+  use json_utils, only: json_get, json_get_or_default
   use interpolation, only: interpolator_t
   use space, only: space_t, GL
   use coefs, only: coef_t
@@ -73,22 +73,20 @@ module augmented_lagrangian_objective
 
      ! ---- everything GLL ----
      !> The original space used in the simulation
-     type(space_t), pointer :: Xh_GLL
+     type(space_t), pointer :: Xh_GLL => null()
      !> cfs of the original space in the simulation
-     type(coef_t), pointer :: c_Xh_GLL
-
+     type(coef_t), pointer :: c_Xh_GLL => null()
      ! ---- everything for GL ----
      !> The additional higher-order space used in dealiasing
-     type(space_t), pointer :: Xh_GL
+     type(space_t), pointer :: Xh_GL => null()
      !> cfs of the higher-order space
-     type(coef_t), pointer :: c_Xh_GL
+     type(coef_t), pointer :: c_Xh_GL => null()
      !> Interpolator between the original and higher-order spaces
-     type(interpolator_t), pointer :: GLL_to_GL
+     type(interpolator_t), pointer :: GLL_to_GL => null()
      !> If dealiasing should be applied
      logical :: dealias
      !> GL scratch registry
-     type(scratch_registry_t), pointer :: scratch_GL
-
+     type(scratch_registry_t), pointer :: scratch_GL => null()
    contains
      !> The common constructor using a JSON object.
      procedure, public, pass(this) :: init_json_sim => &
@@ -132,12 +130,15 @@ contains
     character(len=:), allocatable :: name
     character(len=:), allocatable :: mask_name
     real(kind=rp) :: weight
-    logical :: dealias
+    logical :: dealias, dealias_fallback
 
     call json_get_or_default(json, "weight", weight, 1.0_rp)
     call json_get_or_default(json, "mask_name", mask_name, "")
     call json_get_or_default(json, "name", name, "Augmented Lagrangian")
-    call json_get_or_default(json, "dealias", dealias, .true.)
+    call json_get(simulation%neko_case%params, 'case.numerics.dealias', &
+         dealias_fallback)
+    call json_get_or_default(json, "dealias_sensitivity", dealias, &
+         dealias_fallback)
 
     call this%init_from_attributes(design, simulation, weight, name, &
          mask_name, dealias)
@@ -161,6 +162,8 @@ contains
     character(len=*), intent(in) :: mask_name
     logical, intent(in) :: dealias
 
+    call this%free()
+
     call this%init_base(name, design%size(), weight, mask_name)
 
     ! Save the simulation and design
@@ -176,6 +179,11 @@ contains
     this%c_Xh_GLL => simulation%neko_case%fluid%c_Xh
     this%Xh_GLL => this%c_Xh_GLL%Xh
 
+    ! The over-integration stack is only needed if this objective dealiases
+    if (dealias) then
+       call simulation%adjoint_case%fluid_adj%require_gauss_stack()
+    end if
+
     ! GL
     this%c_Xh_GL => simulation%adjoint_case%fluid_adj%c_Xh_GL
     this%Xh_GL => this%c_Xh_GL%Xh
@@ -188,6 +196,7 @@ contains
   end subroutine augmented_lagrangian_init_attributes
 
   !> Destructor.
+  !! @param this The objective.
   subroutine augmented_lagrangian_free(this)
     class(augmented_lagrangian_objective_t), intent(inout) :: this
     call this%free_base()
@@ -200,8 +209,12 @@ contains
     if (associated(this%adjoint_v)) nullify(this%adjoint_v)
     if (associated(this%adjoint_w)) nullify(this%adjoint_w)
 
+    nullify(this%Xh_GLL)
+    nullify(this%c_Xh_GLL)
+    nullify(this%Xh_GL)
+    nullify(this%c_Xh_GL)
+    nullify(this%GLL_to_GL)
     nullify(this%scratch_GL)
-
 
   end subroutine augmented_lagrangian_free
 

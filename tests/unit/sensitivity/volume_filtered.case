@@ -29,6 +29,7 @@
         "fluid": {
             "scheme": "pnpn",
             "Re": 2.0,
+            "strict_convergence": true,
             "initial_condition": {
                 "type": "uniform",
                 "value": [ 0.0, 0.0, 0.0 ]
@@ -127,7 +128,8 @@
                     {
                         "type": "PDE_filter",
                         "r": 0.2,
-                        "tol": 1.0e-25
+                        "tol": 1.0e-14,
+                        "strict_convergence": true
                     }
                 ]
             }

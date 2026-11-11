@@ -13,6 +13,9 @@ examples/debug/*
 !examples/debug/readme.md
 !examples/debug/run.sh
 
+# IDE Related files
+.vscode/
+
 # Translated unit test files
 tests/unit/**/*.F90
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2024, The Neko-TOP Authors
+# Copyright (c) 2023-2026, The Neko-TOP Authors
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -33,25 +33,30 @@
 # ============================================================================ #
 # Neko-TOP: Neko Topology Optimization Package
 # ============================================================================ #
-
+# CMakeLists.txt for Neko-TOP
 cmake_minimum_required(VERSION 3.21)
-project(Neko-TOP VERSION 0.0.1 LANGUAGES Fortran)
 
-# Set language standards
-set(CMAKE_Fortran_STANDARD 2008)
-
-# ............................................................................ #
-# Define cmake variables
-
-# Define the list of available build types
+# Define the list of available build types and default to Release
 set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build")
-set(CMAKE_BUILD_TYPE_LIST
+set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
     Debug
     Release
     Testing
 )
+# ============================================================================ #
+# Setup the project
+# ============================================================================ #
+
+project(Neko-TOP VERSION 0.0.1 LANGUAGES Fortran)
+
+# Set language standards
+set(CMAKE_Fortran_STANDARD 2008)
 set(CMAKE_Fortran_PREPROCESS ON)
+
+# ............................................................................ #
+# Include the utility functions
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+include(NekoTopUtilities)
 
 # ............................................................................ #
 # Options
@@ -61,6 +66,12 @@ option(BUILD_EXAMPLES "Build the examples" OFF)
 option(BUILD_DOCS "Build documentation" OFF)
 option(BUILD_TESTING "Build the tests" OFF)
 option(ONLY_DOCS "Only build the documentation" OFF)
+
+# Enable runtime checks: AUTO (default), ON, or OFF. AUTO enables runtime checks
+# during Debug builds.
+set(NEKO_TOP_RUNTIME_CHECKS "AUTO" CACHE STRING
+    "Enable runtime checks: AUTO (default), ON, or OFF")
+set_property(CACHE NEKO_TOP_RUNTIME_CHECKS PROPERTY STRINGS AUTO ON OFF)
 
 # ============================================================================ #
 # Documentation
@@ -116,9 +127,11 @@ else()
 endif()
 
 set(CMAKE_PREFIX_PATH ${JSON_FORTRAN_DIR} ${CMAKE_PREFIX_PATH})
+prepend_pkg_config_path("${JSON_FORTRAN_DIR}")
 
 # Find the JSON-Fortran library
 pkg_check_modules(json-fortran REQUIRED IMPORTED_TARGET json-fortran)
+restore_pkg_config_path()
 
 # ............................................................................ #
 # Optional ADIOS2 support
@@ -196,10 +209,12 @@ else()
 endif()
 
 set(CMAKE_PREFIX_PATH ${NEKO_DIR} ${CMAKE_PREFIX_PATH})
+prepend_pkg_config_path("${NEKO_DIR}")
 
 # Find the Neko library
 pkg_check_modules(neko REQUIRED IMPORTED_TARGET neko)
 pkg_get_variable(DEVICE_TYPE neko backend)
+restore_pkg_config_path()
 
 # ............................................................................ #
 # HDF5 Support
@@ -215,11 +230,8 @@ else()
     set(_hdf5_requested FALSE)
 endif()
 
-# Use FindHDF5's module mode; its config-mode branch can select a different
-# installation than the one HDF5_ROOT points at.
 set(HDF5_NO_FIND_PACKAGE_CONFIG_FILE TRUE)
 find_package(HDF5 COMPONENTS Fortran)
-
 # Determine if the HDF5 found is serial or parallel.
 if (HDF5_FOUND AND DEFINED HDF5_IS_PARALLEL AND NOT HDF5_IS_PARALLEL)
     set(_hdf5_known_serial TRUE)
@@ -260,7 +272,8 @@ endif()
 # ============================================================================ #
 
 # Set the compiler flags
-include(${CMAKE_Fortran_COMPILER_ID} OPTIONAL RESULT_VARIABLE compiler_flags_found)
+include(NekoTopCompiler${CMAKE_Fortran_COMPILER_ID} OPTIONAL
+    RESULT_VARIABLE compiler_flags_found)
 if (NOT compiler_flags_found)
     message(WARNING "No specific compiler flags found for "
         "${CMAKE_Fortran_COMPILER_ID}.")
@@ -320,10 +333,10 @@ if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
     message(STATUS "- JSON_FORTRAN_DIR: ${JSON_FORTRAN_DIR}")
     message(STATUS "- NEKO_DIR:         ${NEKO_DIR}")
     message(STATUS "- PFUNIT_DIR:       ${PFUNIT_DIR}")
-    if (HAVE_HDF5 AND HDF5_IS_PARALLEL)
-        message(STATUS "- HDF5:             ${HDF5_VERSION} (parallel)")
+    if (HAVE_HDF5 AND HDF5_VERSION)
+        message(STATUS "- HDF5:             ${HDF5_VERSION}")
     elseif (HAVE_HDF5)
-        message(STATUS "- HDF5:             ${HDF5_VERSION} (parallel assumed)")
+        message(STATUS "- HDF5:             Enabled")
     else()
         message(STATUS "- HDF5:             Disabled (not found)")
     endif()
