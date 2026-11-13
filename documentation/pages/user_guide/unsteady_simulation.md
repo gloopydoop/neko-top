@@ -119,6 +119,42 @@ At the case-file level, POD recovery looks like:
 When `output_reconstruction = true`, the reconstruction output cadence is taken
 from `case.fluid.output_control` and `case.fluid.output_value`.
 
+### URANS-POD state recovery
+
+`type: "urans_pod"` selects a separate fixed-window recovery implementation;
+the standard `type: "pod"` path is unchanged. Its required controls are:
+
+```json
+"state_recovery": {
+  "type": "urans_pod",
+  "batch_size": 10,
+  "n_modes": 5,
+  "dtype": "double",
+  "window_duration": 0.1,
+  "fit_eddy_viscosity": true,
+  "closure_inner_product_weight": 0.0,
+  "closure_inner_product_epsilon": 1.0e-12
+}
+```
+
+Fortran starts at the simulation start time, accumulates statistics at every
+solver step, and sends one record after every complete window. The final
+simulation time must be an exact multiple of `window_duration`; an incomplete
+final window is an error. There are no `i_stream`, `statistics_start_time`, or
+`keep_partial_window` controls for `urans_pod`.
+
+The record contains the window means, six independent Reynolds-stress
+components, and—when a scalar is enabled—the scalar mean and three scalar
+flux components. Python fits `nu_T` and, when requested, `Gamma_T`, then
+passes one POD snapshot per window consisting of the mean fields and fitted
+closure fields.
+
+The velocity and scalar mean fields have unit inner-product weight. Closure
+fields use `max(closure_inner_product_weight,
+closure_inner_product_epsilon)`, so setting the user weight to zero removes
+their energy contribution while the positive epsilon keeps their mode
+components reconstructible.
+
 ## POD technical setup
 
 ### ADIOS2 requirement

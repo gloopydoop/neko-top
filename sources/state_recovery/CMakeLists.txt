@@ -13,4 +13,5 @@ target_sources(neko-top
 target_sources(neko-top
     PRIVATE
         $<$<BOOL:${HAVE_ADIOS2}>:${CMAKE_CURRENT_SOURCE_DIR}/POD_state_recover/POD_state_recover.f90>
+        $<$<BOOL:${HAVE_ADIOS2}>:${CMAKE_CURRENT_SOURCE_DIR}/URANS_POD_state_recover/URANS_POD_state_recover.f90>
 )

@@ -38,6 +38,7 @@ submodule (state_recover) state_recover_fctry
   use state_recover_checkpoint, only: state_recover_checkpoint_t
 #if HAVE_ADIOS2
   use simulation_POD_state_recover, only: POD_state_recover_t
+  use simulation_URANS_POD_state_recover, only: URANS_POD_state_recover_t
 #endif
   use utils, only: neko_error
   implicit none
@@ -79,6 +80,13 @@ contains
        allocate(POD_state_recover_t :: recover)
 #else
        call neko_error("POD state recovery requires ADIOS2. Rebuild with " // &
+            "ADIOS2 enabled.")
+#endif
+    case ("urans_pod")
+#if HAVE_ADIOS2
+       allocate(URANS_POD_state_recover_t :: recover)
+#else
+       call neko_error("URANS-POD state recovery requires ADIOS2. Rebuild with " // &
             "ADIOS2 enabled.")
 #endif
     case default
