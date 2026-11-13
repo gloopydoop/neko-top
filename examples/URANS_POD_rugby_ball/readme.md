@@ -24,7 +24,9 @@ remain reconstructible without materially contributing to POD energy; the
 velocity/scalar fields use unit weight. The fluid and optimization setup is
 otherwise aligned with the standard POD rugby-ball case.
 
-For a scalar-enabled case, add `scalar_closure: "flux_least_squares"` under
-`state_recovery`, together with `gammat_regularisation` and optional
-`gammat_max`; use `scalar_closure: "schmidt"` to select the explicitly
-labelled `Gamma_T = nu_T/Sc_T` fallback and set `turbulent_schmidt`.
+For a scalar-enabled case, `scalar_closure` defaults to
+`"flux_least_squares"`, together with the configured `gammat_regularisation`
+and optional `gammat_max`. Use `scalar_closure: "schmidt"` to select the
+explicitly labelled `Gamma_T = nu_T/Sc_T` fallback and set
+`turbulent_schmidt`. Set `scalar_closure: "off"` only when the scalar closure
+is deliberately not wanted.

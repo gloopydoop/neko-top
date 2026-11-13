@@ -132,6 +132,7 @@ the standard `type: "pod"` path is unchanged. Its required controls are:
   "dtype": "double",
   "window_duration": 0.1,
   "fit_eddy_viscosity": true,
+  "scalar_closure": "flux_least_squares",
   "closure_inner_product_weight": 0.0,
   "closure_inner_product_epsilon": 1.0e-12
 }
@@ -145,9 +146,15 @@ final window is an error. There are no `i_stream`, `statistics_start_time`, or
 
 The record contains the window means, six independent Reynolds-stress
 components, and—when a scalar is enabled—the scalar mean and three scalar
-flux components. Python fits `nu_T` and, when requested, `Gamma_T`, then
+flux components. Python fits `nu_T` and, for an enabled scalar, `Gamma_T` by
+default, then
 passes one POD snapshot per window consisting of the mean fields and fitted
 closure fields.
+
+Both closure fits are enabled by default for `urans_pod`: omitting
+`fit_eddy_viscosity` defaults it to `true`, and omitting `scalar_closure`
+defaults it to `"flux_least_squares"` when the case contains a scalar. An
+explicit `scalar_closure: "off"` is available as an opt-out.
 
 The velocity and scalar mean fields have unit inner-product weight. Closure
 fields use `max(closure_inner_product_weight,

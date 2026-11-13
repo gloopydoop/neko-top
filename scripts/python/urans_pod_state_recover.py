@@ -10,6 +10,7 @@ from mpi4py import MPI
 
 from pysemtools.datatypes.coef import Coef
 from pysemtools.datatypes.msh import Mesh
+from pysemtools.datatypes.msh_connectivity import MeshConnectivity
 from pysemtools.datatypes.utils import get_gradient
 from pysemtools.io.adios2.stream import DataStreamer
 from pysemtools.rom.io_help import IoHelp
@@ -50,6 +51,7 @@ def init_runtime(
     DataStreamer,
     Mesh,
     Coef,
+    MeshConnectivity | None,
     np.ndarray,
     POD,
     IoHelp,
@@ -65,8 +67,16 @@ def init_runtime(
 
     mesh = Mesh(comm, x=x, y=y, z=z, create_connectivity=False)
     coef = Coef(mesh, comm)
+    # Closure coefficients are computed from element-local gradients.  Build
+    # distributed mesh connectivity so their final values are averaged over
+    # shared GLL points before they are used by POD or the adjoint.
+    mesh_connectivity = None
+    if cfg.closure_enabled or cfg.scalar_closure_enabled:
+        mesh_connectivity = MeshConnectivity(
+            comm, msh=mesh, use_hashtable=True
+        )
     pod, ioh = make_pod(comm, coef.B, cfg)
-    return ds, mesh, coef, pod, ioh, initial_fields
+    return ds, mesh, coef, mesh_connectivity, pod, ioh, initial_fields
 
 
 def main() -> None:
@@ -86,7 +96,9 @@ def main() -> None:
     case_cfg, cfg = load_pod_config(case_path)
     set_debug(cfg.debug)
 
-    ds, mesh, coef, pod, ioh, initial_fields = init_runtime(comm, cfg)
+    ds, mesh, coef, mesh_connectivity, pod, ioh, initial_fields = init_runtime(
+        comm, cfg
+    )
     bm = coef.B
     times = []
     energy = EnergyState()
@@ -150,6 +162,10 @@ def main() -> None:
                 pod_fields = list(means)
                 nut = None
                 if cfg.closure_enabled:
+                    if mesh_connectivity is None:
+                        raise RuntimeError(
+                            "closure fitting requires mesh connectivity"
+                        )
                     gradients = get_gradient(mesh, coef, means[:3])
                     gradients = np.moveaxis(gradients, (-2, -1), (0, 1))
                     nut, nut_diag = fit_boussinesq_nut(
@@ -159,11 +175,18 @@ def main() -> None:
                         maximum=cfg.closure_nut_max,
                         clip_negative=True,
                     )
+                    nut = mesh_connectivity.dssum(
+                        field=nut, msh=mesh, average="multiplicity"
+                    )
                     pod_fields.append(nut * cfg.closure_field_scale)
                     if rank == 0:
                         closure_rows.append((float(tcur), nut_diag))
 
                 if cfg.scalar_closure_enabled:
+                    if mesh_connectivity is None:
+                        raise RuntimeError(
+                            "scalar closure fitting requires mesh connectivity"
+                        )
                     scalar_gradient = get_gradient(mesh, coef, [scalar_mean])
                     scalar_gradient = np.moveaxis(
                         scalar_gradient, (-2, -1), (0, 1)
@@ -189,6 +212,9 @@ def main() -> None:
                             "mean_fit_relative_residual": 0.0,
                             "max_gammat": float(np.max(gammat)),
                         }
+                    gammat = mesh_connectivity.dssum(
+                        field=gammat, msh=mesh, average="multiplicity"
+                    )
                     pod_fields.append(gammat * cfg.gammat_field_scale)
                     if rank == 0:
                         scalar_closure_rows.append((float(tcur), gammat_diag))

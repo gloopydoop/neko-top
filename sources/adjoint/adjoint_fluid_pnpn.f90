@@ -942,8 +942,13 @@ contains
       call neko_scratch_registry%relinquish_field(temp_indices)
       !------------------------------------------------------------------------!
 
+      ! The adjoint always stores separate convergence records for U, V, W,
+      ! and pressure, even when the full-stress operator is used.  The shared
+      ! forward helper suppresses the third velocity row for full-stress
+      ! forward solves (where the records are Momentum and Pressure), which
+      ! would otherwise hide the adjoint W result here.
       call fluid_step_info(time, ksp_results, &
-           this%full_stress_formulation, this%strict_convergence)
+           .false., this%strict_convergence)
 
     end associate
     call profiler_end_region('Adjoint')

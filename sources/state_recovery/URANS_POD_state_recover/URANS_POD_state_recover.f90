@@ -186,8 +186,11 @@ contains
     call json_get(params, "window_duration", window_duration)
     call json_get_or_default(params, "dtype", dtype, "double")
     call json_get_or_default(params, "write_modes", write_modes, .false.)
-    call json_get_or_default(params, "fit_eddy_viscosity", fit_eddy_viscosity, .false.)
-    call json_get_or_default(params, "scalar_closure", scalar_closure, "off")
+    ! URANS-POD snapshots contain all applicable closure fields by default.
+    ! An explicit false/off value remains available as an opt-out.
+    call json_get_or_default(params, "fit_eddy_viscosity", fit_eddy_viscosity, .true.)
+    call json_get_or_default(params, "scalar_closure", scalar_closure, &
+         "flux_least_squares")
     fit_scalar_diffusivity = trim(lower_string(scalar_closure)) .ne. 'off' .and. &
          trim(lower_string(scalar_closure)) .ne. 'none'
     call json_get_or_default(params, "debug", debug, .false.)
@@ -347,7 +350,12 @@ contains
     this%include_nut = .false.
     if (present(fit_eddy_viscosity)) this%include_nut = fit_eddy_viscosity
     this%include_gammat = .false.
-    if (present(fit_scalar_diffusivity)) this%include_gammat = fit_scalar_diffusivity
+    if (present(fit_scalar_diffusivity)) then
+       ! A scalar closure is applicable only when the case has an enabled
+       ! scalar. This keeps the fit-everything default safe for velocity-only
+       ! cases.
+       this%include_gammat = fit_scalar_diffusivity .and. this%include_scalar
+    end if
     this%n_flds = 3 + merge(1, 0, this%include_scalar) + &
          merge(1, 0, this%include_nut) + merge(1, 0, this%include_gammat)
 

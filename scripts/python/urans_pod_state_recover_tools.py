@@ -151,11 +151,11 @@ class PODConfig:
     include_scalar: bool
     debug: bool
     window_duration: float
-    closure_enabled: bool = False
+    closure_enabled: bool = True
     closure_regularisation: float = 1.0e-12
     closure_nut_max: float | None = None
     closure_field_scale: float = 1.0
-    scalar_closure: str = "off"
+    scalar_closure: str = "flux_least_squares"
     gammat_regularisation: float = 1.0e-12
     gammat_max: float | None = None
     gammat_field_scale: float = 1.0
@@ -188,7 +188,7 @@ class PODConfig:
 
     @property
     def scalar_closure_enabled(self) -> bool:
-        return self.scalar_closure != "off"
+        return self.include_scalar and self.scalar_closure != "off"
 
 
 @dataclass
@@ -263,7 +263,9 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
         include_scalar=include_scalar,
         debug=as_bool(state_recovery.get("debug")),
         window_duration=float(state_recovery["window_duration"]),
-        closure_enabled=as_bool(state_recovery.get("fit_eddy_viscosity")),
+        closure_enabled=as_bool(
+            state_recovery.get("fit_eddy_viscosity"), True
+        ),
         closure_regularisation=float(
             state_recovery.get("strain_regularisation", 1.0e-12)
         ),
@@ -272,7 +274,12 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
             if state_recovery.get("nut_max") is not None else None
         ),
         closure_field_scale=float(state_recovery.get("closure_field_scale", 1.0)),
-        scalar_closure=str(state_recovery.get("scalar_closure", "off")).lower(),
+        scalar_closure=str(
+            state_recovery.get(
+                "scalar_closure",
+                "flux_least_squares",
+            )
+        ).lower(),
         gammat_regularisation=float(
             state_recovery.get("gammat_regularisation", state_recovery.get("strain_regularisation", 1.0e-12))
         ),
@@ -295,8 +302,6 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
         raise ValueError("n_modes must be at least 1")
     if cfg.scalar_closure not in ("off", "flux_least_squares", "schmidt"):
         raise ValueError("scalar_closure must be off, flux_least_squares, or schmidt")
-    if cfg.scalar_closure_enabled and not cfg.include_scalar:
-        raise ValueError("scalar_closure requires an enabled scalar")
     if cfg.scalar_closure == "schmidt" and not cfg.closure_enabled:
         raise ValueError("scalar_closure=schmidt requires fit_eddy_viscosity")
     if cfg.turbulent_schmidt <= 0.0:
