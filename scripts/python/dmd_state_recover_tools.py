@@ -9,6 +9,21 @@ import re
 import numpy as np
 
 
+def rotate_existing_file(path: str) -> str | None:
+    """Archive an existing DMD output using the POD naming convention."""
+    if not os.path.exists(path):
+        return None
+
+    stem, ext = os.path.splitext(path)
+    index = 1
+    while True:
+        candidate = f"{stem}_{index:03d}{ext}"
+        if not os.path.exists(candidate):
+            os.rename(path, candidate)
+            return candidate
+        index += 1
+
+
 
 def as_bool(value, default: bool = False) -> bool:
     if value is None:
@@ -495,10 +510,23 @@ def evaluate_spectral_coefficients(spectral_data, times) -> np.ndarray:
 
 
 def write_spectral_data(
-    comm, spectral_data, eigenvalues, amplitudes, times
+    comm, spectral_data, eigenvalues, amplitudes, times, rotate_existing
 ) -> None:
     if comm.Get_rank() != 0:
         return
+
+    # Match the POD writer: when mode output is enabled, preserve each
+    # completed decomposition before writing the next one. Keep the spectrum,
+    # eigenvalue summary, and diagnostic dynamics from the same decomposition
+    # together.
+    if rotate_existing:
+        for path in (
+            "dmd_spectral.csv",
+            "dmd_eigenvalues.csv",
+            "dmd_modal_dynamics.csv",
+        ):
+            rotate_existing_file(path)
+
     header = "omega_real,omega_imag,amplitude_real,amplitude_imag,component"
     np.savetxt(
         "dmd_spectral.csv",

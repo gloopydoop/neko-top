@@ -117,7 +117,7 @@ module simulation_DMD_state_recover
      type(field_output_t) :: recon_output
      integer :: recon_output_precision = sp
      character(len=32) :: recon_output_format = 'fld'
-     character(len=80) :: recon_file_name = 'pod_reconstruction'
+     character(len=80) :: recon_file_name = 'dmd_reconstruction'
      character(len=16) :: recon_output_control = "never"
      real(kind=rp) :: recon_output_value = 0.0_rp
      real(kind=rp) :: recon_time_interval = 0.0_rp
@@ -187,7 +187,7 @@ contains
     recon_output_precision = mode_output_precision
     recon_output_precision_str = trim(mode_output_precision_str)
     recon_output_format = trim(mode_output_format)
-    recon_file_name = 'pod_reconstruction'
+    recon_file_name = 'dmd_reconstruction'
     output_control = 'never'
     output_value = 0.0_rp
 
@@ -211,7 +211,7 @@ contains
                recon_output_format)
        end if
        call json_get_or_default(params, 'reconstruction_output_file_name', &
-            recon_file_name, 'pod_reconstruction')
+            recon_file_name, 'dmd_reconstruction')
 
        call json_get_or_default(neko_case%params, 'case.fluid.output_control', &
             output_control, 'org')
@@ -290,7 +290,7 @@ contains
     this%recon_nsteps = 0
     this%recon_output_precision = sp
     this%recon_output_format = 'fld'
-    this%recon_file_name = 'pod_reconstruction'
+    this%recon_file_name = 'dmd_reconstruction'
     this%mode_output_precision = sp
     this%mode_output_format = 'fld'
     this%mode_file_name = 'DMD_modes'
@@ -481,7 +481,7 @@ contains
     this%mode_file_name = 'DMD_modes'
     this%recon_output_precision = sp
     this%recon_output_format = 'fld'
-    this%recon_file_name = 'pod_reconstruction'
+    this%recon_file_name = 'dmd_reconstruction'
     nullify(this%s)
     this%enabled = .false.
   end subroutine DMD_state_recover_free

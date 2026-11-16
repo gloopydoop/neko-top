@@ -6,7 +6,7 @@
         "output_at_end": false,
         "output_boundary": false,
         "time": {
-            "end_time": 0.1,
+            "end_time": 3.0,
             "timestep": 2.5e-3
         },
         "numerics": {
@@ -22,7 +22,7 @@
                 "value": [1.0, 0.1, 0.0]
             },
             "velocity_solver": {
-                "type": "coupled_cg",
+                "type": "cg",
                 "preconditioner": {
                     "type": "jacobi"
                 },
@@ -93,10 +93,10 @@
     "unsteady": true,
     "state_recovery": {
         "type": "dmd",
-        "batch_size": 4,
-        "n_modes": 4,
-        "dmd_rank": 4,
-        "i_stream": 2,
+        "batch_size": 10,
+        "n_modes": 10,
+        "dmd_rank": 5,
+        "i_stream": 10,
         "dtype": "double",
         "dmd_amplitude_regularization": 1.0e-12,
         "dmd_conjugate_tolerance": 1.0e-8,
@@ -131,7 +131,7 @@
         },
         "solver": {
             "type": "mma",
-            "max_iterations": 1,
+            "max_iterations": 100,
             "tolerance": 1.0e-12,
             "mma": {
                 "scale": 1.0,

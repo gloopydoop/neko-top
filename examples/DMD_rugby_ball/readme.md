@@ -16,6 +16,8 @@ Complex-conjugate DMD pairs are represented by paired real and imaginary modes.
 The `dmd_rank` value must not exceed `n_modes`; `n_modes` is the number of real
 mode fields sent back to Neko.
 
-The DMD spectrum is written to `dmd_eigenvalues.csv`. Dynamic coefficients are
-written to `dmd_time_coeffs.csv` and to the protocol file
-`pod_time_coeffs.csv` used by Neko reconstruction.
+The DMD spectrum is written to `dmd_spectral.csv`; the eigenvalue summary is
+written to `dmd_eigenvalues.csv`, and the evaluated modal dynamics are written
+to `dmd_modal_dynamics.csv`. Before each new decomposition, existing files are
+archived with the POD-style suffixes `_001`, `_002`, and so on. For example,
+`dmd_spectral_001.csv` is the first archived spectrum.

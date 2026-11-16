@@ -133,7 +133,12 @@ def main() -> None:
                     cfg,
                 )
                 write_spectral_data(
-                    comm, spectral_data, eigenvalues, amplitudes, x_times
+                    comm,
+                    spectral_data,
+                    eigenvalues,
+                    amplitudes,
+                    x_times,
+                    cfg.write_modes,
                 )
                 if rank == 0:
                     ctrl.send_cmd(MODE_ADJOINT, PHASE_ADJ_RUNNING)
