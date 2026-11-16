@@ -51,12 +51,14 @@ module simulation_URANS_POD_state_recover
   use logger, only : neko_log
   use comm, only: neko_comm, mpi_real_precision
   use mpi_f08, only: MPI_Allreduce, MPI_IN_PLACE, MPI_SUM
+  use gs_ops, only: GS_OP_ADD
 
   use neko_config, only: NEKO_BCKND_DEVICE
   use device, only: DEVICE_TO_HOST, device_memcpy, HOST_TO_DEVICE
   use utils, only: neko_error
   use vector, only: vector_t
   use field_math, only: field_add2s2, field_rzero
+  use math, only: col2
 
   use neko_ctrl_mod, only: ctrl_stream_t, &
        MODE_IDLE, MODE_FORWARD, MODE_ADJOINT, MODE_STOP, &
@@ -908,6 +910,23 @@ contains
        end if
        if (this%include_nut) call this%dstream%recieve(this%nut_modes(i)%x)
        if (this%include_gammat) call this%dstream%recieve(this%gammat_modes(i)%x)
+
+       ! Python keeps the POD modes element-local. Make every received mode
+       ! continuous on Neko's distributed GLL mesh: gather/scatter the values
+       ! over shared points, then apply Neko's inverse multiplicity field to
+       ! form the arithmetic average.
+       call URANS_POD_state_recover_average_mode(this, this%u_modes(i)%x)
+       call URANS_POD_state_recover_average_mode(this, this%v_modes(i)%x)
+       call URANS_POD_state_recover_average_mode(this, this%w_modes(i)%x)
+       if (this%include_scalar) then
+          call URANS_POD_state_recover_average_mode(this, this%s_modes(i)%x)
+       end if
+       if (this%include_nut) then
+          call URANS_POD_state_recover_average_mode(this, this%nut_modes(i)%x)
+       end if
+       if (this%include_gammat) then
+          call URANS_POD_state_recover_average_mode(this, this%gammat_modes(i)%x)
+       end if
     end do
 
     ! Move modes back to GPU
@@ -949,6 +968,18 @@ contains
     this%have_received_modes = .true.
     call profiler_end_region("POD receive modes")
   end subroutine URANS_POD_state_recover_receive_modes
+
+
+  !> Average an element-local mode over shared GLL points.
+  subroutine URANS_POD_state_recover_average_mode(this, x)
+    class(URANS_POD_state_recover_t), intent(inout) :: this
+    real(kind=rp), contiguous, intent(inout) :: x(:,:,:,:)
+    integer :: n
+
+    n = size(x)
+    call this%coef%gs_h%op(x, n, GS_OP_ADD)
+    call col2(x, this%coef%mult, n)
+  end subroutine URANS_POD_state_recover_average_mode
 
   logical function recon_should_output(this, time, time_out)
     class(URANS_POD_state_recover_t), intent(in) :: this

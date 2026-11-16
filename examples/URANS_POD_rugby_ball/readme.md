@@ -8,6 +8,12 @@ sends exactly one statistics record to Python at the end of that window.
 Python fits the closure fields from that record and submits one POD snapshot
 containing the window means plus the fitted closure fields.
 
+The Python side intentionally does not use pySEMTools mesh connectivity to
+enforce continuity. After the modes are transferred back, Neko gathers and
+scatters every velocity, scalar, and closure mode and applies its inverse
+multiplicity field, so shared GLL points are arithmetic-averaged before the
+modes are used by reconstruction or the adjoint.
+
 Run it through the repository root runner:
 
 ```bash

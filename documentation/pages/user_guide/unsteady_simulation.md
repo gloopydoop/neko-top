@@ -151,6 +151,13 @@ default, then
 passes one POD snapshot per window consisting of the mean fields and fitted
 closure fields.
 
+For `urans_pod`, Python leaves the snapshots and POD modes element-local; it
+does not use pySEMTools mesh connectivity for a continuity operation. On mode
+receipt, Neko performs a distributed gather-scatter and inverse-multiplicity
+average on every velocity, scalar, and closure mode before device transfer.
+Consequently, the modes used for reconstruction and the adjoint are continuous
+at shared GLL points.
+
 Both closure fits are enabled by default for `urans_pod`: omitting
 `fit_eddy_viscosity` defaults it to `true`, and omitting `scalar_closure`
 defaults it to `"flux_least_squares"` when the case contains a scalar. An
