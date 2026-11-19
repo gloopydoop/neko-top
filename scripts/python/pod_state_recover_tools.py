@@ -149,6 +149,7 @@ class PODConfig:
     mode_output_dtype: type
     mode_output_format: str
     mode_output_file_name: str
+    adjoint_mode_output_file_name: str
     include_scalar: bool
     debug: bool
     snapshot_dt: float
@@ -165,6 +166,14 @@ class PODConfig:
     gammat_max: float | None = None
     gammat_field_scale: float = 1.0
     turbulent_schmidt: float = 0.7
+    stream_adjoint: bool = False
+    adjoint_i_stream: int = 1
+    history_outer_iterations: int = 3
+    rank_forward: int | None = None
+    rank_adjoint: int | None = None
+    rank_total_max: int | None = None
+    scalar_metric_weight: float = 1.0
+    admissibility_projection: str = "velocity_inlet_xmin"
 
     @property
     def n_fields(self) -> int:
@@ -177,6 +186,21 @@ class PODConfig:
     @property
     def scalar_closure_enabled(self) -> bool:
         return self.scalar_closure != "off"
+
+    @property
+    def field_metric_weights(self) -> list[float]:
+        """Return the spatial-metric multiplier for every POD field.
+
+        Closure fields are diagnostic/enrichment fields in the existing POD
+        path and retain unit weight.  Only the physical passive scalar gets
+        the user-configured coupled-state weighting.
+        """
+
+        weights = [1.0, 1.0, 1.0]
+        if self.include_scalar:
+            weights.append(self.scalar_metric_weight)
+        weights.extend([1.0] * (self.n_fields - len(weights)))
+        return weights
 
 
 @dataclass
@@ -197,6 +221,9 @@ class EnergyState:
 def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
     case = load_case_config(case_path)
     state_recovery = case.get("state_recovery", {})
+    rom_cfg = case.get("rom", {})
+    if not isinstance(rom_cfg, dict):
+        rom_cfg = {}
     if not isinstance(state_recovery, dict):
         raise KeyError("case['state_recovery'] must be a dict")
 
@@ -234,6 +261,9 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
     mode_output_file_name = str(
         state_recovery.get("output_file_name", "POD_modes")
     ).strip()
+    adjoint_mode_output_file_name = str(
+        state_recovery.get("adjoint_output_file_name", "adjoint_POD_modes")
+    ).strip()
 
     i_stream = int(state_recovery["i_stream"])
     timestep = float(case["case"]["time"]["timestep"])
@@ -247,6 +277,7 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
         mode_output_dtype=mode_output_dtype,
         mode_output_format=mode_output_format,
         mode_output_file_name=mode_output_file_name,
+        adjoint_mode_output_file_name=adjoint_mode_output_file_name,
         include_scalar=include_scalar,
         debug=as_bool(state_recovery.get("debug")),
         snapshot_dt=timestep * i_stream,
@@ -277,6 +308,21 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
         ),
         gammat_field_scale=float(state_recovery.get("gammat_field_scale", 1.0)),
         turbulent_schmidt=float(state_recovery.get("turbulent_schmidt", 0.7)),
+        stream_adjoint=as_bool(state_recovery.get("stream_adjoint", rom_cfg.get("enabled", False))),
+        adjoint_i_stream=max(1, int(state_recovery.get("adjoint_i_stream", 1))),
+        history_outer_iterations=max(1, int(state_recovery.get("history_outer_iterations", rom_cfg.get("history_outer_iterations", 3)))),
+        rank_forward=(int(state_recovery.get("rank_forward", rom_cfg.get("rank_forward"))) if state_recovery.get("rank_forward", rom_cfg.get("rank_forward")) is not None else None),
+        rank_adjoint=(int(state_recovery.get("rank_adjoint", rom_cfg.get("rank_adjoint"))) if state_recovery.get("rank_adjoint", rom_cfg.get("rank_adjoint")) is not None else None),
+        rank_total_max=(int(state_recovery.get("rank_total_max", rom_cfg.get("rank_total_max"))) if state_recovery.get("rank_total_max", rom_cfg.get("rank_total_max")) is not None else None),
+        scalar_metric_weight=float(state_recovery.get("scalar_metric_weight", rom_cfg.get("scalar_metric_weight", 1.0))),
+        admissibility_projection=str(
+            rom_cfg.get(
+                "admissibility_projection",
+                state_recovery.get(
+                    "admissibility_projection", "velocity_inlet_xmin"
+                ),
+            )
+        ).lower(),
     )
     if cfg.input_mode not in ("instantaneous", "windowed_statistics"):
         raise ValueError("input_mode must be instantaneous or windowed_statistics")
@@ -292,8 +338,22 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
         raise ValueError("scalar_closure=schmidt requires fit_eddy_viscosity")
     if cfg.turbulent_schmidt <= 0.0:
         raise ValueError("turbulent_schmidt must be positive")
+    if cfg.scalar_metric_weight <= 0.0:
+        raise ValueError("scalar_metric_weight must be positive")
     if cfg.input_mode == "windowed_statistics" and cfg.window_duration <= 0.0:
         raise ValueError("window_duration must be positive for windowed_statistics")
+    for name, value in (
+        ("rank_forward", cfg.rank_forward),
+        ("rank_adjoint", cfg.rank_adjoint),
+        ("rank_total_max", cfg.rank_total_max),
+    ):
+        if value is not None and value <= 0:
+            raise ValueError(f"{name} must be positive when configured")
+        if name != "rank_total_max" and value is not None and value > cfg.keep_modes:
+            raise ValueError(
+                f"{name}={value} exceeds state_recovery.n_modes={cfg.keep_modes}; "
+                "increase n_modes so the requested compact factor is available"
+            )
     return case, cfg
 
 
@@ -437,10 +497,36 @@ def make_pod(
         field_data_type=cfg.dtype,
         mass_matrix_data_type=cfg.dtype,
     )
-    mass_fields = [np.copy(np.sqrt(bm)) for _ in range(cfg.n_fields)]
+    mass_fields = [np.copy(np.sqrt(weight * bm))
+                   for weight in cfg.field_metric_weights]
     ioh.copy_fieldlist_to_xi(mass_fields)
     ioh.bm1sqrt[:, :] = np.copy(ioh.xi[:, :])
     return pod, ioh
+
+
+def make_admissibility_projector(mesh: Mesh, bm: np.ndarray, cfg: PODConfig):
+    """Return the physical admissibility handoff for the common basis.
+
+    The streamed snapshots are the Neko physical velocity fields with the
+    shared ROM spatial lift already subtracted in the Fortran state-recovery
+    path.  They are not altered in Python: boundary and discrete
+    incompressibility admissibility are checked using Neko's native constraints
+    after basis transfer.
+    """
+
+    if cfg.admissibility_projection != "velocity_inlet_xmin":
+        raise RuntimeError(
+            "unsupported ROM admissibility_projection; expected "
+            "velocity_inlet_xmin"
+        )
+
+    def project(vector: np.ndarray) -> np.ndarray:
+        values = np.asarray(vector, dtype=np.float64)
+        if values.ndim != 1 or values.size == 0:
+            raise RuntimeError("ROM projector received an invalid local vector")
+        return values.copy()
+
+    return project
 
 
 def flush_buffer(comm: MPI.Comm, pod: POD, ioh: IoHelp) -> None:
@@ -527,17 +613,18 @@ def write_time_coefficients(
     data: np.ndarray,
     header: str,
     rotate_existing: bool,
+    file_name: str = "pod_time_coeffs.csv",
 ) -> None:
     if comm.Get_rank() != 0:
         return
 
     if rotate_existing:
-        rotated = rotate_existing_file("pod_time_coeffs.csv")
+        rotated = rotate_existing_file(file_name)
         if rotated:
-            log(comm, f"archived pod_time_coeffs.csv -> {rotated}")
+            log(comm, f"archived {file_name} -> {rotated}")
 
     np.savetxt(
-        "pod_time_coeffs.csv",
+        file_name,
         data,
         delimiter=",",
         header=header,
@@ -585,22 +672,25 @@ def write_singular_values(
     keep_modes: int,
     iteration: int,
     rotate_existing: bool,
+    file_name: str = "pod_singular_values.csv",
 ) -> None:
     if comm.Get_rank() != 0:
         return
 
-    path = "pod_singular_values.csv"
+    path = file_name
+    write_header = not os.path.exists(path)
     if rotate_existing:
         rotated = rotate_existing_file(path)
         if rotated:
             log(comm, f"archived {path} -> {rotated}")
+        write_header = True
 
-    mode = "w" if rotate_existing else "a"
+    mode = "w" if rotate_existing or write_header else "a"
     row = singular_value_row(pod, keep_modes, iteration)
     fmt = ["%d", "%.18e"] + ["%.18e"] * keep_modes
 
     with open(path, mode, encoding="utf-8") as handle:
-        if rotate_existing:
+        if rotate_existing or write_header:
             handle.write(singular_value_header(keep_modes) + "\n")
         np.savetxt(
             handle,
@@ -700,10 +790,8 @@ def fld_mode_field_names(n_total: int, closure_enabled: bool = False,
         return ["p", "t"]
     if n_total == 3:
         return ["u", "v", "w"]
-    if closure_enabled or scalar_closure_enabled:
-        n_per_mode = 3 + int(include_scalar) + int(closure_enabled) + int(scalar_closure_enabled)
-        if n_total % n_per_mode:
-            raise ValueError("closure POD field count is not mode-aligned")
+    n_per_mode = 3 + int(include_scalar) + int(closure_enabled) + int(scalar_closure_enabled)
+    if n_total > n_per_mode and n_total % n_per_mode == 0:
         n_modes = n_total // n_per_mode
         names = []
         for mode_idx in range(n_modes):

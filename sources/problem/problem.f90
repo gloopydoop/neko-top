@@ -628,6 +628,25 @@ contains
        ! step the adjoint backwards
        call simulation_adjoint_step(simulation%adjoint_case, dt_controller, &
             cfl, loop_start, total_time)
+       ! Optional ROM stream hook.  The default state-recovery implementation
+       ! is a no-op, so legacy checkpoint/DMD/POD runs are unchanged.  This
+       ! belongs here because problem_t owns the unsteady adjoint loop.
+       if (allocated(simulation%state_recover)) then
+          if (allocated(simulation%adjoint_case%adjoint_scalars)) then
+             call simulation%state_recover%save_adjoint( &
+                  simulation%adjoint_fluid%u_adj, &
+                  simulation%adjoint_fluid%v_adj, &
+                  simulation%adjoint_fluid%w_adj, &
+                  simulation%adjoint_scalars%adjoint_scalar_fields(1)%s_adj, &
+                  simulation%adjoint_case%time%t)
+          else
+             call simulation%state_recover%save_adjoint( &
+                  simulation%adjoint_fluid%u_adj, &
+                  simulation%adjoint_fluid%v_adj, &
+                  simulation%adjoint_fluid%w_adj, &
+                  time_value = simulation%adjoint_case%time%t)
+          end if
+       end if
     end do
 
     ! Leave every forcing scale at one, as the steady path assumes

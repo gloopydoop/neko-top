@@ -37,7 +37,7 @@ module simulation_POD_state_recover
   use num_types, only: rp, sp, dp
   use case, only: case_t
   use json_file_module, only: json_file
-  use json_utils, only: json_get, json_get_or_default
+  use json_utils, only: json_get, json_get_or_default, json_get_or_lookup
   use field, only: field_t
   use registry, only: neko_registry
   use file, only: file_t
@@ -56,12 +56,13 @@ module simulation_POD_state_recover
   use device, only: DEVICE_TO_HOST, device_memcpy, HOST_TO_DEVICE
   use utils, only: neko_error
   use vector, only: vector_t
-  use field_math, only: field_add2s2, field_rzero
+  use field_math, only: field_add2s2, field_rzero, field_cfill, field_copy
+  use rom_lift, only: rom_lift_t
 
   use neko_ctrl_mod, only: ctrl_stream_t, &
        MODE_IDLE, MODE_FORWARD, MODE_ADJOINT, MODE_STOP, &
        PHASE_INIT, PHASE_FWD_RUNNING, PHASE_FWD_DONE, &
-       PHASE_ADJ_RUNNING, PHASE_ADJ_DONE
+       PHASE_ADJ_RUNNING, PHASE_ADJ_DONE, PHASE_ADJ_SNAPSHOT
   use, intrinsic :: iso_fortran_env, only: int32, real64
 
   implicit none
@@ -89,9 +90,14 @@ module simulation_POD_state_recover
      integer :: n_modes
      integer :: n_flds = 3
      integer :: pod_tstep = 0
+     integer :: adjoint_tstep = 0
+     integer :: adjoint_i_stream = 1
+     logical :: stream_adjoint = .false.
      logical :: include_scalar = .false.
      logical :: include_nut = .false.
      logical :: include_gammat = .false.
+     real(kind=rp) :: forward_lift(3) = 0.0_rp
+     type(rom_lift_t) :: rom_lift
      character(len=16) :: dtype = "double"
      type(coef_t), pointer :: coef => null()
 
@@ -143,9 +149,28 @@ module simulation_POD_state_recover
      procedure, public, pass(this) :: reset => POD_state_recover_reset
      procedure, public, pass(this) :: save => POD_state_recover_save
      procedure, public, pass(this) :: restore => POD_state_recover_restore
+     procedure, public, pass(this) :: save_adjoint => POD_state_recover_save_adjoint
+     procedure, public, pass(this) :: receive_rom_basis_header => &
+          POD_state_recover_receive_rom_basis_header
+     procedure, public, pass(this) :: receive_rom_basis_field => &
+          POD_state_recover_receive_rom_basis_field
   end type POD_state_recover_t
 
 contains
+
+  subroutine POD_state_recover_receive_rom_basis_header(this, n_modes, n_fields)
+    class(POD_state_recover_t), intent(inout) :: this
+    integer, intent(out) :: n_modes, n_fields
+
+    call this%ctrl%receive_basis_header(n_modes, n_fields)
+  end subroutine POD_state_recover_receive_rom_basis_header
+
+  subroutine POD_state_recover_receive_rom_basis_field(this, field)
+    class(POD_state_recover_t), intent(inout) :: this
+    real(kind=rp), intent(inout) :: field(:,:,:,:)
+
+    call this%dstream%recieve(field)
+  end subroutine POD_state_recover_receive_rom_basis_field
 
   !> Initialize POD state recovery from JSON parameters.
   !! @param[inout] this POD state recovery instance.
@@ -170,9 +195,12 @@ contains
     character(len=:), allocatable :: recon_file_name
     integer :: mode_output_precision
     integer :: recon_output_precision
+    integer :: adjoint_i_stream
+    logical :: stream_adjoint
     logical :: fit_eddy_viscosity
     logical :: fit_scalar_diffusivity
     character(len=:), allocatable :: scalar_closure
+    real(kind=rp), allocatable :: forward_lift(:)
 
     call json_get(params, "i_stream", i_stream)
     call json_get(params, "n_modes", n_modes)
@@ -183,6 +211,17 @@ contains
     fit_scalar_diffusivity = trim(lower_string(scalar_closure)) .ne. 'off' .and. &
          trim(lower_string(scalar_closure)) .ne. 'none'
     call json_get_or_default(params, "debug", debug, .false.)
+    call json_get_or_default(params, "stream_adjoint", stream_adjoint, .false.)
+    if ('forward_lift' .in. params) then
+       call json_get_or_lookup(params, 'forward_lift', forward_lift)
+       if (size(forward_lift) .ne. 3) then
+          call neko_error('state_recovery.forward_lift must have size 3')
+       end if
+       this%forward_lift = forward_lift
+    else
+       this%forward_lift = 0.0_rp
+    end if
+    call json_get_or_default(params, "adjoint_i_stream", adjoint_i_stream, 1)
     call json_get_or_default(params, "output_reconstruction", &
          output_reconstruction, .false.)
     call json_get_or_default(params, "output_precision", &
@@ -247,6 +286,8 @@ contains
          mode_output_format, mode_file_name, recon_output_precision, &
          recon_output_format, recon_file_name, fit_eddy_viscosity, &
          fit_scalar_diffusivity)
+    this%stream_adjoint = stream_adjoint
+    this%adjoint_i_stream = max(1, adjoint_i_stream)
   end subroutine POD_state_recover_init_from_json
 
 
@@ -312,7 +353,13 @@ contains
     this%mode_file_name = 'POD_modes'
     this%n_flds = 3
     this%pod_tstep = 0
+    this%adjoint_tstep = 0
     this%coef => neko_case%fluid%c_Xh
+
+    ! ROM cases use the spatial lift built from the initial/reference velocity
+    ! and the native velocity BC list.  It is initialised before the initial
+    ! snapshot is streamed so every POD snapshot follows the same convention.
+    call this%rom_lift%init(neko_case)
 
     this%include_scalar = allocated(neko_case%scalars)
     this%include_nut = .false.
@@ -517,6 +564,7 @@ contains
     end if
 
     call this%recon_output%free()
+    call this%rom_lift%free()
     call this%dstream%free()
     call this%csv_reader%free()
     call this%a_interp%free()
@@ -529,6 +577,7 @@ contains
     this%include_nut = .false.
     this%include_gammat = .false.
     this%pod_tstep = 0
+    this%adjoint_tstep = 0
     this%mode_output_precision = sp
     this%mode_output_format = 'fld'
     this%mode_file_name = 'POD_modes'
@@ -560,6 +609,7 @@ contains
     this%adjoint_started = .false.
     this%adj_running_sent = .false.
     this%pod_tstep = 0
+    this%adjoint_tstep = 0
 
     call this%set_n_timesteps(0)
 
@@ -595,9 +645,13 @@ contains
        end if
     end if
 
-    call this%dstream%stream(u%x)
-    call this%dstream%stream(v%x)
-    call this%dstream%stream(w%x)
+    if (this%rom_lift%enabled) then
+       call this%rom_lift%stream_homogeneous(this%dstream, u, v, w)
+    else
+       call this%dstream%stream(u%x)
+       call this%dstream%stream(v%x)
+       call this%dstream%stream(w%x)
+    end if
     if (this%include_scalar) call this%dstream%stream(s%x)
   end subroutine POD_state_recover_stream_fields
 
@@ -635,6 +689,49 @@ contains
 
     call profiler_end_region("POD save")
   end subroutine POD_state_recover_save
+
+  !> Stream a physical adjoint snapshot without retaining the trajectory.
+  !! The Python peer receives PHASE_ADJ_SNAPSHOT and maintains a separate
+  !! incremental POD.  This hook is opt-in and therefore harmless for all
+  !! existing POD cases.
+  subroutine POD_state_recover_save_adjoint(this, u, v, w, scalar, time_value)
+    class(POD_state_recover_t), intent(inout) :: this
+    type(field_t), intent(inout), target :: u, v, w
+    type(field_t), intent(inout), optional, target :: scalar
+    real(kind=rp), intent(in) :: time_value
+    integer :: n
+    type(field_t), pointer :: up, vp, wp, sp
+
+    up => u
+    vp => v
+    wp => w
+    ! Associate the optional scalar on both host and accelerator paths.  The
+    ! old code only associated it inside the device branch.
+    if (present(scalar)) sp => scalar
+
+    if (.not. this%enabled .or. .not. this%stream_adjoint) return
+    this%adjoint_tstep = this%adjoint_tstep + 1
+    if (mod(this%adjoint_tstep, this%adjoint_i_stream) .ne. 0) return
+
+    if (this%ctrl%inited) then
+       call this%ctrl%send(MODE_ADJOINT, PHASE_ADJ_SNAPSHOT, &
+            int(this%adjoint_tstep, int32), real(time_value, real64))
+    end if
+
+    n = up%dof%size()
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call device_memcpy(up%x, up%x_d, n, DEVICE_TO_HOST, sync = .true.)
+       call device_memcpy(vp%x, vp%x_d, n, DEVICE_TO_HOST, sync = .true.)
+       call device_memcpy(wp%x, wp%x_d, n, DEVICE_TO_HOST, sync = .true.)
+       if (present(scalar)) then
+          call device_memcpy(sp%x, sp%x_d, n, DEVICE_TO_HOST, sync = .true.)
+       end if
+    end if
+    call this%dstream%stream(up%x)
+    call this%dstream%stream(vp%x)
+    call this%dstream%stream(wp%x)
+    if (present(scalar)) call this%dstream%stream(sp%x)
+  end subroutine POD_state_recover_save_adjoint
 
 
   !> Reconstruct and restore state from POD during adjoint.
@@ -938,9 +1035,19 @@ contains
        this%gammat => neko_registry%get_field('adjoint_gammat')
     end if
 
-    call field_rzero(u)
-    call field_rzero(v)
-    call field_rzero(w)
+    ! The streamed forward POD represents the homogeneous state q-q_L.
+    ! Restore the same spatial lift used by the streamer before handing the
+    ! state back to Neko.  The scalar fallback remains for non-ROM legacy POD
+    ! cases that still configure state_recovery.forward_lift.
+    if (this%rom_lift%enabled) then
+       call field_copy(u, this%rom_lift%velocity(1))
+       call field_copy(v, this%rom_lift%velocity(2))
+       call field_copy(w, this%rom_lift%velocity(3))
+    else
+       call field_cfill(u, this%forward_lift(1))
+       call field_cfill(v, this%forward_lift(2))
+       call field_cfill(w, this%forward_lift(3))
+    end if
     if (this%include_scalar) call field_rzero(s)
     if (this%include_nut) call field_rzero(this%nut)
     if (this%include_gammat) call field_rzero(this%gammat)

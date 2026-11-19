@@ -69,6 +69,7 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/mma)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/design)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/optimizer)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/IO)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/rom)
 
 target_sources(neko-top
     PRIVATE

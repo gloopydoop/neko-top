@@ -83,6 +83,15 @@ contains
        call neko_error("POD state recovery requires ADIOS2. Rebuild with " // &
             "ADIOS2 enabled.")
 #endif
+    case ("rom")
+#if HAVE_ADIOS2
+       ! ROM uses the same bounded Neko/ADIOS2 state transport as POD.  The
+       ! Python peer performs the recycled adjoint-enriched Galerkin work.
+       allocate(POD_state_recover_t :: recover)
+#else
+       call neko_error("ROM state recovery requires ADIOS2. Rebuild with " // &
+            "ADIOS2 enabled.")
+#endif
     case ("urans_pod")
 #if HAVE_ADIOS2
        allocate(URANS_POD_state_recover_t :: recover)

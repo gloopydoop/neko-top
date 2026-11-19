@@ -113,7 +113,7 @@ module simulation_m
      ! State recovery system
 
      !> The state recovery system data
-     class(state_recover_t), allocatable :: state_recover
+     class(state_recover_t), allocatable, public :: state_recover
 
    contains
      !> Initialize the simulation

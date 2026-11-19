@@ -180,7 +180,6 @@ contains
     call this%design_output%init(trim(this%forward_file_name), n_fields, &
          precision = this%output_precision, &
          format = trim(this%output_format))
-
     if (this%verbose_design) then
        do i = 1, n_mappings
           call this%design_output%fields%assign_to_field(i, &

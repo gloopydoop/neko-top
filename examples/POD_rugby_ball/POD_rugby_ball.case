@@ -161,7 +161,9 @@
             {
                 "type": "brinkman_dissipation",
                 "mask_name": "optimization_domain",
-                "weight": 1.0
+                "weight": 1.0,
+                "dealias_sensitivity": false,
+                "dealias_forcing": false
             }
         ],
         "constraints": [

@@ -9,6 +9,7 @@ target_sources(neko-top
         ${CMAKE_CURRENT_SOURCE_DIR}/optimizer.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/optimizer_factory.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/mma_optimizer.f90
+        ${CMAKE_CURRENT_SOURCE_DIR}/rom_optimizer.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/steepest_descent_optimizer.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/steepest_descent_math.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/bcknd/device_steepest_descent.f90

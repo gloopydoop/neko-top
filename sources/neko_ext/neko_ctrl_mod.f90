@@ -70,10 +70,13 @@ module neko_ctrl_mod
   integer(int32), public, parameter :: PHASE_FWD_DONE = 11_int32
   integer(int32), public, parameter :: PHASE_ADJ_RUNNING = 20_int32
   integer(int32), public, parameter :: PHASE_ADJ_DONE = 21_int32
+  ! Optional physical-adjoint snapshot streamed after each backward step.
+  integer(int32), public, parameter :: PHASE_ADJ_SNAPSHOT = 22_int32
 
   integer, parameter :: CTRL_TAG_STATE_INT = 4101
   integer, parameter :: CTRL_TAG_STATE_REAL = 4102
   integer, parameter :: CTRL_TAG_CMD = 4103
+  integer, parameter :: CTRL_TAG_BASIS_HEADER = 4104
 
   !> Lightweight control channel for coordinating POD streaming phases.
   type, public :: ctrl_stream_t
@@ -85,6 +88,8 @@ module neko_ctrl_mod
      procedure, pass(this) :: free => ctrl_stream_free
      procedure, pass(this) :: send => ctrl_stream_send
      procedure, pass(this) :: receive => ctrl_stream_receive
+     procedure, pass(this) :: receive_basis_header => &
+          ctrl_stream_receive_basis_header
   end type ctrl_stream_t
 
 contains
@@ -136,6 +141,8 @@ contains
        nm = 'ADJ_RUNNING'
     case (PHASE_ADJ_DONE)
        nm = 'ADJ_DONE'
+    case (PHASE_ADJ_SNAPSHOT)
+       nm = 'ADJ_SNAPSHOT'
     case default
        nm = 'UNKNOWN'
     end select
@@ -252,5 +259,33 @@ contains
          trim(mode_name(mode_cmd)), ' phase:', trim(phase_name(phase_cmd))
     call ctrl_dbg_print(this, msg)
   end subroutine ctrl_stream_receive
+
+  !> Receive the dimensions of the next ROM basis and broadcast them locally.
+  !! The basis payload itself travels through the ADIOS2 reverse stream; this
+  !! small control message only tells Neko how many streamed fields to read.
+  subroutine ctrl_stream_receive_basis_header(this, n_modes, n_fields)
+    class(ctrl_stream_t), intent(inout) :: this
+    integer, intent(out) :: n_modes, n_fields
+    integer(int32) :: header(2)
+    integer :: ierr, rank
+
+    if (.not. this%inited) then
+       n_modes = 0
+       n_fields = 0
+       return
+    end if
+
+    call MPI_Comm_rank(neko_comm, rank, ierr)
+    if (rank == 0) then
+       call MPI_Recv(header, size(header), MPI_INTEGER4, this%peer_root, &
+            CTRL_TAG_BASIS_HEADER, MPI_COMM_WORLD, MPI_STATUS_IGNORE, ierr)
+    else
+       header = 0_int32
+    end if
+    call MPI_Bcast(header, size(header), MPI_INTEGER4, 0, neko_comm, ierr)
+
+    n_modes = int(header(1))
+    n_fields = int(header(2))
+  end subroutine ctrl_stream_receive_basis_header
 
 end module neko_ctrl_mod

@@ -46,7 +46,9 @@
 !! is already allocated.
 module state_recover
   use case, only: case_t
+  use field, only: field_t
   use json_file_module, only: json_file
+  use num_types, only: rp
   implicit none
   private
 
@@ -63,6 +65,15 @@ module state_recover
      procedure(state_recover_reset), pass(this), public, deferred :: reset
      procedure(state_recover_save), pass(this), public, deferred :: save
      procedure(state_recover_restore), pass(this), public, deferred :: restore
+     ! Optional hook for bounded streaming of the physical adjoint.  The
+     ! default is a no-op so checkpoint, DMD, and legacy POD recovery retain
+     ! their existing behavior.
+     procedure, pass(this), public :: save_adjoint => state_recover_save_adjoint
+     ! Optional reverse-stream hook for a reduced basis header/payload.
+     procedure, pass(this), public :: receive_rom_basis_header => &
+          state_recover_receive_rom_basis_header
+     procedure, pass(this), public :: receive_rom_basis_field => &
+          state_recover_receive_rom_basis_field
      procedure, pass(this), public :: get_n_timesteps => &
           state_recover_get_n_timesteps
      procedure, pass(this), public :: set_n_timesteps => &
@@ -124,6 +135,30 @@ module state_recover
   public :: state_recover_factory
 
 contains
+
+  subroutine state_recover_save_adjoint(this, u, v, w, scalar, time_value)
+    class(state_recover_t), intent(inout) :: this
+    type(field_t), intent(inout), target :: u, v, w
+    type(field_t), intent(inout), optional, target :: scalar
+    real(kind=rp), intent(in) :: time_value
+    ! Deliberately unused in the default recovery implementation.
+  end subroutine state_recover_save_adjoint
+
+  !> Default ROM-basis header hook for recovery strategies without a ROM peer.
+  subroutine state_recover_receive_rom_basis_header(this, n_modes, n_fields)
+    class(state_recover_t), intent(inout) :: this
+    integer, intent(out) :: n_modes, n_fields
+
+    n_modes = 0
+    n_fields = 0
+  end subroutine state_recover_receive_rom_basis_header
+
+  !> Default ROM-basis payload hook for recovery strategies without a ROM peer.
+  subroutine state_recover_receive_rom_basis_field(this, field)
+    class(state_recover_t), intent(inout) :: this
+    real(kind=rp), intent(inout) :: field(:,:,:,:)
+
+  end subroutine state_recover_receive_rom_basis_field
 
   !> Get the number of states recorded by this recovery strategy.
   !! @param[in] this State recovery instance.

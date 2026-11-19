@@ -142,6 +142,9 @@ module optimizer
 
      !> Run the optimization loop
      procedure, pass(this), public :: run => optimizer_run
+     !> Get the configured design-change stopping threshold
+     procedure, pass(this), public :: get_stop_design_change => &
+          optimizer_get_stop_design_change
 
      ! ----------------------------------------------------------------------- !
      ! Private procedures
@@ -162,6 +165,11 @@ module optimizer
      procedure, pass(this) :: init_log => optimizer_init_log
      !> Write optimization log entry
      procedure, pass(this) :: write_log => optimizer_write_log
+     !> Write a log entry from explicitly supplied objective/constraint values.
+     !! This is used by staged optimizers whose inner model is not evaluated
+     !! by the full-order problem object.
+     procedure, pass(this), public :: write_log_values => &
+          optimizer_write_log_values
   end type optimizer_t
 
   ! -------------------------------------------------------------------------- !
@@ -575,6 +583,14 @@ contains
     iteration = this%current_iteration
   end function optimizer_get_iteration
 
+  !> Get the configured design-change stopping threshold.
+  pure function optimizer_get_stop_design_change(this) result(threshold)
+    class(optimizer_t), intent(in) :: this
+    real(kind=rp) :: threshold
+
+    threshold = this%stop_design_change
+  end function optimizer_get_stop_design_change
+
   !> Print status message
   !! Supported flags:
   !! 0: Converged successfully                       (SUCCESS)
@@ -780,6 +796,63 @@ contains
     call this%log_file%write(this%log_data)
 
   end subroutine optimizer_write_log
+
+  !> Write a log entry using explicitly supplied problem values.
+  !! @param[inout] this The optimizer object.
+  !! @param[in] iter Display iteration number.
+  !! @param[in] problem Problem supplying log dimensions and headers.
+  !! @param[in] values Problem values in get_log_values order.
+  !! @param[in] extra_values Optimizer-specific values.
+  subroutine optimizer_write_log_values(this, iter, problem, values, &
+       extra_values)
+    class(optimizer_t), intent(inout) :: this
+    integer, intent(in) :: iter
+    class(problem_t), intent(in) :: problem
+    real(kind=rp), intent(in) :: values(:)
+    real(kind=rp), intent(in), optional :: extra_values(:)
+    integer :: base_size, offset, n_cont, i
+
+    if (.not. this%log_initialized) return
+
+    if (this%current_iteration .eq. 0) then
+       call this%log_file%set_overwrite(.true.)
+       this%log_file%header_is_written = .false.
+    else
+       call this%log_file%set_overwrite(.false.)
+       this%log_file%header_is_written = .true.
+    end if
+
+    n_cont = nekotop_continuation%get_n_params()
+    base_size = problem%get_log_size(this%log_include_constraints)
+    if (size(values) .ne. base_size) then
+       call neko_error('optimizer log value size does not match the problem')
+    end if
+    this%log_data%x(1) = real(iter, kind=rp)
+    this%log_data%x(2:1 + base_size) = values
+
+    offset = 2 + base_size
+    if (present(extra_values)) then
+       if (this%log_extra_size .ne. size(extra_values)) then
+          call neko_error('optimizer log extra value size mismatch')
+       end if
+       this%log_data%x(offset:offset + size(extra_values) - 1) = &
+            extra_values
+    else if (this%log_extra_size .ne. 0) then
+       call neko_error('optimizer log extras are required by the header')
+    end if
+
+    offset = offset + this%log_extra_size
+    this%log_data%x(offset) = this%max_design_change
+    this%log_data%x(offset + 1) = this%norm2_design_change
+
+    offset = offset + 2
+    do i = 1, n_cont
+       this%log_data%x(offset + i - 1) = &
+            nekotop_continuation%params(i)%target
+    end do
+
+    call this%log_file%write(this%log_data)
+  end subroutine optimizer_write_log_values
 
   ! ========================================================================== !
   ! IO Functions

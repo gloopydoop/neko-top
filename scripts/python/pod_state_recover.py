@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import json
+from dataclasses import replace
 
 import numpy as np
 from mpi4py import MPI
@@ -21,6 +22,7 @@ from neko_communicator import MODE_FORWARD
 from neko_communicator import MODE_STOP
 from neko_communicator import PHASE_ADJ_DONE
 from neko_communicator import PHASE_ADJ_RUNNING
+from neko_communicator import PHASE_ADJ_SNAPSHOT
 from neko_communicator import PHASE_FWD_DONE
 from neko_communicator import PHASE_FWD_RUNNING
 from neko_communicator import get_peer_root
@@ -28,10 +30,12 @@ from neko_communicator import make_local_comm
 from pod_state_recover_tools import EnergyState
 from pod_state_recover_tools import PODConfig
 from pod_state_recover_tools import add_snapshot
+from pod_state_recover_tools import available_modes
 from pod_state_recover_tools import build_time_coefficients
 from pod_state_recover_tools import flush_buffer
 from pod_state_recover_tools import load_pod_config
 from pod_state_recover_tools import make_pod
+from pod_state_recover_tools import make_admissibility_projector
 from pod_state_recover_tools import recv_field
 from pod_state_recover_tools import recv_fields
 from pod_state_recover_tools import report_energy_capture
@@ -42,6 +46,45 @@ from pod_state_recover_tools import write_singular_values
 from pod_state_recover_tools import write_time_coefficients
 from pod_state_recover_tools import WindowStatistics
 from statistical_closure import fit_boussinesq_nut, fit_scalar_gammat
+from recycled_pod_tools import (
+    append_factor_history,
+    common_basis_distributed,
+    factors_from_pod,
+    recycle_distributed,
+)
+
+
+def stream_rom_basis(comm, ds, ctrl, common_basis, bm, cfg) -> None:
+    """Stream the local common basis over the reverse ADIOS2 connection."""
+
+    rank = comm.Get_rank()
+    modes = np.asarray(common_basis.modes)
+    field_size = np.asarray(bm).size
+    expected_rows = cfg.n_input_fields * field_size
+    if modes.ndim != 2 or modes.shape[0] != expected_rows:
+        raise RuntimeError(
+            "ROM basis rows do not match the streamed local input fields: "
+            f"got {modes.shape[0] if modes.ndim == 2 else modes.ndim}, "
+            f"expected {expected_rows}"
+        )
+
+    n_modes = int(modes.shape[1])
+    n_fields = int(cfg.n_input_fields)
+    comm.Barrier()
+    if rank == 0:
+        ctrl.send_basis_header(n_modes, n_fields)
+    comm.Barrier()
+
+    for mode_index in range(n_modes):
+        for field_index in range(n_fields):
+            first = field_index * field_size
+            last = (field_index + 1) * field_size
+            field = np.ascontiguousarray(
+                modes[first:last, mode_index], dtype=cfg.dtype
+            )
+            ds.stream(field)
+
+    comm.Barrier()
 
 
 def init_runtime(
@@ -91,7 +134,9 @@ def main() -> None:
     bm = coef.B
     times = []
     energy = EnergyState()
-    add_snapshot(comm, pod, ioh, bm, initial_fields, 0.0, times, energy)
+    add_snapshot(
+        comm, pod, ioh, bm, initial_fields, 0.0, times, energy,
+    )
     window_stats = None
     if cfg.input_mode == "windowed_statistics":
         # The initial condition is not a statistical sample.  Window means are
@@ -106,8 +151,22 @@ def main() -> None:
             cfg.keep_partial_window,
         )
     mode_output_index = 0
+    adjoint_mode_output_index = 0
     pod_iteration = 0
     singular_value_history_new = True
+    adjoint_pod = None
+    adjoint_ioh = None
+    adjoint_times = []
+    adjoint_energy = EnergyState()
+    adjoint_cfg = replace(
+        cfg,
+        closure_enabled=False,
+        scalar_closure="off",
+        keep_modes=cfg.rank_adjoint or cfg.keep_modes,
+        mode_output_file_name=cfg.adjoint_mode_output_file_name,
+    )
+    forward_history = []
+    adjoint_history = []
 
     ctrl = None
     if rank == 0:
@@ -133,7 +192,9 @@ def main() -> None:
             if mode == MODE_FORWARD and phase == PHASE_FWD_RUNNING:
                 fields = recv_fields(ds, cfg.n_input_fields, cfg.dtype)
                 if window_stats is None:
-                    add_snapshot(comm, pod, ioh, bm, fields, tcur, times, energy)
+                    add_snapshot(
+                        comm, pod, ioh, bm, fields, tcur, times, energy,
+                    )
                 else:
                     window_stats.add(fields, tcur)
                 continue
@@ -242,7 +303,7 @@ def main() -> None:
                             pod_fields.append(gammat * cfg.gammat_field_scale)
                             scalar_closure_rows.append((item["center"], gammat_diag))
                         add_snapshot(
-                            comm, pod, ioh, bm, pod_fields, item["center"], times, energy
+                            comm, pod, ioh, bm, pod_fields, item["center"], times, energy,
                         )
                     if rank == 0:
                         print(
@@ -312,14 +373,129 @@ def main() -> None:
                     n_avail,
                     mode_output_index,
                 )
+                if cfg.stream_adjoint:
+                    adjoint_pod, adjoint_ioh = make_pod(comm, bm, adjoint_cfg)
+                    adjoint_times = []
+                    adjoint_energy = EnergyState()
+                continue
+
+            if mode == MODE_ADJOINT and phase == PHASE_ADJ_SNAPSHOT:
+                if not cfg.stream_adjoint:
+                    raise RuntimeError(
+                        "Neko streamed an adjoint snapshot but stream_adjoint is disabled"
+                    )
+                fields = recv_fields(ds, cfg.n_input_fields, cfg.dtype)
+                add_snapshot(
+                    comm, adjoint_pod, adjoint_ioh, bm, fields, tcur,
+                    adjoint_times, adjoint_energy
+                )
                 continue
 
             if mode == MODE_ADJOINT and phase == PHASE_ADJ_DONE:
+                if cfg.stream_adjoint and adjoint_pod is not None:
+                    flush_buffer(comm, adjoint_pod, adjoint_ioh)
+                    adjoint_pod.scale_modes(comm, bm1sqrt=adjoint_ioh.bm1sqrt, op="div")
+                    adjoint_pod.rotate_local_modes_to_global(comm)
+                    adjoint_coeffs, adjoint_header, _ = build_time_coefficients(
+                        comm, adjoint_pod, adjoint_cfg, adjoint_times
+                    )
+                    write_time_coefficients(
+                        comm,
+                        adjoint_coeffs,
+                        adjoint_header,
+                        rotate_existing=adjoint_mode_output_index > 0,
+                        file_name="adjoint_pod_time_coeffs.csv",
+                    )
+                    write_singular_values(
+                        comm,
+                        adjoint_pod,
+                        adjoint_cfg.keep_modes,
+                        pod_iteration,
+                        rotate_existing=adjoint_mode_output_index > 0,
+                        file_name="adjoint_pod_singular_values.csv",
+                    )
+                    if rank == 0:
+                        print(
+                            f"Adjoint POD: {len(adjoint_times)} snapshots, "
+                            f"{adjoint_energy.count} accumulated samples",
+                            flush=True,
+                        )
+                    adjoint_mode_output_index = write_modes_to_disk(
+                        comm,
+                        mesh,
+                        adjoint_ioh,
+                        adjoint_pod,
+                        adjoint_cfg,
+                        zero_field,
+                        available_modes(adjoint_pod, adjoint_cfg.keep_modes),
+                        adjoint_mode_output_index,
+                    )
+                    # Keep compact factor metadata for the next three
+                    # outer iterations.  The local pySEMTools mode block is
+                    # retained separately above for inspection and plotting.
+                    # Retain per-iteration V Sigma factors, never a recycled
+                    # aggregate.  The compact Gram-matrix SVD is distributed:
+                    # only small rank-by-rank matrices are reduced over MPI.
+                    append_factor_history(
+                        forward_history,
+                        factors_from_pod(
+                            pod, ioh, bm, cfg.n_input_fields, pod_iteration - 1,
+                            cfg.scalar_metric_weight,
+                        ),
+                        cfg.history_outer_iterations,
+                    )
+                    append_factor_history(
+                        adjoint_history,
+                        factors_from_pod(
+                            adjoint_pod, adjoint_ioh, bm,
+                            adjoint_cfg.n_fields, pod_iteration - 1,
+                            cfg.scalar_metric_weight,
+                        ),
+                        cfg.history_outer_iterations,
+                    )
+                    history_length = cfg.history_outer_iterations
+                    local_field_weights = cfg.field_metric_weights[:cfg.n_input_fields]
+                    local_mass = np.concatenate([
+                        weight * np.asarray(bm, dtype=np.float64).reshape(-1)
+                        for weight in local_field_weights
+                    ])
+                    recycled_forward = recycle_distributed(
+                        comm, forward_history, local_mass, cfg.rank_forward
+                    )
+                    recycled_adjoint = recycle_distributed(
+                        comm, adjoint_history, local_mass, cfg.rank_adjoint
+                    )
+                    common_basis, basis_diag = common_basis_distributed(
+                        comm,
+                        recycled_forward,
+                        recycled_adjoint,
+                        local_mass,
+                        cfg.rank_total_max,
+                        adjoint_projector=make_admissibility_projector(mesh, bm, cfg),
+                    )
+                    stream_rom_basis(comm, ds, ctrl, common_basis, bm, cfg)
+                    if rank == 0:
+                        with open("recycled_rom_history.json", "w", encoding="utf-8") as handle:
+                            json.dump(
+                                {
+                                    "history_outer_iterations": history_length,
+                                    "forward_iterations": [item.iteration for item in forward_history],
+                                    "adjoint_iterations": [item.iteration for item in adjoint_history],
+                                    "basis_rank": int(common_basis.modes.shape[1]),
+                                    "mass_gram_error": basis_diag["mass_gram_error"],
+                                },
+                                handle,
+                                indent=2,
+                            )
+                    adjoint_pod = None
+                    adjoint_ioh = None
                 pod, ioh = make_pod(comm, bm, cfg)
                 times = []
                 energy = EnergyState()
                 if window_stats is None:
-                    add_snapshot(comm, pod, ioh, bm, initial_fields, 0.0, times, energy)
+                    add_snapshot(
+                        comm, pod, ioh, bm, initial_fields, 0.0, times, energy,
+                    )
                 else:
                     window_stats = WindowStatistics(
                         cfg.window_duration,

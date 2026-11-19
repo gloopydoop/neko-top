@@ -35,10 +35,12 @@ PHASE_FWD_RUNNING = 10
 PHASE_FWD_DONE = 11
 PHASE_ADJ_RUNNING = 20
 PHASE_ADJ_DONE = 21
+PHASE_ADJ_SNAPSHOT = 22
 
 CTRL_TAG_STATE_INT = 4101
 CTRL_TAG_STATE_REAL = 4102
 CTRL_TAG_CMD = 4103
+CTRL_TAG_BASIS_HEADER = 4104
 
 
 def get_comm_color() -> Optional[int]:
@@ -125,6 +127,20 @@ class CtrlClient:
             [cmd, MPI.INT],
             dest=self.peer_root,
             tag=CTRL_TAG_CMD,
+        )
+
+    def send_basis_header(self, n_modes: int, n_fields: int) -> None:
+        """Tell Neko how many ADIOS2 basis steps follow this header."""
+        header = np.asarray([n_modes, n_fields], dtype=np.int32)
+        if self.debug:
+            print(
+                f"send_basis_header modes={n_modes} fields={n_fields}",
+                flush=True,
+            )
+        self.world.Send(
+            [header, MPI.INT],
+            dest=self.peer_root,
+            tag=CTRL_TAG_BASIS_HEADER,
         )
 
     def close(self) -> None:

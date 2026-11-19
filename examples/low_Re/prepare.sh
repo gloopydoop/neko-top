@@ -21,7 +21,7 @@ function help() {
     exit 0
 }
 
-Nx=48 && Ny=16 && Nz=16
+Nx=192 && Ny=64 && Nz=64
 for arg in "$@"; do
     if [ "${arg:0:2}" == "--" ]; then
         case ${arg:2} in

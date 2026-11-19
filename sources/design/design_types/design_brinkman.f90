@@ -36,6 +36,7 @@
 module brinkman_design
   use num_types, only: rp, sp, dp
   use field, only: field_t
+  use field_output, only: field_output_t
   use json_module, only: json_file
   use mapping_handler, only: mapping_handler_t
   use coefs, only: coef_t
@@ -45,6 +46,7 @@ module brinkman_design
   use point_zone, only: point_zone_t
   use mask_ops, only: mask_exterior_const
   use neko_config, only: NEKO_BCKND_DEVICE
+  use device, only: DEVICE_TO_HOST, HOST_TO_DEVICE, device_memcpy
   use design, only: design_t
   use simulation_m, only: simulation_t
   use simple_brinkman_source_term, only: simple_brinkman_source_term_t
@@ -199,6 +201,12 @@ module brinkman_design
      procedure, pass(this) :: get_values => brinkman_design_get_design
      !> Retrieve the sensitivity
      procedure, pass(this) :: get_sensitivity => brinkman_design_get_sensitivity
+     !> Retrieve the mapped Brinkman coefficient used by the PDE.
+     procedure, pass(this) :: get_mapped_values => &
+          brinkman_design_get_mapped_values
+     !> Bind ROM-owned output writers to the mapping fields.
+     procedure, pass(this), public :: configure_rom_outputs => &
+          brinkman_design_configure_rom_outputs
 
      !> Retrieve the x location of the design variables
      procedure, pass(this) :: design_get_x => brinkman_design_get_x
@@ -226,8 +234,13 @@ module brinkman_design
      procedure, pass(this) :: map_backward => brinkman_design_map_backward
      !> Project a gradient field onto all GLL points, recovering a vector of
      !! directional derivatives
-     procedure, pass(this) :: convert_to_directional_derivative => &
+     procedure, pass(this) :: convert_to_directional_derivative_vector => &
           brinkman_design_convert_to_directional_derivative
+     procedure, pass(this) :: convert_to_directional_derivative_matrix => &
+          brinkman_design_convert_to_directional_derivative_matrix
+     generic, public :: convert_to_directional_derivative => &
+          convert_to_directional_derivative_vector, &
+          convert_to_directional_derivative_matrix
      !> Project a vector sensitivity before optimization.
      procedure, pass(this) :: project_sensitivity_vector => &
           brinkman_design_project_sensitivity_vector
@@ -516,6 +529,25 @@ contains
 
   end subroutine brinkman_design_get_sensitivity
 
+  subroutine brinkman_design_get_mapped_values(this, values)
+    class(brinkman_design_t), intent(in) :: this
+    type(vector_t), intent(inout) :: values
+    integer :: n
+
+    n = this%size()
+    if (n .ne. values%size()) then
+       call neko_error('Get mapped design: size mismatch')
+    end if
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       ! Assembly and objective kernels consume the host vector.  Copying
+       ! device-to-device here left `values%x` stale on accelerator builds.
+       call device_memcpy(values%x, this%brinkman_amplitude%x_d, n, &
+            DEVICE_TO_HOST, sync = .true.)
+    else
+       call copy(values%x, this%brinkman_amplitude%x, n)
+    end if
+  end subroutine brinkman_design_get_mapped_values
+
   ! The interpretation of the sensitivity DF is a function that satisfies
   ! <DF,phi> = delta F(x;phi)
   ! To recover directional derivatives we should project the sensitivity onto
@@ -537,6 +569,27 @@ contains
     end if
 
   end subroutine brinkman_design_convert_to_directional_derivative
+
+  subroutine brinkman_design_convert_to_directional_derivative_matrix(this, mat_in)
+    class(brinkman_design_t), intent(in) :: this
+    type(matrix_t), intent(inout) :: mat_in
+    integer :: i
+    type(vector_t) :: row
+
+    if (mat_in%get_ncols() /= this%size()) then
+       call neko_error('convert_to_directional_derivative: matrix size mismatch')
+    end if
+    call row%init(this%size())
+    do i = 1, mat_in%get_nrows()
+       row%x = mat_in%x(i, :)
+       call this%convert_to_directional_derivative_vector(row)
+       mat_in%x(i, :) = row%x
+    end do
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call mat_in%copy_from(HOST_TO_DEVICE, sync = .true.)
+    end if
+    call row%free()
+  end subroutine brinkman_design_convert_to_directional_derivative_matrix
 
   ! to aleviate lumpy designs due to non uniform spacing, we instead project
   ! onto a uniform mass matrix with average weight, as opposed to using the
@@ -705,6 +758,17 @@ contains
     call this%mapping%write_sensitivity(idx)
 
   end subroutine brinkman_design_write
+
+  subroutine brinkman_design_configure_rom_outputs(this, design_output, &
+       sensitivity_output)
+    class(brinkman_design_t), intent(in) :: this
+    type(field_output_t), intent(inout) :: design_output
+    type(field_output_t), intent(inout) :: sensitivity_output
+
+    call design_output%fields%assign(this%mapping%design_output%fields)
+    call sensitivity_output%fields%assign(this%mapping%sensitivity_output%fields)
+
+  end subroutine brinkman_design_configure_rom_outputs
 
   subroutine brinkman_design_set_output_counter(this, idx)
     class(brinkman_design_t), intent(inout) :: this
