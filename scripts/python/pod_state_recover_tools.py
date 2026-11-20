@@ -268,6 +268,19 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
     i_stream = int(state_recovery["i_stream"])
     timestep = float(case["case"]["time"]["timestep"])
 
+    # Resolve the forward rank first.  Every adjoint numeric setting inherits
+    # its forward counterpart unless the user explicitly supplies an adjoint
+    # override.  In particular, this keeps the streamed adjoint cadence and
+    # adjoint POD rank synchronized with the forward POD by default.
+    rank_forward_value = state_recovery.get("rank_forward")
+    if rank_forward_value is None:
+        rank_forward_value = rom_cfg.get("rank_forward")
+    rank_adjoint_value = state_recovery.get("rank_adjoint")
+    if rank_adjoint_value is None:
+        rank_adjoint_value = rom_cfg.get("rank_adjoint")
+    if rank_adjoint_value is None:
+        rank_adjoint_value = rank_forward_value
+
     cfg = PODConfig(
         batch_size=int(state_recovery["batch_size"]),
         keep_modes=int(state_recovery["n_modes"]),
@@ -309,10 +322,10 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
         gammat_field_scale=float(state_recovery.get("gammat_field_scale", 1.0)),
         turbulent_schmidt=float(state_recovery.get("turbulent_schmidt", 0.7)),
         stream_adjoint=as_bool(state_recovery.get("stream_adjoint", rom_cfg.get("enabled", False))),
-        adjoint_i_stream=max(1, int(state_recovery.get("adjoint_i_stream", 1))),
+        adjoint_i_stream=max(1, int(state_recovery.get("adjoint_i_stream", i_stream))),
         history_outer_iterations=max(1, int(state_recovery.get("history_outer_iterations", rom_cfg.get("history_outer_iterations", 3)))),
-        rank_forward=(int(state_recovery.get("rank_forward", rom_cfg.get("rank_forward"))) if state_recovery.get("rank_forward", rom_cfg.get("rank_forward")) is not None else None),
-        rank_adjoint=(int(state_recovery.get("rank_adjoint", rom_cfg.get("rank_adjoint"))) if state_recovery.get("rank_adjoint", rom_cfg.get("rank_adjoint")) is not None else None),
+        rank_forward=(int(rank_forward_value) if rank_forward_value is not None else None),
+        rank_adjoint=(int(rank_adjoint_value) if rank_adjoint_value is not None else None),
         rank_total_max=(int(state_recovery.get("rank_total_max", rom_cfg.get("rank_total_max"))) if state_recovery.get("rank_total_max", rom_cfg.get("rank_total_max")) is not None else None),
         scalar_metric_weight=float(state_recovery.get("scalar_metric_weight", rom_cfg.get("scalar_metric_weight", 1.0))),
         admissibility_projection=str(

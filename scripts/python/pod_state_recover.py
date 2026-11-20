@@ -113,6 +113,67 @@ def init_runtime(
     return ds, mesh, coef, pod, ioh, initial_fields
 
 
+def build_forward_only_basis(
+    comm: MPI.Comm,
+    ds: DataStreamer,
+    ctrl: CtrlClient,
+    mesh: Mesh,
+    bm: np.ndarray,
+    cfg: PODConfig,
+    pod: POD,
+    ioh: IoHelp,
+    pod_iteration: int,
+    forward_history: list,
+) -> None:
+    """Recycle and stream a forward-only common velocity/scalar basis.
+
+    A forward-only experiment still uses the normal common-basis transport and
+    Neko-side admissibility gate.  It simply supplies no adjoint columns to
+    the recycling/orthogonalisation step.  This keeps zero adjoint enrichment
+    distinct from silently omitting the basis handoff altogether.
+    """
+
+    append_factor_history(
+        forward_history,
+        factors_from_pod(
+            pod, ioh, bm, cfg.n_input_fields, pod_iteration - 1,
+            cfg.scalar_metric_weight,
+        ),
+        cfg.history_outer_iterations,
+    )
+    local_field_weights = cfg.field_metric_weights[:cfg.n_input_fields]
+    local_mass = np.concatenate([
+        weight * np.asarray(bm, dtype=np.float64).reshape(-1)
+        for weight in local_field_weights
+    ])
+    recycled_forward = recycle_distributed(
+        comm, forward_history, local_mass, cfg.rank_forward
+    )
+    common_basis, basis_diag = common_basis_distributed(
+        comm,
+        recycled_forward,
+        None,
+        local_mass,
+        cfg.rank_total_max,
+        adjoint_projector=make_admissibility_projector(mesh, bm, cfg),
+    )
+    stream_rom_basis(comm, ds, ctrl, common_basis, bm, cfg)
+    if comm.Get_rank() == 0:
+        with open("recycled_rom_history.json", "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "history_outer_iterations": cfg.history_outer_iterations,
+                    "forward_iterations": [item.iteration for item in forward_history],
+                    "adjoint_iterations": [],
+                    "basis_rank": int(common_basis.modes.shape[1]),
+                    "mass_gram_error": basis_diag["mass_gram_error"],
+                    "adjoint_enrichment": False,
+                },
+                handle,
+                indent=2,
+            )
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         raise SystemExit(
@@ -392,6 +453,11 @@ def main() -> None:
                 continue
 
             if mode == MODE_ADJOINT and phase == PHASE_ADJ_DONE:
+                if not cfg.stream_adjoint:
+                    build_forward_only_basis(
+                        comm, ds, ctrl, mesh, bm, cfg, pod, ioh,
+                        pod_iteration, forward_history,
+                    )
                 if cfg.stream_adjoint and adjoint_pod is not None:
                     flush_buffer(comm, adjoint_pod, adjoint_ioh)
                     adjoint_pod.scale_modes(comm, bm1sqrt=adjoint_ioh.bm1sqrt, op="div")

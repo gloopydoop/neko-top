@@ -20,6 +20,9 @@ module rom_projection_operator
   use operators, only: grad, ortho
   use gather_scatter, only: GS_OP_ADD
   use math, only: col2
+  use device_math, only: device_col2, device_copy
+  use device, only: device_get_ptr
+  use neko_config, only: NEKO_BCKND_DEVICE
   use coefs, only: coef_t
   use mesh, only: mesh_t
   use space, only: space_t
@@ -96,7 +99,11 @@ contains
     ! is absent from the KSP inner products and would change the operator
     ! seen by GMRES.  Gather-scatter is applied below to C^T q, where it is
     ! the required assembly of the velocity mass-adjoint gradient.
-    this%q%x = u
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call device_copy(this%q%x_d, device_get_ptr(u), n)
+    else
+       this%q%x = u
+    end if
     ! KSP constrains the output residual, but a general right
     ! preconditioner is not required to preserve the pressure Dirichlet
     ! subspace in its input vector.  Apply the same essential pressure
@@ -108,13 +115,24 @@ contains
     ! gradient grad_h.  The ROM restriction is explicit: gather/average the
     ! element-local correction into the continuous velocity space and then
     ! apply the native essential velocity projector.
-    call grad(this%grad_x%x, this%grad_y%x, this%grad_z%x, this%q%x, &
-         this%fluid%c_Xh)
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call grad(this%grad_x%x_d, this%grad_y%x_d, this%grad_z%x_d, &
+            this%q%x_d, this%fluid%c_Xh)
+    else
+       call grad(this%grad_x%x, this%grad_y%x, this%grad_z%x, this%q%x, &
+            this%fluid%c_Xh)
+    end if
     call this%fluid%gs_Xh%op(this%grad_x%x, this%grad_y%x, this%grad_z%x, &
          n, GS_OP_ADD)
-    call col2(this%grad_x%x, this%fluid%c_Xh%mult, n)
-    call col2(this%grad_y%x, this%fluid%c_Xh%mult, n)
-    call col2(this%grad_z%x, this%fluid%c_Xh%mult, n)
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call device_col2(this%grad_x%x_d, this%fluid%c_Xh%mult_d, n)
+       call device_col2(this%grad_y%x_d, this%fluid%c_Xh%mult_d, n)
+       call device_col2(this%grad_z%x_d, this%fluid%c_Xh%mult_d, n)
+    else
+       call col2(this%grad_x%x, this%fluid%c_Xh%mult, n)
+       call col2(this%grad_y%x, this%fluid%c_Xh%mult, n)
+       call col2(this%grad_z%x, this%fluid%c_Xh%mult, n)
+    end if
     call this%fluid%bcs_vel_projector%apply(this%grad_x%x, this%grad_y%x, &
          this%grad_z%x, n)
 
@@ -124,9 +142,15 @@ contains
     call field_col3(this%f_x, this%grad_x, this%fluid%rho)
     call field_col3(this%f_y, this%grad_y, this%fluid%rho)
     call field_col3(this%f_z, this%grad_z, this%fluid%rho)
-    call col2(this%f_x%x, this%fluid%c_Xh%B, n)
-    call col2(this%f_y%x, this%fluid%c_Xh%B, n)
-    call col2(this%f_z%x, this%fluid%c_Xh%B, n)
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call device_col2(this%f_x%x_d, this%fluid%c_Xh%B_d, n)
+       call device_col2(this%f_y%x_d, this%fluid%c_Xh%B_d, n)
+       call device_col2(this%f_z%x_d, this%fluid%c_Xh%B_d, n)
+    else
+       call col2(this%f_x%x, this%fluid%c_Xh%B, n)
+       call col2(this%f_y%x, this%fluid%c_Xh%B, n)
+       call col2(this%f_z%x, this%fluid%c_Xh%B, n)
+    end if
     call field_rzero(this%p_zero)
     event = c_null_ptr
     call this%fluid%prs_res%compute(this%p_zero, this%p_res, this%grad_x, &
@@ -138,7 +162,11 @@ contains
     if (.not. this%fluid%prs_dirichlet) then
        call ortho(this%p_res%x, this%fluid%glb_n_points, n)
     end if
-    w = this%p_res%x
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call device_copy(device_get_ptr(w), this%p_res%x_d, n)
+    else
+       w = this%p_res%x
+    end if
   end subroutine rom_projection_ax_compute
 
   !> Apply the constrained operator to three vector-valued right-hand sides.
@@ -166,6 +194,7 @@ contains
     nullify(this%grad_x, this%grad_y, this%grad_z)
     nullify(this%f_x, this%f_y, this%f_z)
     nullify(this%u_zero, this%v_zero, this%w_zero)
+    this%event = c_null_ptr
   end subroutine rom_projection_ax_free
 
 end module rom_projection_operator

@@ -4,6 +4,7 @@
 target_sources(neko-top
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/rom_model.f90
+        ${CMAKE_CURRENT_SOURCE_DIR}/rom_lift.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/rom_assembly.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/rom_basis_orthogonalization.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/rom_objectives.f90

@@ -221,7 +221,9 @@ contains
     else
        this%forward_lift = 0.0_rp
     end if
-    call json_get_or_default(params, "adjoint_i_stream", adjoint_i_stream, 1)
+    ! Use the forward snapshot stride for adjoint snapshots unless the case
+    ! explicitly requests a different cadence.
+    call json_get_or_default(params, "adjoint_i_stream", adjoint_i_stream, i_stream)
     call json_get_or_default(params, "output_reconstruction", &
          output_reconstruction, .false.)
     call json_get_or_default(params, "output_precision", &
@@ -354,6 +356,9 @@ contains
     this%n_flds = 3
     this%pod_tstep = 0
     this%adjoint_tstep = 0
+    ! The adjoint stream follows the forward cadence unless overridden by the
+    ! JSON initializer above.
+    this%adjoint_i_stream = max(1, i_stream)
     this%coef => neko_case%fluid%c_Xh
 
     ! ROM cases use the spatial lift built from the initial/reference velocity
@@ -646,13 +651,17 @@ contains
     end if
 
     if (this%rom_lift%enabled) then
-       call this%rom_lift%stream_homogeneous(this%dstream, u, v, w)
+       if (this%include_scalar) then
+          call this%rom_lift%stream_homogeneous(this%dstream, u, v, w, s)
+       else
+          call this%rom_lift%stream_homogeneous(this%dstream, u, v, w)
+       end if
     else
        call this%dstream%stream(u%x)
        call this%dstream%stream(v%x)
        call this%dstream%stream(w%x)
+       if (this%include_scalar) call this%dstream%stream(s%x)
     end if
-    if (this%include_scalar) call this%dstream%stream(s%x)
   end subroutine POD_state_recover_stream_fields
 
 
@@ -1048,7 +1057,13 @@ contains
        call field_cfill(v, this%forward_lift(2))
        call field_cfill(w, this%forward_lift(3))
     end if
-    if (this%include_scalar) call field_rzero(s)
+    if (this%include_scalar) then
+       if (this%rom_lift%scalar_enabled) then
+          call field_copy(s, this%rom_lift%scalar)
+       else
+          call field_rzero(s)
+       end if
+    end if
     if (this%include_nut) call field_rzero(this%nut)
     if (this%include_gammat) call field_rzero(this%gammat)
 

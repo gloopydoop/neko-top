@@ -11,6 +11,8 @@ module rom_optimizer
   use problem, only: problem_t
   use design, only: design_t
   use brinkman_design, only: brinkman_design_t
+  use constraint, only: constraint_t
+  use dummy_constraint, only: dummy_constraint_t
   use simulation_m, only: simulation_t
   use rom_problem, only: rom_problem_t
   use rom_validation, only: rom_validation_metrics_t, rom_validation_accept
@@ -19,12 +21,15 @@ module rom_optimizer
   use json_utils, only: json_get, json_get_or_default
   use vector, only: vector_t
   use matrix, only: matrix_t
+  use vector_math, only: vector_copy, vector_sub3, vector_absval, vector_glmax, &
+       vector_glsc2, vector_glsubnorm
+  use matrix_math, only: matrix_copy, matrix_glsc2, matrix_glsubnorm
   use device, only: DEVICE_TO_HOST, HOST_TO_DEVICE
   use neko_config, only: NEKO_BCKND_DEVICE
   use logger, only: neko_log
   use utils, only: neko_error
-  use comm, only: pe_rank, NEKO_COMM, MPI_REAL_PRECISION
-  use mpi_f08, only: MPI_Allreduce, MPI_MAX, MPI_SUM
+  use comm, only: pe_rank
+  use mpi_f08, only: MPI_WTIME
   implicit none
   private
 
@@ -34,6 +39,7 @@ module rom_optimizer
      type(mma_t) :: mma
      type(rom_problem_t) :: rom_problem
      type(vector_t) :: base_x
+     logical :: unconstrained_problem = .false.
      integer :: inner_iterations = 1
      integer :: inner_counter = 0
      real(kind=rp) :: tolerance = 1.0e-3_rp
@@ -48,6 +54,10 @@ module rom_optimizer
      integer :: rom_log_unit = -1
      logical :: rom_log_initialized = .false.
      character(len=16) :: last_validation_status = 'initial'
+     real(kind=rp) :: rom_forward_seconds = 0.0_rp
+     real(kind=rp) :: rom_adjoint_seconds = 0.0_rp
+     real(kind=rp) :: mma_seconds = 0.0_rp
+     real(kind=rp) :: full_order_seconds = 0.0_rp
    contains
      procedure, pass(this) :: init_from_json => rom_optimizer_init_from_json
      procedure, pass(this) :: free => rom_optimizer_free
@@ -78,6 +88,7 @@ contains
     class(design_t), intent(in) :: design
     type(simulation_t), optional, intent(in) :: simulation
     type(json_file) :: solver_parameters, rom_parameters
+    class(constraint_t), allocatable :: dummy_con
     integer :: max_iterations
 
     call this%free()
@@ -89,6 +100,23 @@ contains
          1.0e-3_rp)
     call json_get_or_default(solver_parameters, 'enable_output', &
          this%enable_output, .true.)
+
+    ! MMA requires at least one constraint row.  Match mma_optimizer's
+    ! unconstrained-problem behavior by adding a zero-gradient dummy row to
+    ! the full-order problem when the user supplied no constraints.  The ROM
+    ! problem still parses the original JSON and does not fabricate a volume
+    ! constraint.
+    this%unconstrained_problem = problem%get_n_constraints() == 0
+    if (this%unconstrained_problem) then
+       call neko_log%message('Unconstrained ROM problem detected. Adding a dummy MMA constraint.')
+       allocate(dummy_constraint_t::dummy_con)
+       select type (con => dummy_con)
+       type is (dummy_constraint_t)
+          call con%init_from_attributes(design)
+       end select
+       call problem%add_constraint(dummy_con)
+       if (allocated(dummy_con)) deallocate(dummy_con)
+    end if
 
     call this%rom_problem%init_from_json(parameters, problem)
     this%inner_iterations = this%rom_problem%inner_iterations
@@ -122,6 +150,7 @@ contains
     end if
     this%rom_log_unit = -1
     this%rom_log_initialized = .false.
+    this%unconstrained_problem = .false.
     call this%rom_problem%free()
     call this%base_x%free()
     call this%mma%free()
@@ -171,13 +200,16 @@ contains
     allocate(constraints(m))
     call this%rom_problem%compute(design, objective, constraints, final_state)
     constraint = constraints(1)
-    call this%rom_problem%compute_sensitivity(density%x)
+    call this%rom_problem%compute_sensitivity(density)
     if (present(chi_gradient)) then
        if (size(chi_gradient) /= n) call neko_error( &
             'ROM diagnostic chi-gradient size mismatch')
+       if (NEKO_BCKND_DEVICE .eq. 1) call density%copy_from(DEVICE_TO_HOST, sync=.true.)
        chi_gradient = density%x
     end if
     call this%rom_problem%project_density(design, density, projected_gradient)
+    if (NEKO_BCKND_DEVICE .eq. 1) call projected_gradient%copy_from( &
+         DEVICE_TO_HOST, sync=.true.)
     gradient = projected_gradient%x
     call density%free()
     call projected_gradient%free()
@@ -208,19 +240,23 @@ contains
     class(design_t), intent(inout) :: design
     type(simulation_t), optional, intent(inout) :: simulation
     type(vector_t) :: x, xold, fval, df0dx, dx, density, old_design
-    type(matrix_t) :: dfdx
+    type(vector_t) :: predicted_gradient
+    type(matrix_t) :: dfdx, predicted_constraint_gradient
     real(kind=rp), allocatable :: rom_state(:)
     real(kind=rp) :: rom_objective, actual_objective
-    real(kind=rp), allocatable :: predicted_constraints(:), actual_constraints(:), &
-         predicted_gradient(:), actual_gradient(:), predicted_constraint_gradient(:, :), &
-         actual_constraint_gradient(:, :)
-    real(kind=rp) :: local_max, global_max, local_norm, global_norm
+    real(kind=rp), allocatable :: predicted_constraints(:), actual_constraints(:)
+    real(kind=rp) :: global_max, global_norm
     real(kind=rp) :: objective_gradient_error, constraint_gradient_error
     type(rom_validation_metrics_t) :: validation_metrics
     logical :: converged, validation_checked, validation_passed
-    integer :: inner, n, m, i
+    integer :: inner, n, m
+    real(kind=rp) :: timer_start
 
     if (.not. present(simulation)) call neko_error('rom_mma step requires simulation')
+    this%rom_forward_seconds = 0.0_rp
+    this%rom_adjoint_seconds = 0.0_rp
+    this%mma_seconds = 0.0_rp
+    this%full_order_seconds = 0.0_rp
     call simulation%reset()
     if (.not. this%supplied_basis_for_step) then
        call this%rom_problem%refresh(simulation)
@@ -231,53 +267,66 @@ contains
     call x%init(n); call xold%init(n); call old_design%init(n)
     call fval%init(m); call df0dx%init(n); call dx%init(n); call density%init(n)
     call dfdx%init(m, n)
+    call predicted_gradient%init(n)
+    call predicted_constraint_gradient%init(m, n)
     call design%get_values(x)
-    if (NEKO_BCKND_DEVICE .eq. 1) call x%copy_from(DEVICE_TO_HOST, sync = .true.)
-    old_design = x
-    if (NEKO_BCKND_DEVICE .eq. 1) then
-       call x%copy_from(HOST_TO_DEVICE, sync = .true.)
-       call old_design%copy_from(HOST_TO_DEVICE, sync = .true.)
-    end if
+    call vector_copy(old_design, x)
 
     ! Evaluate the current design once before the first MMA update.  The
     ! resulting ROM forward/adjoint and gradients are consumed by the first
     ! inner update and then replaced only after the design has changed.
     call this%rom_problem%compute(design, rom_objective, final_state=rom_state)
-    call this%rom_problem%compute_sensitivity(density%x)
-    call this%rom_problem%compute_volume_constraint(design, fval%x(1), dfdx)
+    if (this%enable_output .and. allocated(rom_state)) then
+       call this%rom_problem%write_forward_output(simulation, 0, rom_state)
+    end if
+    call this%rom_problem%compute_sensitivity(density)
+    if (this%unconstrained_problem) then
+       fval = -1.0_rp
+       dfdx = 0.0_rp
+    else
+       call this%rom_problem%compute_volume_constraint(design, fval%x(1), dfdx)
+    end if
     call this%rom_problem%project_density(design, density, df0dx)
     if (NEKO_BCKND_DEVICE .eq. 1) then
        call fval%copy_from(HOST_TO_DEVICE, sync = .true.)
-       call dfdx%copy_from(HOST_TO_DEVICE, sync = .true.)
     end if
 
     do inner = 1, this%inner_iterations
        this%inner_counter = this%inner_counter + 1
-       xold = x
+       call vector_copy(xold, x)
        ! mma%update applies its configured xmin/xmax and mma.move_limit when
        ! constructing the subproblem. Do not alter that MMA solution with a
        ! second ROM-specific clip relative to the outer design.
+       timer_start = real(MPI_WTIME(), rp)
        call this%mma%update(this%inner_counter, x, df0dx, fval, dfdx)
+       this%mma_seconds = real(MPI_WTIME(), rp) - timer_start
        call design%update_design(x)
 
        ! Evaluate the updated design exactly once.  This evaluation supplies
        ! the KKT check, output fields, and the cached state/gradient used by
        ! the next inner update; the next loop entrance does not repeat it.
+       timer_start = real(MPI_WTIME(), rp)
        call this%rom_problem%compute(design, rom_objective, final_state=rom_state)
-       call this%rom_problem%compute_sensitivity(density%x)
-       call this%rom_problem%compute_volume_constraint(design, fval%x(1), dfdx)
+       this%rom_forward_seconds = real(MPI_WTIME(), rp) - timer_start
+       timer_start = real(MPI_WTIME(), rp)
+       call this%rom_problem%compute_sensitivity(density)
+       this%rom_adjoint_seconds = real(MPI_WTIME(), rp) - timer_start
+       if (this%unconstrained_problem) then
+          fval = -1.0_rp
+          dfdx = 0.0_rp
+       else
+          call this%rom_problem%compute_volume_constraint(design, fval%x(1), dfdx)
+       end if
        call this%rom_problem%project_density(design, density, df0dx)
        if (NEKO_BCKND_DEVICE .eq. 1) call fval%copy_from(HOST_TO_DEVICE, sync = .true.)
-       if (NEKO_BCKND_DEVICE .eq. 1) call dfdx%copy_from(HOST_TO_DEVICE, sync = .true.)
        call this%mma%KKT(x, df0dx, fval, dfdx)
 
-       if (NEKO_BCKND_DEVICE .eq. 1) call x%copy_from(DEVICE_TO_HOST, sync = .true.)
-       local_max = maxval(abs(x%x - xold%x))
-       call MPI_Allreduce(local_max, global_max, 1, MPI_REAL_PRECISION, MPI_MAX, NEKO_COMM)
-       local_norm = sum((x%x - xold%x) ** 2)
-       call MPI_Allreduce(local_norm, global_norm, 1, MPI_REAL_PRECISION, MPI_SUM, NEKO_COMM)
+       call vector_sub3(dx, x, xold)
+       call vector_absval(dx)
+       global_max = vector_glmax(dx)
+       global_norm = sqrt(vector_glsc2(dx, dx))
        this%max_design_change = global_max
-       this%norm2_design_change = sqrt(global_norm)
+       this%norm2_design_change = global_norm
        if (NEKO_BCKND_DEVICE .eq. 1) call fval%copy_from(DEVICE_TO_HOST, sync = .true.)
        call rom_optimizer_write_inner(this, iter, inner, rom_objective, fval%x)
        if (this%enable_output .and. allocated(rom_state)) &
@@ -292,19 +341,17 @@ contains
     if (allocated(predicted_constraints)) deallocate(predicted_constraints)
     allocate(predicted_constraints(m))
     predicted_constraints = fval%x
-    allocate(predicted_gradient(n), actual_gradient(n), predicted_constraint_gradient(m, n), &
-         actual_constraint_gradient(m, n))
-    predicted_gradient = df0dx%x
-    predicted_constraint_gradient = dfdx%x
+    call vector_copy(predicted_gradient, df0dx)
+    call matrix_copy(predicted_constraint_gradient, dfdx)
     call design%get_values(x)
-    if (NEKO_BCKND_DEVICE .eq. 1) call x%copy_from(DEVICE_TO_HOST, sync = .true.)
-    local_max = maxval(abs(x%x - old_design%x))
-    call MPI_Allreduce(local_max, global_max, 1, MPI_REAL_PRECISION, MPI_MAX, NEKO_COMM)
-    local_norm = sum((x%x - old_design%x) ** 2)
-    call MPI_Allreduce(local_norm, global_norm, 1, MPI_REAL_PRECISION, MPI_SUM, NEKO_COMM)
+    call vector_sub3(dx, x, old_design)
+    call vector_absval(dx)
+    global_max = vector_glmax(dx)
+    global_norm = sqrt(vector_glsc2(dx, dx))
     this%max_design_change = global_max
-    this%norm2_design_change = sqrt(global_norm)
+    this%norm2_design_change = global_norm
 
+    timer_start = real(MPI_WTIME(), rp)
     call simulation%set_design_iteration(iter)
     call problem%compute(design, simulation)
     call problem%get_objective_value(actual_objective)
@@ -313,41 +360,25 @@ contains
     call fval%copy_from(DEVICE_TO_HOST, sync = .true.)
     actual_constraints = fval%x
     ! Compute the full-order sensitivity before deciding whether the ROM
-    ! candidate is trustworthy.  Brinkman sensitivities are fields, so the
-    ! exact SEM diagonal conversion is required to compare directional
-    ! derivatives with the ROM/MMA convention.
+    ! candidate is trustworthy.  Use the same constant-average SEM weighting
+    ! as the production mma_optimizer; otherwise the validation would compare
+    ! the ROM's production convention against a different full-order gradient.
     call problem%compute_sensitivity(design, simulation)
     select type (des => design)
     type is (brinkman_design_t)
        call des%get_sensitivity(df0dx)
-       call des%convert_to_directional_derivative(df0dx)
+       call des%project_sensitivity(df0dx)
        call problem%get_constraint_sensitivities(dfdx)
-       call des%convert_to_directional_derivative(dfdx)
+       call des%project_sensitivity(dfdx)
     class default
        call problem%get_objective_sensitivities(df0dx)
        call problem%get_constraint_sensitivities(dfdx)
     end select
-    if (NEKO_BCKND_DEVICE .eq. 1) then
-       call df0dx%copy_from(DEVICE_TO_HOST, sync = .true.)
-       call dfdx%copy_from(DEVICE_TO_HOST, sync = .true.)
-    end if
-    actual_gradient = df0dx%x
-    actual_constraint_gradient = dfdx%x
-
-    local_norm = sum((actual_gradient - predicted_gradient) ** 2)
-    call MPI_Allreduce(local_norm, global_norm, 1, MPI_REAL_PRECISION, MPI_SUM, NEKO_COMM)
-    local_norm = sum(actual_gradient ** 2)
-    call MPI_Allreduce(local_norm, global_max, 1, MPI_REAL_PRECISION, MPI_SUM, NEKO_COMM)
-    objective_gradient_error = sqrt(global_norm) / max(1.0_rp, sqrt(global_max))
-    constraint_gradient_error = 0.0_rp
-    do i = 1, m
-       local_norm = sum((actual_constraint_gradient(i,:) - predicted_constraint_gradient(i,:)) ** 2)
-       call MPI_Allreduce(local_norm, global_norm, 1, MPI_REAL_PRECISION, MPI_SUM, NEKO_COMM)
-       local_norm = sum(actual_constraint_gradient(i,:) ** 2)
-       call MPI_Allreduce(local_norm, global_max, 1, MPI_REAL_PRECISION, MPI_SUM, NEKO_COMM)
-       constraint_gradient_error = max(constraint_gradient_error, &
-            sqrt(global_norm) / max(1.0_rp, sqrt(global_max)))
-    end do
+    this%full_order_seconds = real(MPI_WTIME(), rp) - timer_start
+    objective_gradient_error = vector_glsubnorm(df0dx, predicted_gradient) / &
+         max(1.0_rp, sqrt(vector_glsc2(df0dx, df0dx)))
+    constraint_gradient_error = matrix_glsubnorm(dfdx, predicted_constraint_gradient) / &
+         max(1.0_rp, sqrt(matrix_glsc2(dfdx, dfdx)))
     validation_metrics%objective = abs(actual_objective - rom_objective) / &
          max(1.0_rp, abs(actual_objective))
     validation_metrics%constraint = maxval(abs(actual_constraints - predicted_constraints) / &
@@ -381,13 +412,10 @@ contains
 
     call x%free(); call xold%free(); call old_design%free(); call fval%free()
     call df0dx%free(); call dx%free(); call density%free(); call dfdx%free()
+    call predicted_gradient%free(); call predicted_constraint_gradient%free()
     if (allocated(rom_state)) deallocate(rom_state)
     if (allocated(predicted_constraints)) deallocate(predicted_constraints)
     if (allocated(actual_constraints)) deallocate(actual_constraints)
-    if (allocated(predicted_gradient)) deallocate(predicted_gradient)
-    if (allocated(actual_gradient)) deallocate(actual_gradient)
-    if (allocated(predicted_constraint_gradient)) deallocate(predicted_constraint_gradient)
-    if (allocated(actual_constraint_gradient)) deallocate(actual_constraint_gradient)
   end function rom_optimizer_step
 
 
@@ -420,10 +448,12 @@ contains
     if (ios /= 0) call neko_error('could not open ROM optimization_data.csv')
     write(this%rom_log_unit, '(A)') &
          'phase,outer_iteration,inner_iteration,source,total_objective,'// &
+         'scalar_mixing,scalar_mixing.weight,'// &
          'viscous_dissipation,viscous_dissipation.weight,'// &
          'brinkman_dissipation,brinkman_dissipation.weight,'// &
          'volume_constraint,volume_constraint.volume,max_design_change,'// &
-         'norm2_design_change,status'
+         'norm2_design_change,rom_forward_seconds,rom_adjoint_seconds,'// &
+         'mma_seconds,full_order_seconds,status'
     this%rom_log_initialized = .true.
   end subroutine rom_optimizer_init_log
 
@@ -436,9 +466,11 @@ contains
     integer, intent(in) :: iter
     class(problem_t), intent(inout) :: problem
     real(kind=rp), allocatable :: values(:)
-    real(kind=rp) :: total, viscous, viscous_weight, brinkman, brinkman_weight
+    real(kind=rp) :: total, scalar_mixing, scalar_mixing_weight
+    real(kind=rp) :: viscous, viscous_weight, brinkman, brinkman_weight
     real(kind=rp) :: constraint, volume
     integer :: n
+    character(len=:), allocatable :: header
 
     if (.not. this%rom_log_initialized) return
     n = problem%get_log_size(.true.)
@@ -446,22 +478,25 @@ contains
     call problem%get_log_values(values, .true.)
 
     total = values(1)
-    viscous = 0.0_rp; viscous_weight = 0.0_rp
-    brinkman = 0.0_rp; brinkman_weight = 0.0_rp
-    constraint = 0.0_rp; volume = 0.0_rp
-    if (n >= 3) then
-       viscous = values(2); viscous_weight = values(3)
-    end if
-    if (n >= 5) then
-       brinkman = values(4); brinkman_weight = values(5)
-    end if
-    if (n >= 7) then
-       constraint = values(6); volume = values(7)
+    header = problem%get_log_header(.true.)
+    scalar_mixing = rom_optimizer_log_value(values, header, 'scalar_mixing')
+    scalar_mixing_weight = rom_optimizer_log_value(values, header, 'scalar_mixing.weight')
+    viscous = rom_optimizer_log_value(values, header, 'viscous_dissipation')
+    viscous_weight = rom_optimizer_log_value(values, header, 'viscous_dissipation.weight')
+    brinkman = rom_optimizer_log_value(values, header, 'brinkman_dissipation')
+    brinkman_weight = rom_optimizer_log_value(values, header, 'brinkman_dissipation.weight')
+    constraint = rom_optimizer_log_value(values, header, 'volume_constraint')
+    volume = rom_optimizer_log_value(values, header, 'volume_constraint.volume')
+    if (this%unconstrained_problem) then
+       constraint = -1.0_rp
+       volume = 0.0_rp
     end if
     call rom_optimizer_write_record(this, 'outer', iter, 0, 'full_order', &
-         total, viscous, viscous_weight, brinkman, brinkman_weight, &
-         constraint, volume, this%last_validation_status)
+         total, scalar_mixing, scalar_mixing_weight, viscous, viscous_weight, &
+         brinkman, brinkman_weight, constraint, volume, 0.0_rp, 0.0_rp, &
+         0.0_rp, this%full_order_seconds, this%last_validation_status)
     deallocate(values)
+    deallocate(header)
   end subroutine rom_optimizer_write_outer
 
   !> Write one reduced inner-MMA record after its ROM objective evaluation.
@@ -482,16 +517,20 @@ contains
     ! evaluated.  The full-order problem is deliberately not queried here:
     ! its state and objective are refreshed only at the outer boundary.
     constraint = constraints(1)
-    if (this%rom_problem%volume_is_max) then
+    if (this%unconstrained_problem) then
+       volume = 0.0_rp
+    else if (this%rom_problem%volume_is_max) then
        volume = this%rom_problem%volume_limit + constraint
     else
        volume = this%rom_problem%volume_limit - constraint
     end if
     call rom_optimizer_write_record(this, 'inner', outer, inner, 'rom', &
-         objective, this%rom_problem%viscous_value, &
+         objective, this%rom_problem%scalar_mixing_value, &
+         this%rom_problem%scalar_mixing_weight, this%rom_problem%viscous_value, &
          this%rom_problem%viscous_weight, this%rom_problem%brinkman_value, &
          this%rom_problem%brinkman_weight, constraint, volume, &
-         'not_validated')
+         this%rom_forward_seconds, this%rom_adjoint_seconds, this%mma_seconds, &
+         0.0_rp, 'not_validated')
   end subroutine rom_optimizer_write_inner
 
   !> Append one ordered record to the ROM optimization history.
@@ -501,6 +540,8 @@ contains
   !! @param inner Inner reduced iteration, or zero for an outer record.
   !! @param source Objective source (`full_order` or `rom`).
   !! @param total Weighted total objective.
+  !! @param scalar_mixing Unweighted scalar-mixing objective value.
+  !! @param scalar_mixing_weight Scalar-mixing objective weight.
   !! @param viscous Unweighted viscous objective value.
   !! @param viscous_weight Viscous objective weight.
   !! @param brinkman Unweighted Brinkman objective value.
@@ -509,24 +550,63 @@ contains
   !! @param volume Normalised design volume.
   !! @param status Validation status for the outer record.
   subroutine rom_optimizer_write_record(this, phase, outer, inner, source, &
-       total, viscous, viscous_weight, brinkman, brinkman_weight, constraint, &
-       volume, status)
+       total, scalar_mixing, scalar_mixing_weight, viscous, viscous_weight, &
+       brinkman, brinkman_weight, constraint, volume, rom_forward_seconds, &
+       rom_adjoint_seconds, mma_seconds, full_order_seconds, status)
     class(rom_optimizer_t), intent(inout) :: this
     character(len=*), intent(in) :: phase, source, status
     integer, intent(in) :: outer, inner
-    real(kind=rp), intent(in) :: total, viscous, viscous_weight, brinkman
-    real(kind=rp), intent(in) :: brinkman_weight, constraint, volume
+    real(kind=rp), intent(in) :: total, scalar_mixing, scalar_mixing_weight
+    real(kind=rp), intent(in) :: viscous, viscous_weight, brinkman, brinkman_weight
+    real(kind=rp), intent(in) :: constraint, volume, rom_forward_seconds
+    real(kind=rp), intent(in) :: rom_adjoint_seconds, mma_seconds, full_order_seconds
     integer :: ios
 
     if (.not. this%rom_log_initialized) return
     write(this%rom_log_unit, &
          '(A,",",I0,",",I0,",",A,",",ES24.16,",",ES24.16,",",ES24.16,",",'// &
          'ES24.16,",",ES24.16,",",ES24.16,",",ES24.16,",",ES24.16,",",'// &
-         'ES24.16,",",A)', iostat=ios) phase, outer, inner, source, total, &
-         viscous, viscous_weight, brinkman, brinkman_weight, constraint, volume, &
-         this%max_design_change, this%norm2_design_change, status
+         'ES24.16,",",ES24.16,",",ES24.16,",",ES24.16,",",ES24.16,",",'// &
+         'ES24.16,",",ES24.16,",",A)', iostat=ios) phase, outer, inner, &
+         source, total, scalar_mixing, scalar_mixing_weight, viscous, viscous_weight, &
+         brinkman, brinkman_weight, constraint, volume, this%max_design_change, &
+         this%norm2_design_change, rom_forward_seconds, rom_adjoint_seconds, &
+         mma_seconds, full_order_seconds, status
     if (ios /= 0) call neko_error('could not write ROM optimization_data.csv')
   end subroutine rom_optimizer_write_record
+
+  !> Return one value from Neko's comma-separated objective/constraint log.
+  !! The full-order problem owns the ordering; searching its header avoids
+  !! assuming that a scalar objective is present or comes first.
+  function rom_optimizer_log_value(values, header, label) result(value)
+    real(kind=rp), intent(in) :: values(:)
+    character(len=*), intent(in) :: header, label
+    real(kind=rp) :: value
+    character(len=len(header)) :: normal_header
+    character(len=len(label)) :: normal_label
+    integer :: position, column, i
+
+    value = 0.0_rp
+    normal_header = header
+    normal_label = label
+    do i = 1, len(normal_header)
+       if (normal_header(i:i) >= 'A' .and. normal_header(i:i) <= 'Z') &
+            normal_header(i:i) = achar(iachar(normal_header(i:i)) + 32)
+       if (normal_header(i:i) == ' ') normal_header(i:i) = '_'
+    end do
+    do i = 1, len(normal_label)
+       if (normal_label(i:i) >= 'A' .and. normal_label(i:i) <= 'Z') &
+            normal_label(i:i) = achar(iachar(normal_label(i:i)) + 32)
+       if (normal_label(i:i) == ' ') normal_label(i:i) = '_'
+    end do
+    position = index(normal_header, trim(normal_label))
+    if (position <= 0) return
+    column = 1
+    do i = 1, position - 1
+       if (header(i:i) == ',') column = column + 1
+    end do
+    if (column <= size(values)) value = values(column)
+  end function rom_optimizer_log_value
 
   !> Write the ordered ROM/full-order history for one outer callback.
   subroutine rom_optimizer_write(this, iter, problem)

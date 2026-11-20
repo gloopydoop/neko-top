@@ -11,8 +11,8 @@ CASE_DIR=$(pwd)
 CASE_FILE=${1:-"${CASE_DIR}/ROM_low_Re_mini.case"}
 PY_SCRIPT=${2:-"${MAIN_DIR}/scripts/python/rom_state_recover.py"}
 
-NEKO_RANKS=${NEKO_RANKS:-6}
-PY_RANKS=${PY_RANKS:-6}
+NEKO_RANKS=${NEKO_RANKS:-9}
+PY_RANKS=${PY_RANKS:-4}
 
 if [ ! -f "${CASE_FILE}" ]; then
     echo "Error: case file not found: ${CASE_FILE}" >&2

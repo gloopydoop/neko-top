@@ -3,7 +3,7 @@ program rom_objective_algebra_diagnostic
   use num_types, only: rp
   use rom_array_test_adapters, only: test_assemble_viscous_quadratic, &
        test_assemble_brinkman_objective, test_viscous_value, test_brinkman_value, &
-       test_brinkman_density
+       test_brinkman_density, test_assemble_scalar_mixing
   implicit none
 
   integer, parameter :: n = 11, r = 3
@@ -11,6 +11,9 @@ program rom_objective_algebra_diagnostic
   real(kind=rp) :: lift(n,3), viscous(r,r), brinkman(r,r), lift_linear(r)
   real(kind=rp) :: state(r), density(n), expected, value, fd, eps, domain
   real(kind=rp) :: chi_plus(n), chi_minus(n), objective_plus, objective_minus
+  real(kind=rp) :: scalar_lift(n), scalar_modes(n,r), scalar_constant
+  real(kind=rp) :: scalar_linear(r), scalar_quadratic(r,r), scalar_ref
+  real(kind=rp) :: scalar_state(r), scalar_expected, scalar_fd
   integer :: i, j, c, d
 
   call neko_init()
@@ -74,6 +77,39 @@ program rom_objective_algebra_diagnostic
   fd = (objective_plus - objective_minus) / (2.0_rp * eps)
   value = sum(weights * 0.1_rp * [(real(i, rp), i=1,n)] * density)
   if (abs(fd - value) > 1.0e-8_rp) error stop 'Brinkman density FD mismatch'
+
+  scalar_ref = 0.35_rp
+  scalar_state = [-0.15_rp, 0.25_rp, 0.45_rp]
+  do i = 1, n
+     scalar_lift(i) = 0.2_rp + 0.01_rp * real(i, rp)
+     do j = 1, r
+        scalar_modes(i,j) = 0.03_rp * real(i + 2*j, rp)
+     end do
+  end do
+  call test_assemble_scalar_mixing(weights, mask, scalar_lift, scalar_modes, &
+       scalar_ref, scalar_constant, scalar_linear, scalar_quadratic)
+  scalar_expected = 0.0_rp
+  do i = 1, n
+     scalar_expected = scalar_expected + 0.5_rp * weights(i) * mask(i) * &
+          (scalar_lift(i) + dot_product(scalar_modes(i,:), scalar_state) - &
+           scalar_ref)**2
+  end do
+  scalar_expected = scalar_expected / domain
+  value = test_viscous_value(scalar_state, scalar_quadratic, domain) + &
+       dot_product(scalar_linear, scalar_state) / domain + &
+       0.5_rp * scalar_constant / domain
+  if (abs(value - scalar_expected) > 1.0e-13_rp) &
+       error stop 'scalar mixing objective algebra mismatch'
+  eps = 1.0e-7_rp
+  scalar_fd = 0.0_rp
+  do i = 1, n
+     scalar_fd = scalar_fd + weights(i) * mask(i) * &
+          (scalar_lift(i) + dot_product(scalar_modes(i,:), scalar_state) - scalar_ref) * &
+          scalar_modes(i,1) / domain
+  end do
+  if (abs(scalar_fd - (scalar_linear(1) + &
+       dot_product(scalar_quadratic(1,:), scalar_state)) / domain) > 1.0e-12_rp) &
+       error stop 'scalar mixing coefficient derivative mismatch'
 
   write(*,'(A,ES12.4,A,ES12.4)') 'ROM objective algebra passed: value/FD=', value, ' / ', fd
   call neko_finalize()

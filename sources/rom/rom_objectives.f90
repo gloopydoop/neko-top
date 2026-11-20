@@ -7,6 +7,7 @@ module rom_objectives
   use vector, only: vector_t
   use matrix, only: matrix_t
   use vector_math, only: vector_col3, vector_add2s2, vector_vdot3, vector_cmult, &
+       vector_cadd, &
        vector_glsc2, vector_glsc3
   use scratch_registry, only: neko_scratch_registry
   implicit none
@@ -14,6 +15,7 @@ module rom_objectives
 
   public :: rom_assemble_viscous_quadratic
   public :: rom_assemble_viscous_terms
+  public :: rom_assemble_scalar_mixing_terms
   public :: rom_assemble_brinkman_objective
   public :: rom_viscous_value
   public :: rom_brinkman_value
@@ -53,7 +55,9 @@ contains
     call neko_scratch_registry%request_vector(effective, effective_index, n, .true.)
     call vector_col3(effective, weights, mask)
     call constant%init(1); call linear%init(r); call quadratic%init(r,r)
-    constant = 0.0_rp; linear = 0.0_rp; quadratic = 0.0_rp
+    constant%x = 0.0_rp
+    linear%x = 0.0_rp
+    quadratic%x = 0.0_rp
     do component = 1, 3
        do direction = 1, 3
           constant%x(1) = constant%x(1) + viscosity * vector_glsc3( &
@@ -74,6 +78,45 @@ contains
     call neko_scratch_registry%relinquish_vector(effective_index)
     nullify(effective)
   end subroutine rom_assemble_viscous_terms
+
+  !> Assemble the scalar-mixing objective for a spatial scalar lift.
+  !! The full-order functional is
+  !!  0.5 / |Omega| * <mask*(phi-phi_ref)^2, B>.
+  !! The returned constant, linear and quadratic terms omit the factor
+  !! one-half and domain normalisation, matching the velocity objective API.
+  subroutine rom_assemble_scalar_mixing_terms(weights, mask, scalar_lift, &
+       scalar_modes, scalar_reference_value, constant, linear, quadratic)
+    type(vector_t), intent(in) :: weights, mask, scalar_lift
+    type(vector_t), intent(in) :: scalar_modes(:)
+    real(kind=rp), intent(in) :: scalar_reference_value
+    type(vector_t), intent(inout) :: constant, linear
+    type(matrix_t), intent(inout) :: quadratic
+    type(vector_t), pointer :: effective, offset
+    integer :: effective_index, offset_index
+    integer :: n, r, i, j
+
+    n = weights%size(); r = size(scalar_modes)
+    if (mask%size() /= n .or. scalar_lift%size() /= n) &
+         error stop 'ROM scalar objective shape mismatch'
+    call neko_scratch_registry%request_vector(effective, effective_index, n, .true.)
+    call neko_scratch_registry%request_vector(offset, offset_index, n, .true.)
+    call vector_col3(effective, weights, mask)
+    offset = scalar_lift
+    call vector_cadd(offset, -scalar_reference_value)
+    call constant%init(1); call linear%init(r); call quadratic%init(r,r)
+    constant%x(1) = vector_glsc3(offset, effective, offset)
+    linear%x = 0.0_rp
+    quadratic%x = 0.0_rp
+    do i = 1, r
+       linear%x(i) = vector_glsc3(offset, effective, scalar_modes(i))
+       do j = 1, r
+          quadratic%x(i,j) = vector_glsc3(scalar_modes(i), effective, &
+               scalar_modes(j))
+       end do
+    end do
+    call neko_scratch_registry%relinquish_vector([effective_index, offset_index])
+    nullify(effective); nullify(offset)
+  end subroutine rom_assemble_scalar_mixing_terms
 
   !> Assemble the reduced viscous-dissipation quadratic form.
   subroutine rom_assemble_viscous_quadratic(weights, mask, viscosity, gradients, &
@@ -130,6 +173,8 @@ contains
          lift_velocity(1), lift_velocity(2), lift_velocity(3))
     constant = vector_glsc2(effective, lift_square)
     call quadratic%init(r, r); call lift_linear%init(r)
+    quadratic%x = 0.0_rp
+    lift_linear%x = 0.0_rp
     do i = 1, r
        do j = 1, r
           do component = 1, 3

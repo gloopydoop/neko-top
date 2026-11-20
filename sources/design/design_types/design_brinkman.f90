@@ -46,7 +46,6 @@ module brinkman_design
   use point_zone, only: point_zone_t
   use mask_ops, only: mask_exterior_const
   use neko_config, only: NEKO_BCKND_DEVICE
-  use device, only: DEVICE_TO_HOST, HOST_TO_DEVICE, device_memcpy
   use design, only: design_t
   use simulation_m, only: simulation_t
   use simple_brinkman_source_term, only: simple_brinkman_source_term_t
@@ -539,10 +538,10 @@ contains
        call neko_error('Get mapped design: size mismatch')
     end if
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       ! Assembly and objective kernels consume the host vector.  Copying
-       ! device-to-device here left `values%x` stale on accelerator builds.
-       call device_memcpy(values%x, this%brinkman_amplitude%x_d, n, &
-            DEVICE_TO_HOST, sync = .true.)
+       ! The mapped coefficient is consumed by ROM assembly on the device.
+       ! Keep the destination mirror untouched: a device-to-host copy here
+       ! would make every ROM candidate pay a mesh-sized transfer.
+       call device_copy(values%x_d, this%brinkman_amplitude%x_d, n)
     else
        call copy(values%x, this%brinkman_amplitude%x, n)
     end if
@@ -573,20 +572,28 @@ contains
   subroutine brinkman_design_convert_to_directional_derivative_matrix(this, mat_in)
     class(brinkman_design_t), intent(in) :: this
     type(matrix_t), intent(inout) :: mat_in
-    integer :: i
     type(vector_t) :: row
 
     if (mat_in%get_ncols() /= this%size()) then
        call neko_error('convert_to_directional_derivative: matrix size mismatch')
     end if
+    ! A ROM constraint is represented by one row.  Its row-major Fortran
+    ! section is contiguous, so the existing vector device operation can be
+    ! applied without staging the full design derivative on the host.
+    if (mat_in%get_nrows() /= 1) then
+       call neko_error('device directional derivative supports one constraint row')
+    end if
     call row%init(this%size())
-    do i = 1, mat_in%get_nrows()
-       row%x = mat_in%x(i, :)
-       call this%convert_to_directional_derivative_vector(row)
-       mat_in%x(i, :) = row%x
-    end do
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call mat_in%copy_from(HOST_TO_DEVICE, sync = .true.)
+       call device_copy(row%x_d, mat_in%x_d, this%size())
+    else
+       row%x = mat_in%x(1, :)
+    end if
+    call this%convert_to_directional_derivative_vector(row)
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call device_copy(mat_in%x_d, row%x_d, this%size())
+    else
+       mat_in%x(1, :) = row%x
     end if
     call row%free()
   end subroutine brinkman_design_convert_to_directional_derivative_matrix

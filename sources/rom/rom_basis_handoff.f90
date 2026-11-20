@@ -3,11 +3,16 @@ module rom_basis_handoff
   use state_recover, only: state_recover_t
   use fluid_pnpn, only: fluid_pnpn_t
   use field, only: field_t
+  use vector, only: vector_t
   use scratch_registry, only: neko_scratch_registry
-  use field_math, only: field_add2s2, field_col3, field_rzero
+  use field_math, only: field_add2s2, field_col3, field_rzero, field_copy, &
+       field_sub3
   use operators, only: grad, div, ortho
   use gather_scatter, only: GS_OP_ADD
   use math, only: col2, glsc3
+  use device_math, only: device_col2, device_glsc3
+  use device, only: DEVICE_TO_HOST, HOST_TO_DEVICE
+  use neko_config, only: NEKO_BCKND_DEVICE
   use krylov, only: ksp_monitor_t
   use json_file_module, only: json_file
   use json_utils, only: json_get, json_get_or_default
@@ -17,7 +22,7 @@ module rom_basis_handoff
   use logger, only: neko_log
   use utils, only: neko_error
   use rom_basis_orthogonalization, only: rom_mass_dot, &
-       rom_mass_orthonormalize
+       rom_mass_orthonormalize_device
   use rom_projection_operator, only: rom_projection_ax_t
   implicit none
   private
@@ -25,6 +30,95 @@ module rom_basis_handoff
   public :: rom_receive_basis, rom_project_basis
 
 contains
+
+  !> Orthonormalise the final projected velocity columns on Neko's backend.
+  !!
+  !! `projected` is the host staging buffer supplied by the ADIOS/Python
+  !! handoff.  It is uploaded once after projection, processed with device
+  !! vector contractions and axpy operations, and read back once for the
+  !! returned host basis.  No invocation occurs in the reduced inner loop.
+  subroutine rom_orthonormalize_projected_device(projected, n, n_modes, mass, &
+       tolerance, accepted, final_mode_index, mass_norm_final, mass_cross_final, ok)
+    real(kind=rp), allocatable, intent(inout) :: projected(:, :)
+    integer, intent(in) :: n
+    integer, intent(in) :: n_modes
+    real(kind=rp), intent(in) :: mass(:), tolerance
+    integer, intent(out) :: accepted
+    integer, intent(inout) :: final_mode_index(:)
+    real(kind=rp), intent(inout) :: mass_norm_final(:), mass_cross_final(:)
+    logical, intent(out) :: ok
+    type(vector_t), allocatable :: modes(:, :)
+    type(vector_t) :: weights
+    integer :: mode, component
+
+    accepted = 0
+    ok = .false.
+    if (n < 1 .or. size(mass) < n .or. size(projected, 1) /= 3*n .or. &
+         size(final_mode_index) < n_modes .or. size(mass_norm_final) < n_modes .or. &
+         size(mass_cross_final) < n_modes) return
+    allocate(modes(3, n_modes))
+    do mode = 1, n_modes
+       do component = 1, 3
+          call modes(component, mode)%init(n)
+          modes(component, mode)%x = projected((component-1)*n+1:component*n, mode)
+          if (NEKO_BCKND_DEVICE .eq. 1) then
+             call modes(component, mode)%copy_from(HOST_TO_DEVICE, sync = .true.)
+          end if
+       end do
+    end do
+    call weights%init(n)
+    weights%x = mass(1:n)
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call weights%copy_from(HOST_TO_DEVICE, sync = .true.)
+    end if
+    call rom_mass_orthonormalize_device(modes, weights, tolerance, accepted, &
+         final_mode_index, mass_norm_final, mass_cross_final, ok)
+    if (ok) then
+       do mode = 1, accepted
+          do component = 1, 3
+             if (NEKO_BCKND_DEVICE .eq. 1) then
+                call modes(component, mode)%copy_from(DEVICE_TO_HOST, sync = .true.)
+             end if
+             projected((component-1)*n+1:component*n, mode) = modes(component, mode)%x
+          end do
+       end do
+    end if
+    call weights%free()
+    do mode = 1, size(modes, 2)
+       do component = 1, 3
+          call modes(component, mode)%free()
+       end do
+    end do
+    deallocate(modes)
+  end subroutine rom_orthonormalize_projected_device
+
+  !> Multiply a mesh field by Neko's SEM diagonal on the active backend.
+  !! The coefficient mirror is selected explicitly so a host `%x` write can
+  !! never silently replace the device arithmetic on HIP/CUDA builds.
+  subroutine rom_col2_B(field, fluid, n)
+    type(field_t), intent(inout) :: field
+    type(fluid_pnpn_t), intent(in) :: fluid
+    integer, intent(in) :: n
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call device_col2(field%x_d, fluid%c_Xh%B_d, n)
+    else
+       call col2(field%x, fluid%c_Xh%B, n)
+    end if
+  end subroutine rom_col2_B
+
+  !> Return a global SEM-weighted squared norm for a mesh field.
+  function rom_weighted_norm(field, weight, weight_d, n) result(value)
+    type(field_t), intent(in) :: field
+    real(kind=rp), intent(in) :: weight(:,:,:,:)
+    type(c_ptr), intent(in) :: weight_d
+    integer, intent(in) :: n
+    real(kind=rp) :: value
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       value = device_glsc3(field%x_d, weight_d, field%x_d, n)
+    else
+       value = glsc3(field%x, weight, field%x, n)
+    end if
+  end function rom_weighted_norm
 
   !> Receive one local velocity basis from the ROM state-recovery stream.
   !! Transport belongs to the ROM add-on; the generic simulation only exposes
@@ -57,10 +151,54 @@ contains
   end subroutine rom_receive_basis
 
   !> Read projection settings and enforce the ROM basis admissibility policy.
-  subroutine rom_project_basis(simulation, basis, n_modes)
+  subroutine rom_project_basis(simulation, basis, n_modes, n_fields)
     type(simulation_t), intent(inout) :: simulation
     real(kind=rp), allocatable, intent(inout) :: basis(:, :)
     integer, intent(inout) :: n_modes
+    integer, intent(in), optional :: n_fields
+    real(kind=rp), allocatable :: velocity_basis(:, :), scalar_basis(:, :)
+    integer, allocatable :: kept_indices(:)
+    integer :: fields, old_modes, n, kept
+
+    fields = 3
+    if (present(n_fields)) fields = n_fields
+    if (fields /= 3 .and. fields /= 4) then
+       call neko_error('ROM basis must contain three velocity fields or one scalar too')
+    end if
+    if (fields == 4) then
+       n = simulation%fluid%u%dof%size()
+       old_modes = n_modes
+       if (size(basis,1) /= 4*n) call neko_error('coupled ROM basis has wrong row count')
+       allocate(velocity_basis(3*n, old_modes), scalar_basis(n, old_modes))
+       velocity_basis = basis(1:3*n,1:old_modes)
+       scalar_basis = basis(3*n+1:4*n,1:old_modes)
+       call rom_project_basis_velocity(simulation, velocity_basis, n_modes, &
+            kept_indices)
+       if (n_modes /= old_modes) then
+          if (n_modes < 1) call neko_error('velocity projection removed every coupled ROM mode')
+          deallocate(scalar_basis)
+          allocate(scalar_basis(n,n_modes))
+          do kept = 1, n_modes
+             scalar_basis(:,kept) = basis(3*n+1:4*n,kept_indices(kept))
+          end do
+       end if
+       deallocate(basis)
+       allocate(basis(4*n,n_modes))
+       basis(1:3*n,:) = velocity_basis(:,1:n_modes)
+       basis(3*n+1:4*n,:) = scalar_basis(:,1:n_modes)
+       deallocate(velocity_basis, scalar_basis)
+       if (allocated(kept_indices)) deallocate(kept_indices)
+       return
+    end if
+    call rom_project_basis_velocity(simulation, basis, n_modes)
+  end subroutine rom_project_basis
+
+  !> Apply the velocity-only admissibility handoff used by the common basis.
+  subroutine rom_project_basis_velocity(simulation, basis, n_modes, kept_indices)
+    type(simulation_t), intent(inout) :: simulation
+    real(kind=rp), allocatable, intent(inout) :: basis(:, :)
+    integer, intent(inout) :: n_modes
+    integer, allocatable, intent(out), optional :: kept_indices(:)
     real(kind=rp) :: pressure_abs_tol, pressure_rel_tol
     integer :: pressure_max_iter, projection_outer_iterations
     real(kind=rp) :: admissibility_tolerance
@@ -95,16 +233,18 @@ contains
     type is (fluid_pnpn_t)
        call project_rom_basis_pnpn(fluid, basis, n_modes, pressure_abs_tol, &
             pressure_rel_tol, pressure_max_iter, admissibility_tolerance, &
-            projection_outer_iterations, diagnostics_file, strict_admissibility)
+            projection_outer_iterations, diagnostics_file, strict_admissibility, &
+            kept_indices)
     class default
        call neko_error('ROM admissibility projection requires a Pn/Pn fluid')
     end select
-  end subroutine rom_project_basis
+  end subroutine rom_project_basis_velocity
 
   !> Project a streamed Pn/Pn basis using Neko's constrained Schur operator.
   subroutine project_rom_basis_pnpn(fluid, basis, n_modes, projection_abs_tol, &
        projection_rel_tol, projection_max_iter, admissibility_tolerance, &
-       projection_outer_iterations, diagnostics_file, strict_admissibility)
+       projection_outer_iterations, diagnostics_file, strict_admissibility, &
+       kept_indices)
     type(fluid_pnpn_t), intent(inout), target :: fluid
     real(kind=rp), allocatable, intent(inout) :: basis(:, :)
     integer, intent(inout) :: n_modes
@@ -114,6 +254,7 @@ contains
     integer, intent(in) :: projection_outer_iterations
     character(len=*), intent(in) :: diagnostics_file
     logical, intent(in) :: strict_admissibility
+    integer, allocatable, intent(out), optional :: kept_indices(:)
     type(field_t), pointer :: p_work, p_rhs, p_op, q_op, phi, u_work, v_work, w_work
     type(field_t), pointer :: u_zero, v_zero, w_zero, f_x, f_y, f_z
     type(field_t), pointer :: grad_x, grad_y, grad_z
@@ -145,7 +286,7 @@ contains
     real(kind=rp) :: pressure_operator_norm
     real(kind=rp) :: saved_abs_tol, saved_rel_tol
     integer :: saved_max_iter
-    integer :: n, mode, previous, accepted, diagnostic_unit, projection_pass
+    integer :: n, mode, previous, accepted, kept, diagnostic_unit, projection_pass
     logical :: diagnostic_open, projection_failed, orthonormal
     character(len=512) :: pressure_log
     type(c_ptr) :: event
@@ -245,6 +386,13 @@ contains
        u_work%x = reshape(basis(1:n, mode), shape(u_work%x))
        v_work%x = reshape(basis(n + 1:2 * n, mode), shape(v_work%x))
        w_work%x = reshape(basis(2 * n + 1:3 * n, mode), shape(w_work%x))
+       if (NEKO_BCKND_DEVICE .eq. 1) then
+          ! Basis reception is the explicit host/device boundary.  All
+          ! subsequent gather, projection and residual work remains on device.
+          call u_work%copy_from(HOST_TO_DEVICE, sync = .true.)
+          call v_work%copy_from(HOST_TO_DEVICE, sync = .true.)
+          call w_work%copy_from(HOST_TO_DEVICE, sync = .true.)
+       end if
 
        ! fld files contain element-local nodal values.  Resolve shared GLL
        ! nodes exactly as Neko does for restart/initial-condition fields
@@ -252,9 +400,14 @@ contains
        ! inter-element jumps enter the pressure RHS as artificial surface
        ! divergence even when the elementwise strong divergence is small.
        call fluid%gs_Xh%op(u_work%x, v_work%x, w_work%x, n, GS_OP_ADD)
-       call col2(u_work%x, fluid%c_Xh%mult, n)
-       call col2(v_work%x, fluid%c_Xh%mult, n)
-       call col2(w_work%x, fluid%c_Xh%mult, n)
+       call rom_col2_B(u_work, fluid, n)
+       call rom_col2_B(v_work, fluid, n)
+       call rom_col2_B(w_work, fluid, n)
+       if (NEKO_BCKND_DEVICE .eq. 1) then
+          call u_work%copy_from(DEVICE_TO_HOST, sync = .true.)
+          call v_work%copy_from(DEVICE_TO_HOST, sync = .true.)
+          call w_work%copy_from(DEVICE_TO_HOST, sync = .true.)
+       end if
        basis(1:n, mode) = reshape(u_work%x, [n])
        basis(n + 1:2 * n, mode) = reshape(v_work%x, [n])
        basis(2 * n + 1:3 * n, mode) = reshape(w_work%x, [n])
@@ -277,9 +430,9 @@ contains
        call field_col3(f_x, u_work, fluid%rho)
        call field_col3(f_y, v_work, fluid%rho)
        call field_col3(f_z, w_work, fluid%rho)
-       call col2(f_x%x, fluid%c_Xh%B, n)
-       call col2(f_y%x, fluid%c_Xh%B, n)
-       call col2(f_z%x, fluid%c_Xh%B, n)
+       call rom_col2_B(f_x, fluid, n)
+       call rom_col2_B(f_y, fluid, n)
+       call rom_col2_B(f_z, fluid, n)
        call field_rzero(p_work)
        call fluid%prs_res%compute(p_work, p_rhs, u_work, v_work, w_work, &
             u_zero, v_zero, w_zero, f_x, f_y, f_z, fluid%c_Xh, fluid%gs_Xh, &
@@ -290,8 +443,8 @@ contains
        end if
        call fluid%gs_Xh%op(p_rhs%x, n, GS_OP_ADD)
        call fluid%bcs_prs_projector%apply(p_rhs%x, n)
-       weak_divergence_before(mode) = sqrt(max(0.0_rp, glsc3(p_rhs%x, &
-            fluid%c_Xh%mult, p_rhs%x, n)))
+       weak_divergence_before(mode) = sqrt(max(0.0_rp, &
+            rom_weighted_norm(p_rhs, fluid%c_Xh%mult, fluid%c_Xh%mult_d, n)))
 
        ! Restrict the incoming column to the homogeneous forward velocity
        ! space before forming the pressure RHS. This uses Neko's resolved
@@ -321,9 +474,9 @@ contains
        call field_col3(f_x, u_work, fluid%rho)
        call field_col3(f_y, v_work, fluid%rho)
        call field_col3(f_z, w_work, fluid%rho)
-       call col2(f_x%x, fluid%c_Xh%B, n)
-       call col2(f_y%x, fluid%c_Xh%B, n)
-       call col2(f_z%x, fluid%c_Xh%B, n)
+       call rom_col2_B(f_x, fluid, n)
+       call rom_col2_B(f_y, fluid, n)
+       call rom_col2_B(f_z, fluid, n)
        call field_rzero(p_work)
        call field_rzero(phi)
        call fluid%prs_res%compute(p_work, p_rhs, u_work, v_work, w_work, &
@@ -340,10 +493,10 @@ contains
        end if
        call fluid%gs_Xh%op(p_rhs%x, n, GS_OP_ADD)
        call fluid%bcs_prs_projector%apply(p_rhs%x, n)
-       weak_divergence_after_bc_input(mode) = sqrt(max(0.0_rp, glsc3(&
-            p_rhs%x, fluid%c_Xh%mult, p_rhs%x, n)))
-       pressure_rhs_norm(mode) = sqrt(max(0.0_rp, glsc3(p_rhs%x, &
-            fluid%c_Xh%mult, p_rhs%x, n)))
+       weak_divergence_after_bc_input(mode) = sqrt(max(0.0_rp, &
+            rom_weighted_norm(p_rhs, fluid%c_Xh%mult, fluid%c_Xh%mult_d, n)))
+       pressure_rhs_norm(mode) = sqrt(max(0.0_rp, &
+            rom_weighted_norm(p_rhs, fluid%c_Xh%mult, fluid%c_Xh%mult_d, n)))
        call fluid%pc_prs%update()
        ksp_result = fluid%ksp_prs%solve(projection_ax, phi, p_rhs%x, n, &
             fluid%c_Xh, fluid%bcs_prs_projector, fluid%gs_Xh, &
@@ -366,8 +519,8 @@ contains
        call fluid%bcs_prs_projector%apply(p_op%x, n)
        call field_add2s2(p_op, p_rhs, -1.0_rp)
        call fluid%bcs_prs_projector%apply(p_op%x, n)
-       pressure_residual(mode) = sqrt(max(0.0_rp, glsc3(p_op%x, &
-            fluid%c_Xh%mult, p_op%x, n)))
+       pressure_residual(mode) = sqrt(max(0.0_rp, &
+            rom_weighted_norm(p_op, fluid%c_Xh%mult, fluid%c_Xh%mult_d, n)))
        pressure_relative(mode) = pressure_residual(mode) / &
             max(pressure_rhs_norm(mode), tiny(1.0_rp))
 
@@ -381,12 +534,12 @@ contains
        call fluid%bcs_prs_projector%apply(p_work%x, n)
        call field_add2s2(p_rhs, p_work, -1.0_rp)
        call fluid%bcs_prs_projector%apply(p_rhs%x, n)
-       native_pressure_residual(mode) = sqrt(max(0.0_rp, glsc3(p_rhs%x, &
-            fluid%c_Xh%mult, p_rhs%x, n)))
+       native_pressure_residual(mode) = sqrt(max(0.0_rp, &
+            rom_weighted_norm(p_rhs, fluid%c_Xh%mult, fluid%c_Xh%mult_d, n)))
        native_pressure_relative(mode) = native_pressure_residual(mode) / &
             max(pressure_rhs_norm(mode), tiny(1.0_rp))
-       pressure_solution_norm = sqrt(max(0.0_rp, glsc3(phi%x, &
-            fluid%c_Xh%B, phi%x, n)))
+       pressure_solution_norm = sqrt(max(0.0_rp, &
+            rom_weighted_norm(phi, fluid%c_Xh%B, fluid%c_Xh%B_d, n)))
        call fluid%Ax_prs%compute(p_work%x, phi%x, fluid%c_Xh, fluid%msh, &
             fluid%Xh)
        call fluid%gs_Xh%op(p_work%x, n, GS_OP_ADD)
@@ -396,32 +549,37 @@ contains
        ! Schur complement, followed by gather/average and the native
        ! homogeneous velocity restriction.  This is the correction operator
        ! whose algebra is tested independently, not an unrelated Laplacian.
-       call grad(grad_x%x, grad_y%x, grad_z%x, phi%x, fluid%c_Xh)
+       if (NEKO_BCKND_DEVICE .eq. 1) then
+          call grad(grad_x%x_d, grad_y%x_d, grad_z%x_d, phi%x_d, fluid%c_Xh)
+       else
+          call grad(grad_x%x, grad_y%x, grad_z%x, phi%x, fluid%c_Xh)
+       end if
        call fluid%gs_Xh%op(grad_x%x, grad_y%x, grad_z%x, n, GS_OP_ADD)
-       call col2(grad_x%x, fluid%c_Xh%mult, n)
-       call col2(grad_y%x, fluid%c_Xh%mult, n)
-       call col2(grad_z%x, fluid%c_Xh%mult, n)
+       call rom_col2_B(grad_x, fluid, n)
+       call rom_col2_B(grad_y, fluid, n)
+       call rom_col2_B(grad_z, fluid, n)
        call fluid%bcs_vel_projector%apply(grad_x%x, grad_y%x, grad_z%x, n)
        call div(divergence%x, grad_x%x, grad_y%x, grad_z%x, fluid%c_Xh)
-       gradient_divergence_norm = sqrt(max(0.0_rp, glsc3(divergence%x, &
-            fluid%c_Xh%B, divergence%x, n)))
+       gradient_divergence_norm = sqrt(max(0.0_rp, &
+            rom_weighted_norm(divergence, fluid%c_Xh%B, fluid%c_Xh%B_d, n)))
        ! Compare the constrained Schur operator with Neko's unmodified
        ! pressure Poisson operator.  The manufactured diagnostic proves the
        ! latter on compatible fields; this quantity records the boundary /
        ! gather-scatter difference for each adjoint mode.
-       pressure_operator_norm = sqrt(max(0.0_rp, glsc3(p_work%x, &
-            fluid%c_Xh%mult, p_work%x, n)))
+       pressure_operator_norm = sqrt(max(0.0_rp, &
+            rom_weighted_norm(p_work, fluid%c_Xh%mult, fluid%c_Xh%mult_d, n)))
        call projection_ax%compute(p_op%x, phi%x, fluid%c_Xh, fluid%msh, &
             fluid%Xh)
        call fluid%gs_Xh%op(p_op%x, n, GS_OP_ADD)
        call fluid%bcs_prs_projector%apply(p_op%x, n)
        call field_add2s2(p_op, p_work, -1.0_rp)
        call fluid%bcs_prs_projector%apply(p_op%x, n)
-       operator_consistency_norm = sqrt(max(0.0_rp, glsc3(p_op%x, &
-            fluid%c_Xh%mult, p_op%x, n)))
-       correction_norm = sqrt(max(0.0_rp, glsc3(grad_x%x, fluid%c_Xh%B, &
-            grad_x%x, n) + glsc3(grad_y%x, fluid%c_Xh%B, grad_y%x, n) + &
-            glsc3(grad_z%x, fluid%c_Xh%B, grad_z%x, n)))
+       operator_consistency_norm = sqrt(max(0.0_rp, &
+            rom_weighted_norm(p_op, fluid%c_Xh%mult, fluid%c_Xh%mult_d, n)))
+       correction_norm = sqrt(max(0.0_rp, &
+            rom_weighted_norm(grad_x, fluid%c_Xh%B, fluid%c_Xh%B_d, n) + &
+            rom_weighted_norm(grad_y, fluid%c_Xh%B, fluid%c_Xh%B_d, n) + &
+            rom_weighted_norm(grad_z, fluid%c_Xh%B, fluid%c_Xh%B_d, n)))
        call field_add2s2(u_work, grad_x, -1.0_rp)
        call field_add2s2(v_work, grad_y, -1.0_rp)
        call field_add2s2(w_work, grad_z, -1.0_rp)
@@ -429,9 +587,9 @@ contains
        ! nodes.  Resolve the corrected velocity back into Neko's continuous
        ! nodal space before measuring its divergence or applying BCs.
        call fluid%gs_Xh%op(u_work%x, v_work%x, w_work%x, n, GS_OP_ADD)
-       call col2(u_work%x, fluid%c_Xh%mult, n)
-       call col2(v_work%x, fluid%c_Xh%mult, n)
-       call col2(w_work%x, fluid%c_Xh%mult, n)
+       call rom_col2_B(u_work, fluid, n)
+       call rom_col2_B(v_work, fluid, n)
+       call rom_col2_B(w_work, fluid, n)
        call rom_divergence_norm(fluid, u_work, v_work, w_work, divergence, &
             n, divergence_before_final_bc)
        call fluid%bcs_vel_projector%apply(u_work%x, v_work%x, w_work%x, n)
@@ -446,9 +604,9 @@ contains
        call field_col3(f_x, u_work, fluid%rho)
        call field_col3(f_y, v_work, fluid%rho)
        call field_col3(f_z, w_work, fluid%rho)
-       call col2(f_x%x, fluid%c_Xh%B, n)
-       call col2(f_y%x, fluid%c_Xh%B, n)
-       call col2(f_z%x, fluid%c_Xh%B, n)
+       call rom_col2_B(f_x, fluid, n)
+       call rom_col2_B(f_y, fluid, n)
+       call rom_col2_B(f_z, fluid, n)
        call field_rzero(p_work)
        call fluid%prs_res%compute(p_work, p_rhs, u_work, v_work, w_work, &
             u_zero, v_zero, w_zero, f_x, f_y, f_z, fluid%c_Xh, fluid%gs_Xh, &
@@ -459,8 +617,8 @@ contains
        end if
        call fluid%gs_Xh%op(p_rhs%x, n, GS_OP_ADD)
        call fluid%bcs_prs_projector%apply(p_rhs%x, n)
-       weak_divergence_after(mode) = sqrt(max(0.0_rp, glsc3(p_rhs%x, &
-            fluid%c_Xh%mult, p_rhs%x, n)))
+       weak_divergence_after(mode) = sqrt(max(0.0_rp, &
+            rom_weighted_norm(p_rhs, fluid%c_Xh%mult, fluid%c_Xh%mult_d, n)))
 
        ! Keep the opposite sign as a diagnostic while the discrete operator
        ! pairing is being verified.  Restore the selected correction before
@@ -486,6 +644,13 @@ contains
 
        end do
 
+       if (NEKO_BCKND_DEVICE .eq. 1) then
+          ! Returning the projected basis to the Python/ADIOS-facing host
+          ! array is a deliberate basis-reception boundary.
+          call u_work%copy_from(DEVICE_TO_HOST, sync = .true.)
+          call v_work%copy_from(DEVICE_TO_HOST, sync = .true.)
+          call w_work%copy_from(DEVICE_TO_HOST, sync = .true.)
+       end if
        projected(1:n, mode) = reshape(u_work%x, [n])
        projected(n + 1:2 * n, mode) = reshape(v_work%x, [n])
        projected(2 * n + 1:3 * n, mode) = reshape(w_work%x, [n])
@@ -591,6 +756,57 @@ contains
        nullify(p_work, p_rhs, p_op, q_op, phi, u_work, v_work, w_work)
        nullify(u_zero, v_zero, w_zero, f_x, f_y, f_z, grad_x, grad_y, grad_z)
        nullify(divergence, bc_u, bc_v, bc_w)
+       if (strict_admissibility) then
+          deallocate(projected, mass, divergence_before, divergence_bc_input, &
+               divergence_after, bc_before, bc_after, mass_norm_before, &
+               mass_norm_raw_after, mass_cross_before, mass_cross_raw_after, &
+               weak_divergence_before, weak_divergence_after_bc_input, &
+               pressure_rhs_norm, pressure_residual, pressure_relative, &
+               native_pressure_residual, native_pressure_relative, &
+               weak_divergence_after, mass_norm_final, mass_cross_final, &
+               pressure_ksp_start, pressure_ksp_final, pressure_iterations, &
+               pressure_converged, final_mode_index)
+          call neko_error('ROM admissibility projection failed; see per-mode diagnostics')
+       else
+          ! The engineering path is deliberately not a scientific admission:
+          ! a failed pressure/BC gate remains visible in the warning and CSV.
+          ! It must nevertheless remove collapsed columns before the coupled
+          ! ROM mass is assembled.  Keeping a zero projected column produces
+          ! a singular reduced system and hides the actual gate failure behind
+          ! an unrelated linear-algebra error.  Strict mode never reaches this
+          ! fallback.
+          call rom_orthonormalize_projected_device(projected, n, n_modes, mass, &
+               admissibility_tolerance, accepted, final_mode_index, mass_norm_final, &
+               mass_cross_final, orthonormal)
+          if (.not. orthonormal .or. accepted < 1) then
+             deallocate(projected, mass, divergence_before, divergence_bc_input, &
+                  divergence_after, bc_before, bc_after, mass_norm_before, &
+                  mass_norm_raw_after, mass_cross_before, mass_cross_raw_after, &
+                  weak_divergence_before, weak_divergence_after_bc_input, &
+                  pressure_rhs_norm, pressure_residual, pressure_relative, &
+                  native_pressure_residual, native_pressure_relative, &
+                  weak_divergence_after, mass_norm_final, mass_cross_final, &
+                  pressure_ksp_start, pressure_ksp_final, pressure_iterations, &
+                  pressure_converged, final_mode_index)
+             call neko_error('ROM engineering fallback removed every projected mode')
+          end if
+          basis = projected(:, 1:accepted)
+          n_modes = accepted
+          if (present(kept_indices)) then
+             allocate(kept_indices(accepted))
+             kept = 0
+             do mode = 1, size(final_mode_index)
+                if (final_mode_index(mode) > 0) then
+                   kept = kept + 1
+                   kept_indices(kept) = mode
+                end if
+             end do
+          end if
+          call neko_log%warning('ROM admissibility projection did not meet its '&
+               //'scientific gate; continuing with the homogeneous-BC basis '&
+               //'for engineering experimentation. The ROM is not validated; '&
+               //'see ' // trim(diagnostics_file))
+       end if
        deallocate(projected, mass, divergence_before, divergence_bc_input, &
             divergence_after, bc_before, bc_after, mass_norm_before, &
             mass_norm_raw_after, mass_cross_before, mass_cross_raw_after, &
@@ -600,14 +816,6 @@ contains
             weak_divergence_after, mass_norm_final, mass_cross_final, &
             pressure_ksp_start, pressure_ksp_final, pressure_iterations, &
             pressure_converged, final_mode_index)
-       if (strict_admissibility) then
-          call neko_error('ROM admissibility projection failed; see per-mode diagnostics')
-       else
-          call neko_log%warning('ROM admissibility projection did not meet its '&
-               //'scientific gate; continuing with the homogeneous-BC basis '&
-               //'for engineering experimentation. The ROM is not validated; '&
-               //'see ' // trim(diagnostics_file))
-       end if
        return
     end if
 
@@ -616,8 +824,9 @@ contains
     ! global SEM mass as the Python POD combination.  The implementation is
     ! in an independent ROM module so this numerical gate is testable without
     ! constructing a simulation object.
-    call rom_mass_orthonormalize(projected, n, mass, admissibility_tolerance, &
-         accepted, final_mode_index, mass_norm_final, mass_cross_final, orthonormal)
+    call rom_orthonormalize_projected_device(projected, n, n_modes, mass, &
+         admissibility_tolerance, accepted, final_mode_index, mass_norm_final, &
+         mass_cross_final, orthonormal)
     if (.not. orthonormal) then
        call neko_error('ROM projected basis is not mass-orthonormal; '&
             //'gather-scatter normalisation or reorthogonalisation failed')
@@ -628,6 +837,16 @@ contains
        basis = projected
     end if
     n_modes = accepted
+    if (present(kept_indices)) then
+       allocate(kept_indices(accepted))
+       kept = 0
+       do mode = 1, size(final_mode_index)
+          if (final_mode_index(mode) > 0) then
+             kept = kept + 1
+             kept_indices(kept) = mode
+          end if
+       end do
+    end if
 
     if (diagnostic_open) then
        do mode = 1, size(divergence_before)
@@ -681,9 +900,13 @@ contains
     integer, intent(in) :: n
     real(kind=rp), intent(out) :: value
 
-    call div(divergence%x, u%x, v%x, w%x, fluid%c_Xh)
-    value = sqrt(max(0.0_rp, glsc3(divergence%x, fluid%c_Xh%B, &
-         divergence%x, n)))
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call div(divergence%x_d, u%x_d, v%x_d, w%x_d, fluid%c_Xh)
+    else
+       call div(divergence%x, u%x, v%x, w%x, fluid%c_Xh)
+    end if
+    value = sqrt(max(0.0_rp, rom_weighted_norm(divergence, fluid%c_Xh%B, &
+         fluid%c_Xh%B_d, n)))
   end subroutine rom_divergence_norm
 
   !> Measure the residual of Neko's homogeneous velocity projector.
@@ -695,14 +918,14 @@ contains
     real(kind=rp), intent(out) :: value
     real(kind=rp) :: norm_squared
 
-    bc_u%x = u%x; bc_v%x = v%x; bc_w%x = w%x
+    call field_copy(bc_u, u); call field_copy(bc_v, v); call field_copy(bc_w, w)
     call fluid%bcs_vel_projector%apply(bc_u%x, bc_v%x, bc_w%x, n)
-    bc_u%x = bc_u%x - u%x
-    bc_v%x = bc_v%x - v%x
-    bc_w%x = bc_w%x - w%x
-    norm_squared = glsc3(bc_u%x, fluid%c_Xh%B, bc_u%x, n) + &
-         glsc3(bc_v%x, fluid%c_Xh%B, bc_v%x, n) + &
-         glsc3(bc_w%x, fluid%c_Xh%B, bc_w%x, n)
+    call field_sub3(bc_u, bc_u, u, n)
+    call field_sub3(bc_v, bc_v, v, n)
+    call field_sub3(bc_w, bc_w, w, n)
+    norm_squared = rom_weighted_norm(bc_u, fluid%c_Xh%B, fluid%c_Xh%B_d, n) + &
+         rom_weighted_norm(bc_v, fluid%c_Xh%B, fluid%c_Xh%B_d, n) + &
+         rom_weighted_norm(bc_w, fluid%c_Xh%B, fluid%c_Xh%B_d, n)
     value = sqrt(max(0.0_rp, norm_squared))
   end subroutine rom_bc_residual_norm
 

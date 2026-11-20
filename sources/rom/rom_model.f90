@@ -63,22 +63,25 @@ contains
     call this%linear%init(this%n_state, this%n_state)
     call this%implicit_linear%init(this%n_state, this%n_state)
     call this%constant%init(this%n_state)
-    this%mass = mass
-    this%linear = linear
-    this%constant = constant
-    this%implicit_linear = 0.0_rp
+    ! Reduced dense algebra is intentionally host-owned.  Copy the host
+    ! mirrors explicitly; container assignment would copy device mirrors on
+    ! accelerator builds even though assembly returns scalar host entries.
+    this%mass%x = mass%x
+    this%linear%x = linear%x
+    this%constant%x = constant%x
+    this%implicit_linear%x = 0.0_rp
     if (present(implicit_linear)) then
        if (implicit_linear%get_nrows() /= this%n_state .or. &
             implicit_linear%get_ncols() /= this%n_state) then
           error stop 'ROM implicit linear operator has the wrong shape'
        end if
-       this%implicit_linear = implicit_linear
+       this%implicit_linear%x = implicit_linear%x
     end if
 
     allocate(this%quadratic(this%n_state))
     do i = 1, this%n_state
        call this%quadratic(i)%init(this%n_state, this%n_state)
-       this%quadratic(i) = quadratic(i)
+       this%quadratic(i)%x = quadratic(i)%x
     end do
   end subroutine rom_model_init
 
@@ -240,7 +243,7 @@ contains
     call neko_scratch_registry%request_vector(next_adjoint, next_index, this%n_state, .true.)
     call neko_scratch_registry%request_vector(current_adjoint, current_index, this%n_state, .true.)
     call neko_scratch_registry%request_vector(terminal, terminal_index, this%n_state, .true.)
-    terminal = terminal_state_gradient
+    terminal%x = terminal_state_gradient%x
     adjoint%x(:,n_steps+1) = terminal%x
     call neko_scratch_registry%request_matrix(jacobian, jacobian_index, &
          this%n_state, this%n_state, .true.)
@@ -294,7 +297,7 @@ contains
     call neko_scratch_registry%request_vector(terminal, terminal_index, this%n_state, .true.)
     call neko_scratch_registry%request_vector(next_adjoint, next_index, this%n_state, .true.)
     call neko_scratch_registry%request_vector(current_adjoint, current_index, this%n_state, .true.)
-    terminal = terminal_state_gradient
+    terminal%x = terminal_state_gradient%x
     adjoint%x(:,n_steps+1) = terminal%x
     call neko_scratch_registry%request_matrix(jacobian, jacobian_index, &
          this%n_state, this%n_state, .true.)

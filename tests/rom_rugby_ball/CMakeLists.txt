@@ -65,6 +65,17 @@ add_rom_rugby_ball_diagnostic(
     objective_algebra_diagnostic.f90)
 
 add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_scalar_transport_diagnostic
+    scalar_transport_diagnostic.f90)
+
+add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_scalar_objective_equivalence_diagnostic
+    scalar_objective_equivalence_diagnostic.f90
+    PkgConfig::json-fortran)
+target_sources(ROM_rugby_ball_scalar_objective_equivalence_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+
+add_rom_rugby_ball_diagnostic(
     ROM_rugby_ball_residual_identity_diagnostic
     residual_identity_diagnostic.f90
     PkgConfig::json-fortran)
@@ -94,6 +105,8 @@ add_custom_target(ROM_rugby_ball_diagnostics
         ROM_rugby_ball_forward_continuity_diagnostic
         ROM_rugby_ball_projection_algebra_diagnostic
         ROM_rugby_ball_objective_diagnostic
+        ROM_rugby_ball_scalar_transport_diagnostic
+        ROM_rugby_ball_scalar_objective_equivalence_diagnostic
         ROM_rugby_ball_residual_identity_diagnostic
         ROM_rugby_ball_objective_equivalence_diagnostic
         ROM_rugby_ball_production_rom_gradient_diagnostic

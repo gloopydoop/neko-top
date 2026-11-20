@@ -15,10 +15,12 @@ module rom_assembly
   private
 
   public :: rom_assemble_mass
+  public :: rom_assemble_mass_coupled
   public :: rom_assemble_brinkman
   public :: rom_assemble_lift_convection
   public :: rom_assemble_diffusion
   public :: rom_assemble_convection
+  public :: rom_assemble_scalar_transport
 
 contains
 
@@ -33,6 +35,10 @@ contains
     if (n < 1 .or. n_fields < 1 .or. any([(modes(field,1)%size(), field=1,n_fields)] /= n)) &
          error stop 'ROM mass assembly shape mismatch'
     call mass%init(n_modes, n_modes)
+    ! Reduced coefficients are assembled by host scalar contractions.  Keep
+    ! this ownership explicit; no device mirror is consumed by the reduced
+    ! solver.
+    mass%x = 0.0_rp
     do i = 1, n_modes
        do j = 1, n_modes
           do field = 1, n_fields
@@ -41,6 +47,35 @@ contains
        end do
     end do
   end subroutine rom_assemble_mass
+
+  !> Assemble the coupled velocity/scalar SEM mass matrix.
+  !! The scalar multiplier is the declared state metric.  It is applied to
+  !! both the scalar mass and scalar residual contractions, so the reduced
+  !! equations remain the Galerkin projection of the block-diagonal physical
+  !! mass operator.
+  subroutine rom_assemble_mass_coupled(weights, velocity_modes, scalar_modes, &
+       scalar_weight, mass)
+    type(vector_t), intent(in) :: weights
+    type(vector_t), intent(in) :: velocity_modes(:, :)
+    type(vector_t), intent(in), optional :: scalar_modes(:)
+    real(kind=rp), intent(in), optional :: scalar_weight
+    type(matrix_t), intent(inout) :: mass
+    integer :: i, j, r
+    real(kind=rp) :: weight
+
+    r = size(velocity_modes, 2)
+    weight = 1.0_rp
+    if (present(scalar_weight)) weight = scalar_weight
+    call rom_assemble_mass(weights, velocity_modes, mass)
+    if (.not. present(scalar_modes)) return
+    if (size(scalar_modes) /= r) error stop 'ROM scalar mass shape mismatch'
+    do i = 1, r
+       do j = 1, r
+          mass%x(i,j) = mass%x(i,j) + weight * vector_glsc3( &
+               scalar_modes(i), weights, scalar_modes(j))
+       end do
+    end do
+  end subroutine rom_assemble_mass_coupled
 
   !> Assemble the reduced Brinkman operator and its lift contribution.
   subroutine rom_assemble_brinkman(weights, chi, velocity_modes, lift_velocity, &
@@ -60,6 +95,10 @@ contains
     call neko_scratch_registry%request_vector(effective, effective_index, n, .true.)
     call vector_col3(effective, weights, chi)
     call brinkman%init(n_modes, n_modes); call lift_vector%init(n_modes)
+    ! The contractions return host scalars and these reduced outputs are
+    ! deliberately host-owned.
+    brinkman%x = 0.0_rp
+    lift_vector%x = 0.0_rp
     do i = 1, n_modes
        do j = 1, n_modes
           do component = 1, 3
@@ -106,8 +145,8 @@ contains
          size(lift_gradients,2) /= 3) error stop 'ROM lift convection shape mismatch'
     call linear%init(r, r)
     call constant%init(r)
-    linear = 0.0_rp
-    constant = 0.0_rp
+    linear%x = 0.0_rp
+    constant%x = 0.0_rp
     call neko_scratch_registry%request_vector(pointwise, pointwise_index, n, .true.)
     call neko_scratch_registry%request_vector(product, product_index, n, .true.)
     do i = 1, r
@@ -168,6 +207,7 @@ contains
             error stop 'ROM diffusion lift shape mismatch'
     end if
     call implicit_linear%init(r, r)
+    implicit_linear%x = 0.0_rp
     do i = 1, r
        do j = 1, r
           do component = 1, 3
@@ -200,6 +240,7 @@ contains
          size(quadratic) /= r) error stop 'ROM convection assembly shape mismatch'
     do field = 1, r
        call quadratic(field)%init(r, r)
+       quadratic(field)%x = 0.0_rp
     end do
     call neko_scratch_registry%request_vector(pointwise, pointwise_index, n, .true.)
     call neko_scratch_registry%request_vector(product, product_index, n, .true.)
@@ -225,5 +266,128 @@ contains
     call neko_scratch_registry%relinquish_vector([pointwise_index, product_index])
     nullify(pointwise); nullify(product)
   end subroutine rom_assemble_convection
+
+  !> Assemble scalar advection and diffusion in the common ROM basis.
+  !!
+  !! For
+  !!   phi = phi_L + sum_j a_j phi_j and
+  !!   u   = u_L   + sum_j a_j u_j,
+  !! this adds the negative weak residual of u.grad(phi) and the implicit
+  !! diffusion matrix to the same reduced rows used by the velocity equation.
+  !! The routine deliberately takes spatial diffusivity so nonuniform material
+  !! properties follow Neko's scalar scheme rather than a guessed Péclet
+  !! constant.
+  subroutine rom_assemble_scalar_transport(weights, scalar_weight, velocity_modes, &
+       scalar_modes, velocity_gradients, scalar_gradients, lift_velocity, &
+       scalar_lift, lift_scalar_gradient, diffusivity, linear, constant, quadratic, &
+       implicit_linear)
+    type(vector_t), intent(in) :: weights
+    real(kind=rp), intent(in) :: scalar_weight
+    type(vector_t), intent(in) :: velocity_modes(:, :), scalar_modes(:)
+    type(vector_t), intent(in) :: velocity_gradients(:, :, :)
+    type(vector_t), intent(in) :: scalar_gradients(:, :)
+    type(vector_t), intent(in) :: lift_velocity(:), scalar_lift, lift_scalar_gradient(:)
+    type(vector_t), intent(in) :: diffusivity
+    type(matrix_t), intent(inout) :: linear, implicit_linear
+    type(vector_t), intent(inout) :: constant
+    type(matrix_t), intent(inout) :: quadratic(:)
+    type(vector_t), pointer :: effective, pointwise, product
+    integer :: effective_index, pointwise_index, product_index
+    integer :: n, r, i, j, k, direction
+
+    n = weights%size(); r = size(scalar_modes)
+    if (size(velocity_modes,1) /= 3 .or. size(velocity_modes,2) /= r .or. &
+         size(velocity_gradients,1) /= 3 .or. size(velocity_gradients,2) /= r .or. &
+         size(velocity_gradients,3) /= 3 .or. size(scalar_gradients,1) /= r .or. &
+         size(scalar_gradients,2) /= 3 .or. size(lift_velocity) /= 3 .or. &
+         scalar_lift%size() /= n .or. &
+         size(lift_scalar_gradient) /= 3 .or. diffusivity%size() /= n) then
+       error stop 'ROM scalar transport shape mismatch'
+    end if
+    if (linear%get_nrows() /= r .or. linear%get_ncols() /= r .or. &
+         implicit_linear%get_nrows() /= r .or. implicit_linear%get_ncols() /= r .or. &
+         size(quadratic) /= r .or. any([(quadratic(i)%get_nrows(), i=1,r)] /= r) .or. &
+         any([(quadratic(i)%get_ncols(), i=1,r)] /= r)) then
+       error stop 'ROM scalar transport operator shape mismatch'
+    end if
+    call neko_scratch_registry%request_vector(effective, effective_index, n, .true.)
+    call neko_scratch_registry%request_vector(pointwise, pointwise_index, n, .true.)
+    call neko_scratch_registry%request_vector(product, product_index, n, .true.)
+    effective = weights
+    call vector_cmult(effective, scalar_weight)
+
+    ! The outputs are small host-owned reduced coefficients.  This routine
+    ! accumulates the scalar block into the velocity operators assembled by
+    ! the preceding routines, so their host values are intentionally retained.
+
+    ! Lift--lift and lift--mode advection terms.  The lift--lift term must use
+    ! grad(phi_L); using grad(phi_i) here would silently turn a constant
+    ! residual into a state-dependent term and is not the Galerkin expansion
+    ! of u.grad(phi).
+    do i = 1, r
+       pointwise = 0.0_rp
+       do direction = 1, 3
+          call vector_col3(product, lift_velocity(direction), &
+               lift_scalar_gradient(direction))
+          call vector_add2(pointwise, product)
+       end do
+       constant%x(i) = constant%x(i) - vector_glsc3( &
+            scalar_modes(i), effective, pointwise)
+       do j = 1, r
+          pointwise = 0.0_rp
+          do direction = 1, 3
+             call vector_col3(product, velocity_modes(direction,j), &
+                  lift_scalar_gradient(direction))
+             call vector_add2(pointwise, product)
+             call vector_col3(product, lift_velocity(direction), &
+                  scalar_gradients(j,direction))
+             call vector_add2(pointwise, product)
+          end do
+          linear%x(i,j) = linear%x(i,j) - vector_glsc3( &
+               scalar_modes(i), effective, pointwise)
+       end do
+    end do
+
+    ! Nonlinear scalar advection u_j.grad(phi_k).
+    do i = 1, r
+       do j = 1, r
+          do k = 1, r
+             pointwise = 0.0_rp
+             do direction = 1, 3
+                call vector_col3(product, velocity_modes(direction,j), &
+                     scalar_gradients(k,direction))
+                call vector_add2(pointwise, product)
+             end do
+             quadratic(i)%x(j,k) = quadratic(i)%x(j,k) - &
+                  vector_glsc3(scalar_modes(i), effective, pointwise)
+          end do
+       end do
+    end do
+
+    ! Scalar diffusion is implicit in the BDF1 map, exactly as the velocity
+    ! diffusion assembled by rom_assemble_diffusion.
+    call vector_col3(effective, weights, diffusivity)
+    call vector_cmult(effective, scalar_weight)
+    do i = 1, r
+       do j = 1, r
+          do direction = 1, 3
+             implicit_linear%x(i,j) = implicit_linear%x(i,j) - &
+                  vector_glsc3(scalar_gradients(i,direction), effective, &
+                  scalar_gradients(j,direction))
+          end do
+       end do
+       do direction = 1, 3
+          ! The lift diffusion is a state-independent residual term.  It
+          ! belongs in the explicit constant vector; fixed_implicit is
+          ! reserved for the homogeneous scalar fluctuation.
+          constant%x(i) = constant%x(i) - &
+               vector_glsc3(scalar_gradients(i,direction), effective, &
+               lift_scalar_gradient(direction))
+       end do
+    end do
+    call neko_scratch_registry%relinquish_vector([effective_index, pointwise_index, &
+         product_index])
+    nullify(effective); nullify(pointwise); nullify(product)
+  end subroutine rom_assemble_scalar_transport
 
 end module rom_assembly
