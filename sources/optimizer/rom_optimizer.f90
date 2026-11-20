@@ -363,7 +363,12 @@ contains
     ! candidate is trustworthy.  Use the same constant-average SEM weighting
     ! as the production mma_optimizer; otherwise the validation would compare
     ! the ROM's production convention against a different full-order gradient.
+    if (this%enable_output) call simulation%write_forward(iter)
     call problem%compute_sensitivity(design, simulation)
+    ! Keep the standard outer-loop physical outputs alongside the ROM fields.
+    ! This writes the full-order state already computed for validation; it does
+    ! not trigger another forward or adjoint lifecycle.
+    if (this%enable_output) call simulation%write_adjoint(iter)
     select type (des => design)
     type is (brinkman_design_t)
        call des%get_sensitivity(df0dx)
@@ -573,6 +578,11 @@ contains
          this%norm2_design_change, rom_forward_seconds, rom_adjoint_seconds, &
          mma_seconds, full_order_seconds, status
     if (ios /= 0) call neko_error('could not write ROM optimization_data.csv')
+    ! Keep the mixed outer/inner history inspectable while the optimisation is
+    ! running; otherwise Fortran may retain several inner records in its I/O
+    ! buffer until the optimizer is freed.
+    flush(this%rom_log_unit, iostat=ios)
+    if (ios /= 0) call neko_error('could not flush ROM optimization_data.csv')
   end subroutine rom_optimizer_write_record
 
   !> Return one value from Neko's comma-separated objective/constraint log.

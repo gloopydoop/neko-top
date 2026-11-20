@@ -31,5 +31,5 @@ command -v genmeshbox >/dev/null 2>&1 || {
     exit 1
 }
 
-NX=$((N * LENGTH))
+NX=$((N * LENGTH / 2))
 genmeshbox 0 "${LENGTH}" 0 2 0 2 "${NX}" "${N}" "${N}" .false. .false. .false.

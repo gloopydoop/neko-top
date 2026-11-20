@@ -106,6 +106,20 @@ contains
     end if
   end subroutine rom_col2_B
 
+  !> Divide a mesh field by Neko's SEM diagonal on the active backend.
+  !! This is the final step of the mass-weighted gather/average
+  !! u_c = B^{-1} GS(B u) used to recover a continuous nodal field.
+  subroutine rom_col2_Binv(field, fluid, n)
+    type(field_t), intent(inout) :: field
+    type(fluid_pnpn_t), intent(in) :: fluid
+    integer, intent(in) :: n
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call device_col2(field%x_d, fluid%c_Xh%Binv_d, n)
+    else
+       call col2(field%x, fluid%c_Xh%Binv, n)
+    end if
+  end subroutine rom_col2_Binv
+
   !> Return a global SEM-weighted squared norm for a mesh field.
   function rom_weighted_norm(field, weight, weight_d, n) result(value)
     type(field_t), intent(in) :: field
@@ -395,14 +409,19 @@ contains
        end if
 
        ! fld files contain element-local nodal values.  Resolve shared GLL
-       ! nodes exactly as Neko does for restart/initial-condition fields
-       ! before using any weak operator.  Without this gather/average step,
-       ! inter-element jumps enter the pressure RHS as artificial surface
-       ! divergence even when the elementwise strong divergence is small.
-       call fluid%gs_Xh%op(u_work%x, v_work%x, w_work%x, n, GS_OP_ADD)
+       ! nodes with Neko's mass-weighted nodal average,
+       ! u_c = Binv*GS(B*u), before using any weak operator.  The streamed
+       ! values are pointwise, not mass-weighted, so B is applied first.
+       ! Without this gather/average step, inter-element jumps enter the
+       ! pressure RHS as artificial surface divergence even when the
+       ! elementwise strong divergence is small.
        call rom_col2_B(u_work, fluid, n)
        call rom_col2_B(v_work, fluid, n)
        call rom_col2_B(w_work, fluid, n)
+       call fluid%gs_Xh%op(u_work%x, v_work%x, w_work%x, n, GS_OP_ADD)
+       call rom_col2_Binv(u_work, fluid, n)
+       call rom_col2_Binv(v_work, fluid, n)
+       call rom_col2_Binv(w_work, fluid, n)
        if (NEKO_BCKND_DEVICE .eq. 1) then
           call u_work%copy_from(DEVICE_TO_HOST, sync = .true.)
           call v_work%copy_from(DEVICE_TO_HOST, sync = .true.)
@@ -546,18 +565,23 @@ contains
        call fluid%bcs_prs_projector%apply(p_work%x, n)
 
        ! Form the same restricted strong SEM gradient used by the constrained
-       ! Schur complement, followed by gather/average and the native
-       ! homogeneous velocity restriction.  This is the correction operator
-       ! whose algebra is tested independently, not an unrelated Laplacian.
+       ! Schur complement.  The gradient is pointwise, not mass-weighted, so
+       ! use Neko's mass-weighted nodal average, Binv*GS(B*grad(phi)), before
+       ! applying the native homogeneous velocity restriction.  This is the
+       ! correction operator whose algebra is tested independently, not an
+       ! unrelated Laplacian.
        if (NEKO_BCKND_DEVICE .eq. 1) then
           call grad(grad_x%x_d, grad_y%x_d, grad_z%x_d, phi%x_d, fluid%c_Xh)
        else
           call grad(grad_x%x, grad_y%x, grad_z%x, phi%x, fluid%c_Xh)
        end if
-       call fluid%gs_Xh%op(grad_x%x, grad_y%x, grad_z%x, n, GS_OP_ADD)
        call rom_col2_B(grad_x, fluid, n)
        call rom_col2_B(grad_y, fluid, n)
        call rom_col2_B(grad_z, fluid, n)
+       call fluid%gs_Xh%op(grad_x%x, grad_y%x, grad_z%x, n, GS_OP_ADD)
+       call rom_col2_Binv(grad_x, fluid, n)
+       call rom_col2_Binv(grad_y, fluid, n)
+       call rom_col2_Binv(grad_z, fluid, n)
        call fluid%bcs_vel_projector%apply(grad_x%x, grad_y%x, grad_z%x, n)
        call div(divergence%x, grad_x%x, grad_y%x, grad_z%x, fluid%c_Xh)
        gradient_divergence_norm = sqrt(max(0.0_rp, &
@@ -584,12 +608,17 @@ contains
        call field_add2s2(v_work, grad_y, -1.0_rp)
        call field_add2s2(w_work, grad_z, -1.0_rp)
        ! A strong elementwise gradient is not single-valued at shared GLL
-       ! nodes.  Resolve the corrected velocity back into Neko's continuous
-       ! nodal space before measuring its divergence or applying BCs.
-       call fluid%gs_Xh%op(u_work%x, v_work%x, w_work%x, n, GS_OP_ADD)
+       ! nodes.  The corrected velocity is pointwise after subtraction, so
+       ! resolve it back into Neko's continuous nodal space with the same
+       ! mass-weighted average, Binv*GS(B*u), before measuring its divergence
+       ! or applying BCs.
        call rom_col2_B(u_work, fluid, n)
        call rom_col2_B(v_work, fluid, n)
        call rom_col2_B(w_work, fluid, n)
+       call fluid%gs_Xh%op(u_work%x, v_work%x, w_work%x, n, GS_OP_ADD)
+       call rom_col2_Binv(u_work, fluid, n)
+       call rom_col2_Binv(v_work, fluid, n)
+       call rom_col2_Binv(w_work, fluid, n)
        call rom_divergence_norm(fluid, u_work, v_work, w_work, divergence, &
             n, divergence_before_final_bc)
        call fluid%bcs_vel_projector%apply(u_work%x, v_work%x, w_work%x, n)

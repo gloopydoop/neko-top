@@ -312,7 +312,14 @@ contains
     if (.not. this%lift%enabled) call neko_error( &
          'ROM requires a spatial lift constructed from the case velocity BCs')
     call problem%compute(design, simulation)
+    ! The ROM optimizer uses this existing full-order initialization solve to
+    ! establish the time grid and objective state.  Mirror mma_optimizer's
+    ! iteration-zero forward output while those physical fields are current.
+    if (this%enable_output) call simulation%write_forward(0)
     call problem%compute_sensitivity(design, simulation)
+    if (this%enable_output) then
+       call simulation%write_adjoint(0)
+    end if
     this%n_steps = simulation%n_timesteps
     this%dt = real(simulation%neko_case%time%dt, rp)
     this%time_start = real(simulation%neko_case%time%start_time, rp)
