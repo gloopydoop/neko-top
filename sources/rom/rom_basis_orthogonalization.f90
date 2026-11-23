@@ -17,6 +17,7 @@ module rom_basis_orthogonalization
   public :: rom_mass_dot
   public :: rom_mass_orthonormalize
   public :: rom_mass_orthonormalize_device
+  public :: rom_mass_orthonormalize_coupled_device
 
 contains
 
@@ -225,5 +226,116 @@ contains
     end do
     ok = .true.
   end subroutine rom_mass_orthonormalize_device
+
+  !> Modified Gram--Schmidt for complete coupled velocity--scalar modes.
+  !! Every column operation is applied to the velocity and scalar components
+  !! together, using the configured coupled SEM mass inner product.
+  subroutine rom_mass_orthonormalize_coupled_device(velocity_modes, scalar_modes, &
+       weights, scalar_weight, tolerance, accepted, final_mode_index, &
+       mass_norm_final, mass_cross_final, ok)
+    type(vector_t), intent(inout) :: velocity_modes(:, :)
+    type(vector_t), intent(inout) :: scalar_modes(:)
+    type(vector_t), intent(in) :: weights
+    real(kind=rp), intent(in) :: scalar_weight, tolerance
+    integer, intent(out) :: accepted
+    integer, intent(out) :: final_mode_index(:)
+    real(kind=rp), intent(out) :: mass_norm_final(:), mass_cross_final(:)
+    logical, intent(out) :: ok
+    integer :: mode, previous, n_modes, component
+    real(kind=rp) :: dot_value, norm_squared
+
+    n_modes = size(scalar_modes)
+    accepted = 0
+    ok = .false.
+    final_mode_index = 0
+    mass_norm_final = 0.0_rp
+    mass_cross_final = 0.0_rp
+    if (size(velocity_modes, 1) /= 3 .or. size(velocity_modes, 2) /= n_modes .or. &
+         weights%size() < 1 .or. scalar_weight <= 0.0_rp .or. tolerance <= 0.0_rp .or. &
+         size(final_mode_index) /= n_modes .or. size(mass_norm_final) /= n_modes .or. &
+         size(mass_cross_final) /= n_modes) return
+
+    do mode = 1, n_modes
+       do component = 1, 3
+          if (velocity_modes(component, mode)%size() /= weights%size()) return
+       end do
+       if (scalar_modes(mode)%size() /= weights%size()) return
+
+       do previous = 1, accepted
+          dot_value = scalar_weight * vector_glsc3(scalar_modes(previous), weights, &
+               scalar_modes(mode))
+          do component = 1, 3
+             dot_value = dot_value + vector_glsc3(velocity_modes(component, previous), &
+                  weights, velocity_modes(component, mode))
+          end do
+          do component = 1, 3
+             call vector_add2s2(velocity_modes(component, mode), &
+                  velocity_modes(component, previous), -dot_value)
+          end do
+          call vector_add2s2(scalar_modes(mode), scalar_modes(previous), -dot_value)
+       end do
+       do previous = 1, accepted
+          dot_value = scalar_weight * vector_glsc3(scalar_modes(previous), weights, &
+               scalar_modes(mode))
+          do component = 1, 3
+             dot_value = dot_value + vector_glsc3(velocity_modes(component, previous), &
+                  weights, velocity_modes(component, mode))
+          end do
+          do component = 1, 3
+             call vector_add2s2(velocity_modes(component, mode), &
+                  velocity_modes(component, previous), -dot_value)
+          end do
+          call vector_add2s2(scalar_modes(mode), scalar_modes(previous), -dot_value)
+       end do
+
+       norm_squared = scalar_weight * vector_glsc3(scalar_modes(mode), weights, &
+            scalar_modes(mode))
+       do component = 1, 3
+          norm_squared = norm_squared + vector_glsc3(velocity_modes(component, mode), &
+               weights, velocity_modes(component, mode))
+       end do
+       if (norm_squared <= max(1.0e-24_rp, tolerance * tolerance)) cycle
+       accepted = accepted + 1
+       if (accepted /= mode) then
+          do component = 1, 3
+             call vector_copy(velocity_modes(component, accepted), &
+                  velocity_modes(component, mode))
+          end do
+          call vector_copy(scalar_modes(accepted), scalar_modes(mode))
+       end if
+       do component = 1, 3
+          call vector_cmult(velocity_modes(component, accepted), &
+               1.0_rp / sqrt(norm_squared))
+       end do
+       call vector_cmult(scalar_modes(accepted), 1.0_rp / sqrt(norm_squared))
+       final_mode_index(mode) = accepted
+       mass_norm_final(mode) = scalar_weight * vector_glsc3( &
+            scalar_modes(accepted), weights, scalar_modes(accepted))
+       do component = 1, 3
+          mass_norm_final(mode) = mass_norm_final(mode) + vector_glsc3( &
+               velocity_modes(component, accepted), weights, &
+               velocity_modes(component, accepted))
+       end do
+       mass_norm_final(mode) = sqrt(max(0.0_rp, mass_norm_final(mode)))
+       do previous = 1, accepted - 1
+          dot_value = scalar_weight * vector_glsc3(scalar_modes(accepted), weights, &
+               scalar_modes(previous))
+          do component = 1, 3
+             dot_value = dot_value + vector_glsc3(velocity_modes(component, accepted), &
+                  weights, velocity_modes(component, previous))
+          end do
+          mass_cross_final(mode) = max(mass_cross_final(mode), abs(dot_value))
+       end do
+    end do
+
+    if (accepted < 1) return
+    do mode = 1, n_modes
+       if (final_mode_index(mode) > 0) then
+          if (abs(mass_norm_final(mode) - 1.0_rp) > tolerance .or. &
+               mass_cross_final(mode) > tolerance) return
+       end if
+    end do
+    ok = .true.
+  end subroutine rom_mass_orthonormalize_coupled_device
 
 end module rom_basis_orthogonalization

@@ -15,8 +15,11 @@ module rom_objectives
 
   public :: rom_assemble_viscous_quadratic
   public :: rom_assemble_viscous_terms
+  public :: rom_assemble_viscous_cross_terms
   public :: rom_assemble_scalar_mixing_terms
+  public :: rom_assemble_scalar_mixing_cross_terms
   public :: rom_assemble_brinkman_objective
+  public :: rom_assemble_brinkman_objective_cross
   public :: rom_viscous_value
   public :: rom_brinkman_value
   public :: rom_brinkman_density
@@ -79,6 +82,47 @@ contains
     nullify(effective)
   end subroutine rom_assemble_viscous_terms
 
+  !> Assemble viscous objective derivatives from an enriched test basis.
+  !! `linear` is the lift/enriched cross term and `cross` maps forward trial
+  !! coefficients to enriched objective derivatives.
+  subroutine rom_assemble_viscous_cross_terms(weights, mask, viscosity, &
+       test_gradients, trial_gradients, lift_gradients, linear, cross)
+    type(vector_t), intent(in) :: weights, mask
+    real(kind=rp), intent(in) :: viscosity
+    type(vector_t), intent(in) :: test_gradients(:, :, :), trial_gradients(:, :, :)
+    type(vector_t), intent(in) :: lift_gradients(:, :)
+    type(vector_t), intent(inout) :: linear
+    type(matrix_t), intent(inout) :: cross
+    type(vector_t), pointer :: effective
+    integer :: effective_index, n, re, rf, i, j, component, direction
+
+    n = weights%size(); re = size(test_gradients,2); rf = size(trial_gradients,2)
+    if (size(test_gradients,1) /= 3 .or. size(test_gradients,3) /= 3 .or. &
+         size(trial_gradients,1) /= 3 .or. size(trial_gradients,3) /= 3 .or. &
+         size(lift_gradients,1) /= 3 .or. size(lift_gradients,2) /= 3 .or. &
+         mask%size() /= n) error stop 'ROM viscous cross objective shape mismatch'
+    call neko_scratch_registry%request_vector(effective, effective_index, n, .true.)
+    call vector_col3(effective, weights, mask)
+    call linear%init(re); call cross%init(re, rf)
+    linear%x = 0.0_rp; cross%x = 0.0_rp
+    do i = 1, re
+       do component = 1, 3
+          do direction = 1, 3
+             linear%x(i) = linear%x(i) + viscosity * vector_glsc3( &
+                  test_gradients(component,i,direction), effective, &
+                  lift_gradients(component,direction))
+             do j = 1, rf
+                cross%x(i,j) = cross%x(i,j) + viscosity * vector_glsc3( &
+                     test_gradients(component,i,direction), effective, &
+                     trial_gradients(component,j,direction))
+             end do
+          end do
+       end do
+    end do
+    call neko_scratch_registry%relinquish_vector(effective_index)
+    nullify(effective)
+  end subroutine rom_assemble_viscous_cross_terms
+
   !> Assemble the scalar-mixing objective for a spatial scalar lift.
   !! The full-order functional is
   !!  0.5 / |Omega| * <mask*(phi-phi_ref)^2, B>.
@@ -117,6 +161,38 @@ contains
     call neko_scratch_registry%relinquish_vector([effective_index, offset_index])
     nullify(effective); nullify(offset)
   end subroutine rom_assemble_scalar_mixing_terms
+
+  !> Assemble scalar-mixing objective derivatives for an enriched basis.
+  subroutine rom_assemble_scalar_mixing_cross_terms(weights, mask, scalar_lift, &
+       trial_scalar_modes, test_scalar_modes, scalar_reference_value, linear, cross)
+    type(vector_t), intent(in) :: weights, mask, scalar_lift
+    type(vector_t), intent(in) :: trial_scalar_modes(:), test_scalar_modes(:)
+    real(kind=rp), intent(in) :: scalar_reference_value
+    type(vector_t), intent(inout) :: linear
+    type(matrix_t), intent(inout) :: cross
+    type(vector_t), pointer :: effective, offset
+    integer :: effective_index, offset_index, n, rf, re, i, j
+
+    n = weights%size(); rf = size(trial_scalar_modes); re = size(test_scalar_modes)
+    if (mask%size() /= n .or. scalar_lift%size() /= n) &
+         error stop 'ROM scalar cross objective shape mismatch'
+    call neko_scratch_registry%request_vector(effective, effective_index, n, .true.)
+    call neko_scratch_registry%request_vector(offset, offset_index, n, .true.)
+    call vector_col3(effective, weights, mask)
+    offset = scalar_lift
+    call vector_cadd(offset, -scalar_reference_value)
+    call linear%init(re); call cross%init(re, rf)
+    linear%x = 0.0_rp; cross%x = 0.0_rp
+    do i = 1, re
+       linear%x(i) = vector_glsc3(test_scalar_modes(i), effective, offset)
+       do j = 1, rf
+          cross%x(i,j) = vector_glsc3(test_scalar_modes(i), effective, &
+               trial_scalar_modes(j))
+       end do
+    end do
+    call neko_scratch_registry%relinquish_vector([effective_index, offset_index])
+    nullify(effective); nullify(offset)
+  end subroutine rom_assemble_scalar_mixing_cross_terms
 
   !> Assemble the reduced viscous-dissipation quadratic form.
   subroutine rom_assemble_viscous_quadratic(weights, mask, viscosity, gradients, &
@@ -190,6 +266,43 @@ contains
     call neko_scratch_registry%relinquish_vector([masked_weights_index, effective_index, lift_square_index])
     nullify(masked_weights); nullify(effective); nullify(lift_square)
   end subroutine rom_assemble_brinkman_objective
+
+  !> Assemble Brinkman objective derivatives with enriched test modes.
+  subroutine rom_assemble_brinkman_objective_cross(weights, mask, chi, &
+       trial_velocity_modes, test_velocity_modes, lift_velocity, cross, lift_linear)
+    type(vector_t), intent(in) :: weights, mask, chi
+    type(vector_t), intent(in) :: trial_velocity_modes(:, :), test_velocity_modes(:, :)
+    type(vector_t), intent(in) :: lift_velocity(:)
+    type(matrix_t), intent(inout) :: cross
+    type(vector_t), intent(inout) :: lift_linear
+    type(vector_t), pointer :: masked_weights, effective
+    integer :: masked_weights_index, effective_index
+    integer :: n, rf, re, i, j, component
+
+    n = weights%size(); rf = size(trial_velocity_modes,2); re = size(test_velocity_modes,2)
+    if (size(trial_velocity_modes,1) /= 3 .or. size(test_velocity_modes,1) /= 3 .or. &
+         size(lift_velocity) /= 3 .or. mask%size() /= n .or. chi%size() /= n) &
+         error stop 'ROM Brinkman cross objective shape mismatch'
+    call neko_scratch_registry%request_vector(masked_weights, masked_weights_index, n, .true.)
+    call neko_scratch_registry%request_vector(effective, effective_index, n, .true.)
+    call vector_col3(masked_weights, weights, mask)
+    call vector_col3(effective, masked_weights, chi)
+    call cross%init(re, rf); call lift_linear%init(re)
+    cross%x = 0.0_rp; lift_linear%x = 0.0_rp
+    do i = 1, re
+       do component = 1, 3
+          lift_linear%x(i) = lift_linear%x(i) + vector_glsc3( &
+               test_velocity_modes(component,i), effective, lift_velocity(component))
+          do j = 1, rf
+             cross%x(i,j) = cross%x(i,j) + vector_glsc3( &
+                  test_velocity_modes(component,i), effective, &
+                  trial_velocity_modes(component,j))
+          end do
+       end do
+    end do
+    call neko_scratch_registry%relinquish_vector([masked_weights_index, effective_index])
+    nullify(masked_weights); nullify(effective)
+  end subroutine rom_assemble_brinkman_objective_cross
 
   !> Evaluate the reduced viscous-dissipation quadratic objective.
   function rom_viscous_value(state, constant, linear, quadratic, domain) result(value)

@@ -9,6 +9,7 @@ module rom_model
   use vector, only: vector_t
   use matrix, only: matrix_t
   use scratch_registry, only: neko_scratch_registry
+  use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
   implicit none
   private
 
@@ -29,6 +30,9 @@ module rom_model
      procedure, public :: forward_bdf1 => rom_model_forward_bdf1
      procedure, public :: discrete_adjoint => rom_model_discrete_adjoint
      procedure, public :: discrete_adjoint_bdf1 => rom_model_discrete_adjoint_bdf1
+     procedure, public :: init_linearized_adjoint => rom_model_init_linearized_adjoint
+     procedure, public :: discrete_adjoint_bdf1_timevarying => &
+          rom_model_discrete_adjoint_bdf1_timevarying
      procedure, public :: solve_mass => rom_model_solve_mass
      procedure, public :: solve_mass_transpose => rom_model_solve_mass_transpose
      procedure, public :: solve_step_transpose => rom_model_solve_step_transpose
@@ -84,6 +88,36 @@ contains
        this%quadratic(i)%x = quadratic(i)%x
     end do
   end subroutine rom_model_init
+
+  !> Initialise the coefficient containers used by a time-varying linearised
+  !! adjoint.  The nonlinear forward operators are not copied into this
+  !! model; each timestep supplies its own projected Jacobian.
+  subroutine rom_model_init_linearized_adjoint(this, mass, implicit_linear)
+    class(rom_model_t), intent(inout) :: this
+    type(matrix_t), intent(in) :: mass, implicit_linear
+    type(vector_t) :: zero_constant
+    type(matrix_t), allocatable :: zero_quadratic(:)
+    integer :: n, i
+
+    n = mass%get_nrows()
+    if (n < 1 .or. mass%get_ncols() /= n .or. &
+         implicit_linear%get_nrows() /= n .or. implicit_linear%get_ncols() /= n) &
+         error stop 'ROM linearized adjoint operator has the wrong shape'
+    call zero_constant%init(n)
+    zero_constant%x = 0.0_rp
+    allocate(zero_quadratic(n))
+    do i = 1, n
+       call zero_quadratic(i)%init(n, n)
+       zero_quadratic(i)%x = 0.0_rp
+    end do
+    call this%init(mass, zero_constant, implicit_linear, zero_quadratic, &
+         implicit_linear)
+    call zero_constant%free()
+    do i = 1, n
+       call zero_quadratic(i)%free()
+    end do
+    deallocate(zero_quadratic)
+  end subroutine rom_model_init_linearized_adjoint
 
   !> Release all reduced operators owned by the model.
   subroutine rom_model_free(this)
@@ -179,8 +213,9 @@ contains
   end subroutine rom_model_forward_euler
 
   !> First-order Neko Pn/Pn map for a fixed timestep.
-  !! The viscous operator is implicit in Neko's BDF1 Helmholtz solve.  The
-  !! solved matrix is `mass - dt*implicit_linear`.
+  !! The viscous and design-dependent Brinkman operators are implicit in the
+  !! reduced BDF1 Helmholtz solve.  The solved matrix is
+  !! `mass - dt*implicit_linear`.
   !> Integrate the reduced model with the supported BDF1 scheme.
   subroutine rom_model_forward_bdf1(this, initial_state, dt, states)
     class(rom_model_t), intent(in) :: this
@@ -201,12 +236,33 @@ contains
     call neko_scratch_registry%request_matrix(step_matrix, step_matrix_index, &
          this%n_state, this%n_state, .true.)
     step_matrix%x = this%mass%x - dt * this%implicit_linear%x
+    if (any(.not. ieee_is_finite(step_matrix%x))) then
+       write(*,'(A)') 'ROM BDF1 failure: non-finite implicit step matrix'
+       error stop 'non-finite ROM BDF1 step matrix'
+    end if
     states%x(:,1) = initial_state%x
+    if (any(.not. ieee_is_finite(states%x(:,1)))) then
+       write(*,'(A)') 'ROM BDF1 failure: non-finite initial reduced state'
+       error stop 'non-finite ROM BDF1 initial state'
+    end if
     do step = 1, n_steps
        state%x = states%x(:,step)
        call rom_model_explicit_residual(this, state, residual)
+       if (any(.not. ieee_is_finite(residual%x))) then
+          write(*,'(A,I0,A,ES14.6)') 'ROM BDF1 failure: non-finite residual at step ', &
+               step, ', max_abs_state=', maxval(abs(state%x))
+          error stop 'non-finite ROM BDF1 residual'
+       end if
        rhs%x = matmul(this%mass%x, state%x) + dt * residual%x
+       if (any(.not. ieee_is_finite(rhs%x))) then
+          write(*,'(A,I0)') 'ROM BDF1 failure: non-finite right-hand side at step ', step
+          error stop 'non-finite ROM BDF1 right-hand side'
+       end if
        call rom_solve(step_matrix, rhs, state)
+       if (any(.not. ieee_is_finite(state%x))) then
+          write(*,'(A,I0)') 'ROM BDF1 failure: non-finite state at step ', step
+          error stop 'non-finite ROM BDF1 state'
+       end if
        states%x(:,step+1) = state%x
     end do
     call neko_scratch_registry%relinquish_vector([state_index, residual_index, rhs_index])
@@ -245,6 +301,9 @@ contains
     call neko_scratch_registry%request_vector(terminal, terminal_index, this%n_state, .true.)
     terminal%x = terminal_state_gradient%x
     adjoint%x(:,n_steps+1) = terminal%x
+    if (any(.not. ieee_is_finite(adjoint%x(:,n_steps+1)))) then
+       error stop 'non-finite ROM adjoint terminal state'
+    end if
     call neko_scratch_registry%request_matrix(jacobian, jacobian_index, &
          this%n_state, this%n_state, .true.)
     call neko_scratch_registry%request_matrix(transition, transition_index, &
@@ -299,6 +358,9 @@ contains
     call neko_scratch_registry%request_vector(current_adjoint, current_index, this%n_state, .true.)
     terminal%x = terminal_state_gradient%x
     adjoint%x(:,n_steps+1) = terminal%x
+    if (any(.not. ieee_is_finite(adjoint%x(:,n_steps+1)))) then
+       error stop 'non-finite ROM BDF1 adjoint terminal state'
+    end if
     call neko_scratch_registry%request_matrix(jacobian, jacobian_index, &
          this%n_state, this%n_state, .true.)
     call neko_scratch_registry%request_matrix(map_jacobian, map_index, &
@@ -316,6 +378,9 @@ contains
        rhs_matrix%x = this%mass%x + dt * matmul(this%mass%x, jacobian%x)
        call rom_solve_matrix(step_matrix, rhs_matrix, map_jacobian)
        current_adjoint%x = matmul(transpose(map_jacobian%x), next_adjoint%x) + dt * running%x
+       if (any(.not. ieee_is_finite(current_adjoint%x))) then
+          error stop 'non-finite ROM BDF1 adjoint state'
+       end if
        adjoint%x(:,step) = current_adjoint%x
     end do
     call neko_scratch_registry%relinquish_vector([state_index, running_index, &
@@ -326,6 +391,85 @@ contains
     nullify(current_adjoint); nullify(jacobian); nullify(map_jacobian)
     nullify(step_matrix); nullify(rhs_matrix)
   end subroutine rom_model_discrete_adjoint_bdf1
+
+  !> Integrate an enriched adjoint with a time-dependent projected Jacobian.
+  !!
+  !! For the BDF1/IMEX map represented by this model, the supplied
+  !! `time_jacobian(step)` is the explicit residual Jacobian projected onto
+  !! the enriched basis at the stored forward state at `step`.  The backward
+  !! map is therefore formed as
+  !!
+  !!   S^T lambda_n = (H + dt J_n)^T lambda_(n+1) + dt g_n,
+  !!
+  !! where `S = H - dt*implicit_linear`.  This keeps the adjoint timestep
+  !! consistent with the forward BDF1 split while allowing the forward state
+  !! and the adjoint basis to have different dimensions.
+  subroutine rom_model_discrete_adjoint_bdf1_timevarying(this, dt, &
+       running_state_gradient, terminal_state_gradient, time_jacobian, adjoint)
+    class(rom_model_t), intent(in) :: this
+    real(kind=rp), intent(in) :: dt
+    type(matrix_t), intent(in) :: running_state_gradient
+    type(vector_t), intent(in) :: terminal_state_gradient
+    type(matrix_t), intent(in) :: time_jacobian(:)
+    type(matrix_t), intent(inout) :: adjoint
+    type(vector_t), pointer :: running, next_adjoint, current_adjoint
+    type(matrix_t), pointer :: step_matrix, rhs_matrix, map_jacobian
+    integer :: running_index, next_index, current_index
+    integer :: step_index, rhs_index, map_index
+    integer :: n_steps, step
+
+    n_steps = running_state_gradient%get_ncols()
+    if (running_state_gradient%get_nrows() /= this%n_state .or. &
+         terminal_state_gradient%size() /= this%n_state .or. &
+         size(time_jacobian) /= n_steps) then
+       error stop 'ROM time-varying adjoint state size mismatch'
+    end if
+    if (any(adjoint%get_dims() /= [this%n_state, n_steps + 1])) &
+         call adjoint%init(this%n_state, n_steps + 1)
+
+    call neko_scratch_registry%request_vector(running, running_index, &
+         this%n_state, .true.)
+    call neko_scratch_registry%request_vector(next_adjoint, next_index, &
+         this%n_state, .true.)
+    call neko_scratch_registry%request_vector(current_adjoint, current_index, &
+         this%n_state, .true.)
+    call neko_scratch_registry%request_matrix(step_matrix, step_index, &
+         this%n_state, this%n_state, .true.)
+    call neko_scratch_registry%request_matrix(rhs_matrix, rhs_index, &
+         this%n_state, this%n_state, .true.)
+    call neko_scratch_registry%request_matrix(map_jacobian, map_index, &
+         this%n_state, this%n_state, .true.)
+
+    step_matrix%x = this%mass%x - dt * this%implicit_linear%x
+    adjoint%x(:,n_steps+1) = terminal_state_gradient%x
+    if (any(.not. ieee_is_finite(adjoint%x(:,n_steps+1)))) then
+       write(*,'(A)') 'ROM time-varying adjoint failure: non-finite terminal gradient'
+       error stop 'non-finite ROM time-varying adjoint terminal state'
+    end if
+    do step = n_steps, 1, -1
+       next_adjoint%x = adjoint%x(:,step+1)
+       running%x = running_state_gradient%x(:,step)
+       rhs_matrix%x = this%mass%x + dt * time_jacobian(step)%x
+       if (any(.not. ieee_is_finite(rhs_matrix%x))) then
+          write(*,'(A,I0)') 'ROM time-varying adjoint failure: non-finite map at step ', step
+          error stop 'non-finite ROM time-varying adjoint map'
+       end if
+       call rom_solve_matrix(step_matrix, rhs_matrix, map_jacobian)
+       current_adjoint%x = matmul(transpose(map_jacobian%x), next_adjoint%x) + &
+            dt * running%x
+       if (any(.not. ieee_is_finite(current_adjoint%x))) then
+          write(*,'(A,I0)') 'ROM time-varying adjoint failure: non-finite state at step ', step
+          error stop 'non-finite ROM time-varying adjoint state'
+       end if
+       adjoint%x(:,step) = current_adjoint%x
+    end do
+
+    call neko_scratch_registry%relinquish_vector([running_index, next_index, &
+         current_index])
+    call neko_scratch_registry%relinquish_matrix([step_index, rhs_index, map_index])
+    nullify(running); nullify(next_adjoint); nullify(current_adjoint)
+    nullify(step_matrix); nullify(rhs_matrix); nullify(map_jacobian)
+  end subroutine rom_model_discrete_adjoint_bdf1_timevarying
 
   !> Solve the transpose reduced mass system.
   subroutine rom_model_solve_mass_transpose(this, rhs, solution)

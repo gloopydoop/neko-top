@@ -7,7 +7,7 @@
         "output_boundary": false,
         "time": {
             "end_time": 13.0,
-            "timestep": 2.0e-3
+            "timestep": 4.0e-3
         },
         "numerics": {
             "time_order": 1,
@@ -190,15 +190,20 @@
     "rom": {
         "enabled": true,
         "inner_iterations": 5,
+        "formulation": "forward_constrained_enriched",
+        "sensitivity_source": "projected_adjoint",
+        "substeps": 4,
         "history_outer_iterations": 3,
         "rank_forward": 8,
         "rank_total_max": 20,
         "scalar_metric_weight": 0.5,
         "validate_full_order": false,
-        "admissibility_projection": "velocity_inlet_xmin",
+        "admissibility_projection": "direct_pod",
         "time_scheme": "bdf1",
         "pressure_treatment": "solenoidal_galerkin",
         "strict_admissibility": false,
+        "export_reduced_system": true,
+        "reduced_system_export_directory": "rom_reduced_system",
         "write_trajectory_fields": false,
         "trajectory_output_interval": 0.02,
         "lift": {"source": "initial_velocity"}
@@ -238,7 +243,7 @@
             "tolerance": 1.0e-12,
             "mma": {
                 "scale": 1.0,
-                "asyinit": 0.8,
+                "asyinit": 0.4,
                 "asyincr": 1.05,
                 "asydecr": 0.65,
                 "xmin": 0.0,
@@ -257,7 +262,7 @@
                 "type": "scalar_mixing",
                 "mask_name": "objective_domain",
                 "start_time": 10.0,
-                "weight": 120.0,
+                "weight": 0.0,
             },
             {
                 "type": "viscous_dissipation",

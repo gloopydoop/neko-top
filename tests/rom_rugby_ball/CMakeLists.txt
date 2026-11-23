@@ -33,6 +33,8 @@ add_rom_rugby_ball_diagnostic(
     $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::cudart>
     $<$<BOOL:${hipblas_FOUND}>:roc::hipblas>
     $<$<BOOL:${hipsolver_FOUND}>:roc::hipsolver>)
+target_sources(ROM_rugby_ball_projection_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
 if(TARGET neko_cxx_support)
     target_link_libraries(ROM_rugby_ball_projection_diagnostic PRIVATE
         neko_cxx_support)

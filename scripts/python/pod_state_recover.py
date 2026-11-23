@@ -87,6 +87,40 @@ def stream_rom_basis(comm, ds, ctrl, common_basis, bm, cfg) -> None:
     comm.Barrier()
 
 
+def stream_rom_bases(comm, ds, ctrl, trial_basis, test_basis, bm, cfg) -> None:
+    """Stream independent forward-trial and adjoint-test basis blocks.
+
+    Each block has its own header and payload.  The Fortran receiver consumes
+    the first payload before waiting for the second header, so this preserves
+    the existing control protocol without changing generic state recovery.
+    """
+
+    rank = comm.Get_rank()
+    field_size = np.asarray(bm).size
+    blocks = (trial_basis, test_basis)
+    for block in blocks:
+        modes = np.asarray(block.modes)
+        expected_rows = cfg.n_input_fields * field_size
+        if modes.ndim != 2 or modes.shape[0] != expected_rows:
+            raise RuntimeError(
+                "Petrov basis rows do not match the streamed local fields: "
+                f"got {modes.shape[0] if modes.ndim == 2 else modes.ndim}, "
+                f"expected {expected_rows}"
+            )
+        comm.Barrier()
+        if rank == 0:
+            ctrl.send_basis_header(int(modes.shape[1]), int(cfg.n_input_fields))
+        comm.Barrier()
+        for mode_index in range(modes.shape[1]):
+            for field_index in range(cfg.n_input_fields):
+                first = field_index * field_size
+                last = (field_index + 1) * field_size
+                ds.stream(np.ascontiguousarray(
+                    modes[first:last, mode_index], dtype=cfg.dtype
+                ))
+        comm.Barrier()
+
+
 def init_runtime(
     comm: MPI.Comm,
     cfg: PODConfig,
@@ -525,21 +559,103 @@ def main() -> None:
                         weight * np.asarray(bm, dtype=np.float64).reshape(-1)
                         for weight in local_field_weights
                     ])
-                    recycled_forward = recycle_distributed(
-                        comm, forward_history, local_mass, cfg.rank_forward
-                    )
-                    recycled_adjoint = recycle_distributed(
-                        comm, adjoint_history, local_mass, cfg.rank_adjoint
-                    )
-                    common_basis, basis_diag = common_basis_distributed(
-                        comm,
-                        recycled_forward,
-                        recycled_adjoint,
-                        local_mass,
-                        cfg.rank_total_max,
-                        adjoint_projector=make_admissibility_projector(mesh, bm, cfg),
-                    )
-                    stream_rom_basis(comm, ds, ctrl, common_basis, bm, cfg)
+                    if cfg.formulation == "petrov_galerkin":
+                        # Recycle the two spaces independently.  In
+                        # particular, do not call common_basis_distributed:
+                        # its forward Gram projection would construct an
+                        # orthogonal complement instead of an adjoint test
+                        # space.
+                        available_rank = min(
+                            recycled_rank for recycled_rank in (
+                                sum(item.modes.shape[1] for item in forward_history),
+                                sum(item.modes.shape[1] for item in adjoint_history),
+                            )
+                        )
+                        petrov_rank = cfg.rank_total_max or available_rank
+                        recycled_forward = recycle_distributed(
+                            comm, forward_history, local_mass, petrov_rank
+                        )
+                        recycled_adjoint = recycle_distributed(
+                            comm, adjoint_history, local_mass, petrov_rank
+                        )
+                        # The two independently recycled spaces can have
+                        # different numerical ranks (especially during the
+                        # first short history).  Petrov assembly requires
+                        # equal trial/test dimensions, so retain the common
+                        # leading singular subspace instead of aborting the
+                        # entire forward/adjoint lifecycle.  This is a
+                        # rank-selection operation, not a projection of the
+                        # adjoint space into the trial space.
+                        common_rank = min(
+                            recycled_forward.modes.shape[1],
+                            recycled_adjoint.modes.shape[1],
+                        )
+                        if common_rank < 1:
+                            raise RuntimeError(
+                                "independent Petrov recycling produced no common rank"
+                            )
+                        if recycled_forward.modes.shape[1] != common_rank:
+                            recycled_forward = type(recycled_forward)(
+                                recycled_forward.modes[:, :common_rank].copy(),
+                                recycled_forward.singular_values[:common_rank].copy(),
+                                recycled_forward.iteration,
+                            )
+                        if recycled_adjoint.modes.shape[1] != common_rank:
+                            recycled_adjoint = type(recycled_adjoint)(
+                                recycled_adjoint.modes[:, :common_rank].copy(),
+                                recycled_adjoint.singular_values[:common_rank].copy(),
+                                recycled_adjoint.iteration,
+                            )
+                        stream_rom_bases(
+                            comm, ds, ctrl, recycled_forward, recycled_adjoint, bm, cfg
+                        )
+                        basis_rank = int(recycled_forward.modes.shape[1])
+                        basis_diag = {"mass_gram_error": 0.0}
+                    elif cfg.formulation in (
+                        "forward_constrained_enriched", "enriched_adjoint_galerkin"
+                    ):
+                        # The enriched formulation constructs [V_f,V_perp]
+                        # on the Fortran side in the coupled SEM mass
+                        # product.  Keep the two streamed POD spaces
+                        # independent here: their ranks may differ and the
+                        # adjoint block must not be projected into the
+                        # forward space by the Python recycler.
+                        recycled_forward = recycle_distributed(
+                            comm, forward_history, local_mass, cfg.rank_forward
+                        )
+                        recycled_adjoint = recycle_distributed(
+                            comm, adjoint_history, local_mass, cfg.rank_adjoint
+                        )
+                        if recycled_forward.modes.shape[1] < 1:
+                            raise RuntimeError(
+                                "forward-constrained enrichment produced no forward modes"
+                            )
+                        if recycled_adjoint.modes.shape[1] < 1:
+                            raise RuntimeError(
+                                "forward-constrained enrichment produced no adjoint modes"
+                            )
+                        stream_rom_bases(
+                            comm, ds, ctrl, recycled_forward, recycled_adjoint, bm, cfg
+                        )
+                        basis_rank = int(recycled_forward.modes.shape[1])
+                        basis_diag = {"mass_gram_error": 0.0}
+                    else:
+                        recycled_forward = recycle_distributed(
+                            comm, forward_history, local_mass, cfg.rank_forward
+                        )
+                        recycled_adjoint = recycle_distributed(
+                            comm, adjoint_history, local_mass, cfg.rank_adjoint
+                        )
+                        common_basis, basis_diag = common_basis_distributed(
+                            comm,
+                            recycled_forward,
+                            recycled_adjoint,
+                            local_mass,
+                            cfg.rank_total_max,
+                            adjoint_projector=make_admissibility_projector(mesh, bm, cfg),
+                        )
+                        stream_rom_basis(comm, ds, ctrl, common_basis, bm, cfg)
+                        basis_rank = int(common_basis.modes.shape[1])
                     if rank == 0:
                         with open("recycled_rom_history.json", "w", encoding="utf-8") as handle:
                             json.dump(
@@ -547,8 +663,9 @@ def main() -> None:
                                     "history_outer_iterations": history_length,
                                     "forward_iterations": [item.iteration for item in forward_history],
                                     "adjoint_iterations": [item.iteration for item in adjoint_history],
-                                    "basis_rank": int(common_basis.modes.shape[1]),
+                                    "basis_rank": basis_rank,
                                     "mass_gram_error": basis_diag["mass_gram_error"],
+                                    "formulation": cfg.formulation,
                                 },
                                 handle,
                                 indent=2,

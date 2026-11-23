@@ -8,7 +8,7 @@ module rom_problem
   use design, only: design_t
   use brinkman_design, only: brinkman_design_t
   use simulation_m, only: simulation_t
-  use scalar_pnpn, only: scalar_pnpn_t
+  use adjoint_fluid_pnpn, only: adjoint_fluid_pnpn_t
   use field_output, only: field_output_t
   use field, only: field_t, field_wrapper_t
   use field_math, only: field_add2s2, field_copy, field_col3, field_invcol2, &
@@ -19,11 +19,20 @@ module rom_problem
        use rom_assembly, only: rom_assemble_mass, rom_assemble_brinkman, &
        rom_assemble_mass_coupled, rom_assemble_scalar_transport, &
        rom_assemble_lift_convection, rom_assemble_diffusion, &
-       rom_assemble_convection
+       rom_assemble_convection, rom_assemble_cross_mass, &
+       rom_assemble_brinkman_petrov, rom_assemble_lift_convection_petrov, &
+       rom_assemble_diffusion_petrov, rom_assemble_convection_petrov, &
+       rom_assemble_scalar_transport_petrov, rom_add_linearized_convection, &
+       rom_add_linearized_scalar_advection
   use rom_objectives, only: rom_assemble_viscous_terms, &
-       rom_assemble_brinkman_objective, rom_assemble_scalar_mixing_terms, &
+       rom_assemble_viscous_cross_terms, rom_assemble_brinkman_objective, &
+       rom_assemble_brinkman_objective_cross, rom_assemble_scalar_mixing_terms, &
+       rom_assemble_scalar_mixing_cross_terms, &
        rom_viscous_value, rom_brinkman_value
-  use rom_basis_handoff, only: rom_receive_basis, rom_project_basis
+  use rom_basis_handoff, only: rom_receive_basis, rom_receive_petrov_bases, &
+       rom_project_basis, rom_project_test_basis, rom_restrict_scalar_basis, &
+       rom_orthonormalize_projected_device, &
+       rom_orthonormalize_projected_coupled_device
   use operators, only: grad
   use num_types, only: rp, sp, dp
   use json_module, only: json_file
@@ -33,15 +42,17 @@ module rom_problem
   use scratch_registry, only: neko_scratch_registry
   use vector_math, only: vector_glsc2, vector_glsc3, vector_col3, vector_add2, &
        vector_add2s2, vector_cmult, vector_cmult2, vector_vdot3, vector_copy, &
-       vector_sub3, vector_absval, vector_glmax
+       vector_sub3, vector_absval, vector_glmax, vector_rzero
   use device, only: DEVICE_TO_HOST, HOST_TO_DEVICE
   use device_math, only: device_copy
   use neko_ext, only: field_to_vector, vector_to_field
   use neko_config, only: NEKO_BCKND_DEVICE
+  use comm, only: pe_rank
   use point_zone, only: point_zone_t
   use point_zone_registry, only: neko_point_zone_registry
-  use utils, only: neko_error, filename_path
+  use utils, only: neko_error, filename_path, mkdir
   use logger, only: neko_log
+  use lapack_interfaces, only: dgesvd
   implicit none
   private
 
@@ -57,6 +68,12 @@ module rom_problem
   type, public :: rom_problem_t
      type(rom_model_t) :: rom
      type(rom_basis_storage_t) :: basis
+     type(rom_basis_storage_t) :: test_basis
+
+     character(len=32) :: formulation = 'galerkin'
+     character(len=32) :: sensitivity_source = 'exact_galerkin'
+     logical :: petrov_galerkin = .false.
+     logical :: forward_constrained_enriched = .false.
 
      integer :: inner_iterations = 1
      integer :: rank_total_max = 1
@@ -67,7 +84,12 @@ module rom_problem
      logical :: rom_ready = .false.
      logical :: write_trajectory_fields = .false.
      real(kind=rp) :: trajectory_output_interval = 0.5_rp
+     logical :: export_reduced_system = .false.
+     character(len=:), allocatable :: reduced_system_export_directory
+     logical :: reduced_system_exported = .false.
+     logical :: reference_trajectory_exported = .false.
 
+     integer :: substeps = 1
      integer :: n_steps = 0
      real(kind=rp) :: dt = 0.0_rp
      real(kind=rp) :: time_start = 0.0_rp
@@ -104,17 +126,37 @@ module rom_problem
      type(vector_t) :: weights, viscous_mask, brinkman_mask, scalar_mixing_mask, volume_mask
      type(vector_t), allocatable :: velocity_modes(:, :)
      type(vector_t), allocatable :: velocity_gradients(:, :, :)
+     type(vector_t), allocatable :: test_velocity_modes(:, :)
+     type(vector_t), allocatable :: test_velocity_gradients(:, :, :)
      type(vector_t), allocatable :: scalar_modes(:)
      type(vector_t), allocatable :: scalar_gradients(:, :)
+     type(vector_t), allocatable :: test_scalar_modes(:)
+     type(vector_t), allocatable :: test_scalar_gradients(:, :)
      type(vector_t) :: scalar_diffusivity
      type(vector_t) :: scalar_lift, scalar_reference
      type(vector_t) :: scalar_lift_gradients(3)
      type(rom_lift_t) :: lift
      type(vector_t) :: lift_gradients(3,3)
      type(vector_t) :: lift_velocity(3)
-     type(matrix_t) :: mass, fixed_linear, fixed_implicit
+     type(matrix_t) :: mass, trial_mass, fixed_linear, fixed_implicit
+     type(matrix_t) :: enriched_mass, enriched_fixed_linear, enriched_fixed_implicit
+     type(matrix_t) :: candidate_enriched_brinkman
+     type(rom_model_t) :: enriched_adjoint_model
+     integer :: enriched_adjoint_rank = 0
+     real(kind=rp) :: cross_mass_sigma_min = 0.0_rp
+     real(kind=rp) :: cross_mass_sigma_max = 0.0_rp
+     real(kind=rp) :: cross_mass_condition = huge(0.0_rp)
+     real(kind=rp) :: petrov_svd_relative_tolerance = 1.0e-8_rp
+     integer :: cross_mass_retained_rank = 0
+     real(kind=rp), allocatable :: cross_mass_singular_values(:)
      type(vector_t) :: fixed_constant
      type(matrix_t), allocatable :: quadratic(:)
+     type(vector_t) :: enriched_viscous_linear
+     type(matrix_t) :: enriched_viscous_cross
+     type(vector_t) :: enriched_scalar_mixing_linear
+     type(matrix_t) :: enriched_scalar_mixing_cross
+     type(vector_t) :: candidate_objective_enriched_lift
+     type(matrix_t) :: candidate_objective_enriched_cross
      type(vector_t) :: viscous_constant, viscous_linear
      type(matrix_t) :: viscous_quadratic
      type(vector_t) :: scalar_mixing_constant, scalar_mixing_linear
@@ -127,6 +169,8 @@ module rom_problem
      real(kind=rp) :: candidate_volume = 0.0_rp
      type(matrix_t) :: states, adjoint, running_gradient, correlation, cost_sum_aa
      type(vector_t) :: terminal_gradient, lambda_sum, cost_sum_a
+     type(matrix_t) :: enriched_running_gradient, exact_adjoint, enriched_correlation
+     type(vector_t) :: enriched_terminal_gradient, enriched_lambda_sum
      real(kind=rp) :: cost_total = 0.0_rp
      real(kind=rp) :: objective_value = 0.0_rp
      real(kind=rp) :: viscous_value = 0.0_rp
@@ -229,16 +273,22 @@ contains
     class(rom_problem_t), intent(inout) :: this
     type(json_file), intent(inout) :: parameters
     class(problem_t), intent(in) :: problem
-    type(json_file) :: rom_parameters
+    type(json_file) :: rom_parameters, solver_parameters
     logical :: dealias, variable_dt
-    character(len=:), allocatable :: time_scheme, pressure_treatment
+    character(len=:), allocatable :: time_scheme, pressure_treatment, formulation
+    character(len=:), allocatable :: sensitivity_source
     integer :: time_order
 
     call this%free()
     if ('rom' .in. parameters) then
        call json_get(parameters, 'rom', rom_parameters)
     else
-       call json_get(parameters, 'optimization.solver', rom_parameters)
+       call json_get(parameters, 'optimization.solver', solver_parameters)
+       if ('rom' .in. solver_parameters) then
+          call json_get(solver_parameters, 'rom', rom_parameters)
+       else
+          rom_parameters = solver_parameters
+       end if
     end if
     call json_get_or_default(rom_parameters, 'inner_iterations', &
          this%inner_iterations, 3)
@@ -246,24 +296,56 @@ contains
          this%history_outer_iterations, 3)
     call json_get_or_default(rom_parameters, 'rank_total_max', &
          this%rank_total_max, 12)
+    call json_get_or_default(rom_parameters, 'substeps', this%substeps, 1)
+    call json_get_or_default(rom_parameters, 'formulation', formulation, 'galerkin')
+    this%formulation = trim(formulation)
+    call json_get_or_default(rom_parameters, 'sensitivity_source', sensitivity_source, &
+         'exact_galerkin')
+    this%sensitivity_source = trim(sensitivity_source)
+    if (this%sensitivity_source /= 'exact_galerkin' .and. &
+         this%sensitivity_source /= 'projected_adjoint') call neko_error( &
+         'rom_mma sensitivity_source must be exact_galerkin or projected_adjoint')
+    if (this%sensitivity_source == 'projected_adjoint' .and. &
+         .not. (trim(formulation) == 'forward_constrained_enriched' .or. &
+         trim(formulation) == 'enriched_adjoint_galerkin')) call neko_error( &
+         'projected_adjoint sensitivity_source requires forward_constrained_enriched')
+    this%petrov_galerkin = trim(formulation) == 'petrov_galerkin'
+    this%forward_constrained_enriched = trim(formulation) == &
+         'forward_constrained_enriched' .or. trim(formulation) == &
+         'enriched_adjoint_galerkin'
+    if (.not. this%petrov_galerkin .and. .not. this%forward_constrained_enriched .and. &
+         trim(formulation) /= 'galerkin') then
+       call neko_error('rom_mma formulation must be galerkin, petrov_galerkin, or forward_constrained_enriched')
+    end if
     call json_get_or_default(rom_parameters, 'scalar_metric_weight', &
          this%scalar_metric_weight, 1.0_rp)
     call json_get_or_default(rom_parameters, 'admissibility_tolerance', &
          this%admissibility_tolerance, 1.0e-8_rp)
+    call json_get_or_default(rom_parameters, 'petrov_svd_relative_tolerance', &
+         this%petrov_svd_relative_tolerance, 1.0e-8_rp)
     call json_get_or_default(rom_parameters, 'enable_output', &
          this%enable_output, .true.)
     call json_get_or_default(rom_parameters, 'write_trajectory_fields', &
          this%write_trajectory_fields, .false.)
     call json_get_or_default(rom_parameters, 'trajectory_output_interval', &
          this%trajectory_output_interval, 0.5_rp)
+    call json_get_or_default(rom_parameters, 'export_reduced_system', &
+         this%export_reduced_system, .false.)
+    call json_get_or_default(rom_parameters, 'reduced_system_export_directory', &
+         this%reduced_system_export_directory, 'rom_reduced_system')
     if (this%inner_iterations < 1) call neko_error( &
          'rom_mma requires inner_iterations >= 1')
     if (this%history_outer_iterations < 1) call neko_error( &
          'rom_mma requires history_outer_iterations >= 1')
     if (this%rank_total_max < 1) call neko_error( &
          'rom_mma requires rank_total_max >= 1')
+    if (this%substeps < 1) call neko_error( &
+         'rom_mma requires substeps >= 1')
     if (this%admissibility_tolerance <= 0.0_rp) call neko_error( &
          'rom_mma requires admissibility_tolerance > 0')
+    if (this%petrov_svd_relative_tolerance <= 0.0_rp .or. &
+         this%petrov_svd_relative_tolerance > 1.0_rp) call neko_error( &
+         'rom_mma requires 0 < petrov_svd_relative_tolerance <= 1')
     if (this%write_trajectory_fields .and. &
          this%trajectory_output_interval <= 0.0_rp) call neko_error( &
          'rom_mma requires trajectory_output_interval > 0')
@@ -294,6 +376,8 @@ contains
     class(problem_t), intent(inout) :: problem
     class(design_t), intent(inout) :: design
     type(simulation_t), intent(inout) :: simulation
+    integer :: dns_steps
+    real(kind=rp) :: dns_dt
     ! Use the pointer association, since simulation_t's legacy convenience
     ! flag is not populated by every Neko scalar initialisation path.
     this%has_scalar = associated(simulation%scalars)
@@ -306,6 +390,10 @@ contains
     if (this%has_scalar_mixing .and. .not. this%has_scalar) then
        call neko_error('scalar_mixing objective requires one passive scalar')
     end if
+    ! Reset Neko before constructing the lift so its retained reference fields
+    ! are taken from the same canonical initial-condition path used by the
+    ! forward solver, including user-defined fluid and scalar ICs.
+    call simulation%reset()
     ! Construct the lift before the full-order run starts.  State recovery has
     ! already used the same ROM-local construction for its initial stream.
     call this%lift%init(simulation%neko_case)
@@ -320,14 +408,23 @@ contains
     if (this%enable_output) then
        call simulation%write_adjoint(0)
     end if
-    this%n_steps = simulation%n_timesteps
-    this%dt = real(simulation%neko_case%time%dt, rp)
+    dns_steps = simulation%n_timesteps
+    dns_dt = real(simulation%neko_case%time%dt, rp)
     this%time_start = real(simulation%neko_case%time%start_time, rp)
     this%time_end = real(simulation%neko_case%time%end_time, rp)
-    if (this%n_steps < 1 .or. this%dt <= 0.0_rp) call neko_error('invalid Neko ROM time grid')
-    if (abs(this%time_start + this%dt * real(this%n_steps, rp) - this%time_end) &
+    if (dns_steps < 1 .or. dns_dt <= 0.0_rp) call neko_error('invalid Neko ROM time grid')
+    if (abs(this%time_start + dns_dt * real(dns_steps, rp) - this%time_end) &
          > 100.0_rp * epsilon(this%time_end) * max(1.0_rp, abs(this%time_end))) then
        call neko_error('rom_mma requires a fixed timestep ending exactly at case.time.end_time')
+    end if
+    ! Refine only the reduced time grid.  The full-order/DNS timestep and
+    ! simulation timestep count remain unchanged for the surrounding Neko
+    ! lifecycle; every ROM step uses the same BDF1 map with dt/substeps.
+    this%n_steps = dns_steps * this%substeps
+    this%dt = dns_dt / real(this%substeps, rp)
+    if (abs(this%time_start + this%dt * real(this%n_steps, rp) - this%time_end) &
+         > 1000.0_rp * epsilon(this%time_end) * max(1.0_rp, abs(this%time_end))) then
+       call neko_error('ROM substepping does not preserve the configured physical time interval')
     end if
     call simulation%reset()
   end subroutine rom_problem_initialize
@@ -337,23 +434,33 @@ contains
     class(rom_problem_t), intent(inout) :: this
     call this%rom%free()
     call this%basis%modes%free()
+    call this%test_basis%modes%free()
     call rom_problem_free_arrays(this)
     call rom_problem_free_outputs(this)
     call rom_problem_free_trajectories(this)
     call this%lift%free()
     this%rom_ready = .false.
+    this%reduced_system_exported = .false.
+    this%reference_trajectory_exported = .false.
   end subroutine rom_problem_free
 
   !> Release only forward and adjoint trajectory storage.
   subroutine rom_problem_free_trajectories(this)
     class(rom_problem_t), intent(inout) :: this
     call this%candidate_brinkman%free()
+    call this%candidate_enriched_brinkman%free()
     call this%candidate_brinkman_lift%free()
     call this%candidate_objective_brinkman%free()
     call this%candidate_objective_lift%free()
+    call this%candidate_objective_enriched_lift%free()
+    call this%candidate_objective_enriched_cross%free()
     call this%states%free(); call this%adjoint%free()
+    call this%exact_adjoint%free()
     call this%running_gradient%free(); call this%terminal_gradient%free()
+    call this%enriched_running_gradient%free()
+    call this%enriched_terminal_gradient%free()
     call this%lambda_sum%free(); call this%correlation%free()
+    call this%enriched_lambda_sum%free(); call this%enriched_correlation%free()
     call this%cost_sum_a%free(); call this%cost_sum_aa%free()
     this%forward_ready = .false.
     this%objectives_ready = .false.
@@ -368,6 +475,8 @@ contains
     integer, intent(in) :: n_modes, n_fields
     type(simulation_t), intent(inout) :: simulation
     integer :: expected_rows
+    if (this%petrov_galerkin .or. this%forward_constrained_enriched) call neko_error( &
+         'This ROM formulation requires separate streamed forward and adjoint bases')
     if (n_modes < 1 .or. size(basis, 2) /= n_modes .or. &
          (n_fields /= 3 .and. n_fields /= 4)) then
        call neko_error('ROM diagnostic basis must contain velocity or velocity/scalar fields')
@@ -377,10 +486,16 @@ contains
     if (size(basis, 1) /= expected_rows) then
        call neko_error('ROM diagnostic basis rows do not match the velocity fields')
     end if
+    ! The supplied-basis path can be entered without rom_problem_initialize.
+    ! Reset the live Neko case explicitly so the initial-state projection below
+    ! uses the case-defined IC rather than whatever fields a previous caller
+    ! left in the simulation object.
+    call simulation%reset()
     if (.not. this%lift%enabled) call this%lift%init(simulation%neko_case)
     if (.not. this%lift%enabled) call neko_error( &
          'ROM diagnostic basis requires a spatial velocity lift')
     call this%basis%modes%free()
+    call this%test_basis%modes%free()
     this%basis%n_rows = size(basis, 1)
     this%basis%n_modes = n_modes
     this%basis%n_fields = n_fields
@@ -548,62 +663,368 @@ contains
     class(rom_problem_t), intent(inout) :: this
     type(vector_t), pointer :: candidate_constant
     type(matrix_t), pointer :: candidate_linear
+    type(matrix_t), pointer :: candidate_implicit
+    type(matrix_t) :: enriched_implicit
     integer :: candidate_constant_index, candidate_linear_index
+    integer :: candidate_implicit_index
     class(design_t), intent(inout) :: design
     logical, intent(in), optional :: compute_constraint
-    integer :: r
+    integer :: r, e
     logical :: need_constraint
     need_constraint = .false.
     if (present(compute_constraint)) need_constraint = compute_constraint
     call rom_problem_free_trajectories(this)
     r = this%mass%get_nrows()
+    e = r
+    if (this%forward_constrained_enriched) e = this%enriched_adjoint_rank
     call this%candidate_brinkman%init(r,r)
     call this%candidate_brinkman_lift%init(r)
     call this%candidate_objective_brinkman%init(r,r)
     call this%candidate_objective_lift%init(r)
+    if (this%forward_constrained_enriched) then
+       call this%candidate_enriched_brinkman%init(e,e)
+       call this%candidate_objective_enriched_cross%init(e,r)
+       call this%candidate_objective_enriched_lift%init(e)
+    end if
     if (need_constraint) then
        call rom_problem_assemble_candidate(this, design, this%candidate_brinkman, &
             this%candidate_brinkman_lift, this%candidate_objective_brinkman, &
             this%candidate_objective_lift, this%candidate_objective_constant, &
-            this%candidate_volume)
+            this%candidate_enriched_brinkman, this%candidate_objective_enriched_cross, &
+            this%candidate_objective_enriched_lift, this%candidate_volume)
     else
        call rom_problem_assemble_candidate(this, design, this%candidate_brinkman, &
             this%candidate_brinkman_lift, this%candidate_objective_brinkman, &
-            this%candidate_objective_lift, this%candidate_objective_constant)
+            this%candidate_objective_lift, this%candidate_objective_constant, &
+            this%candidate_enriched_brinkman, this%candidate_objective_enriched_cross, &
+            this%candidate_objective_enriched_lift)
     end if
     call neko_scratch_registry%request_vector(candidate_constant, candidate_constant_index, &
          r, .true.)
     call neko_scratch_registry%request_matrix(candidate_linear, candidate_linear_index, &
+         r, r, .true.)
+    call neko_scratch_registry%request_matrix(candidate_implicit, candidate_implicit_index, &
          r, r, .true.)
     ! Reduced operators are host-owned dense algebra.  Do not use matrix/vector
     ! container assignment here: on an accelerator it copies the device mirror,
     ! while assembly intentionally populated the host mirror with scalar
     ! contractions.
     candidate_constant%x = this%fixed_constant%x - this%candidate_brinkman_lift%x
-    candidate_linear%x = this%fixed_linear%x - this%candidate_brinkman%x
+    candidate_linear%x = this%fixed_linear%x
+    ! Brinkman damping is part of the implicit BDF1 operator.  The positive
+    ! assembled damping matrix therefore enters with a minus sign in the
+    ! residual operator, so M - dt*(I_fixed - B) adds +dt*B to the solved
+    ! step matrix.
+    candidate_implicit%x = this%fixed_implicit%x - this%candidate_brinkman%x
+    if (this%export_reduced_system .and. .not. this%reduced_system_exported) then
+       call rom_problem_export_reduced_system(this, candidate_constant, &
+            candidate_linear, candidate_implicit)
+       this%reduced_system_exported = .true.
+    end if
     call this%rom%init(this%mass, candidate_constant, candidate_linear, &
-         this%quadratic, this%fixed_implicit)
+         this%quadratic, candidate_implicit)
+    if (this%forward_constrained_enriched) then
+       call enriched_implicit%init(e,e)
+       enriched_implicit%x = this%enriched_fixed_implicit%x - &
+            this%candidate_enriched_brinkman%x
+       call this%enriched_adjoint_model%init_linearized_adjoint( &
+            this%enriched_mass, enriched_implicit)
+       call enriched_implicit%free()
+    end if
     call this%states%init(r, this%n_steps + 1)
     call this%running_gradient%init(r, this%n_steps)
     call this%terminal_gradient%init(r)
+    if (this%forward_constrained_enriched) then
+       call this%enriched_running_gradient%init(e, this%n_steps)
+       call this%enriched_terminal_gradient%init(e)
+    end if
     call this%cost_sum_a%init(r)
     call this%cost_sum_aa%init(r,r)
     call this%rom%forward_bdf1(this%initial_state, this%dt, this%states)
     call neko_scratch_registry%relinquish_vector(candidate_constant_index)
     call neko_scratch_registry%relinquish_matrix(candidate_linear_index)
-    nullify(candidate_constant); nullify(candidate_linear)
+    call neko_scratch_registry%relinquish_matrix(candidate_implicit_index)
+    nullify(candidate_constant); nullify(candidate_linear); nullify(candidate_implicit)
     this%forward_ready = .true.
+    if (this%export_reduced_system .and. .not. this%reference_trajectory_exported) then
+       call rom_problem_export_reference_trajectory(this)
+       this%reference_trajectory_exported = .true.
+    end if
     if (this%write_trajectory_fields .and. this%rom_outputs_initialized) &
          call rom_problem_write_forward_trajectory(this)
   end subroutine rom_problem_run_forward_unsteady
+
+  !> Export the exact reduced operators used by the current BDF1 solve.
+  !!
+  !! This is a reference-design inspection boundary.  It writes host-owned
+  !! reduced arrays only; it does not alter any operator or trajectory.  The
+  !! exported equation is
+  !!
+  !!   (H-dt*L_i) a_(n+1) = H a_n + dt*(b+L_e a_n+q(a_n)),
+  !!
+  !! with q_i(a) = a^T Q_i a.  `b`, `L_e` and `L_i` are the actual candidate
+  !! objects passed to rom_model_t, including the reference-design Brinkman
+  !! lift and damping contributions.
+  subroutine rom_problem_export_reduced_system(this, constant, linear, implicit_linear)
+    class(rom_problem_t), intent(inout) :: this
+    type(vector_t), intent(inout) :: constant
+    type(matrix_t), intent(in) :: linear, implicit_linear
+    integer :: unit, i
+    integer :: r, trial_rank, test_rank
+    character(len=512) :: filename
+    character(len=32) :: logical_string
+
+    if (pe_rank /= 0) return
+    call mkdir(trim(this%reduced_system_export_directory))
+    r = this%mass%get_nrows()
+    trial_rank = this%basis%n_modes
+    test_rank = trial_rank
+    if (this%petrov_galerkin .or. this%forward_constrained_enriched) &
+         test_rank = this%test_basis%n_modes
+
+    filename = trim(this%reduced_system_export_directory)//'/H.csv'
+    call rom_problem_write_matrix_csv(trim(filename), this%mass%x)
+    filename = trim(this%reduced_system_export_directory)//'/trial_mass.csv'
+    call rom_problem_write_matrix_csv(trim(filename), this%trial_mass%x)
+    filename = trim(this%reduced_system_export_directory)//'/b.csv'
+    call rom_problem_write_vector_csv(trim(filename), constant%x)
+    filename = trim(this%reduced_system_export_directory)//'/linear_explicit.csv'
+    call rom_problem_write_matrix_csv(trim(filename), linear%x)
+    filename = trim(this%reduced_system_export_directory)//'/linear_implicit.csv'
+    call rom_problem_write_matrix_csv(trim(filename), implicit_linear%x)
+    filename = trim(this%reduced_system_export_directory)//'/Q.csv'
+    call rom_problem_write_quadratic_csv(trim(filename), this%quadratic)
+    filename = trim(this%reduced_system_export_directory)//'/a0.csv'
+    call rom_problem_write_vector_csv(trim(filename), this%initial_state%x)
+
+    ! These split files make the lift and design-dependent pieces inspectable
+    ! without changing the compact runtime files above.
+    filename = trim(this%reduced_system_export_directory)//'/fixed_constant.csv'
+    call rom_problem_write_vector_csv(trim(filename), this%fixed_constant%x)
+    filename = trim(this%reduced_system_export_directory)//'/brinkman_lift.csv'
+    call rom_problem_write_vector_csv(trim(filename), this%candidate_brinkman_lift%x)
+    filename = trim(this%reduced_system_export_directory)//'/fixed_linear.csv'
+    call rom_problem_write_matrix_csv(trim(filename), this%fixed_linear%x)
+    filename = trim(this%reduced_system_export_directory)//'/fixed_implicit.csv'
+    call rom_problem_write_matrix_csv(trim(filename), this%fixed_implicit%x)
+    filename = trim(this%reduced_system_export_directory)//'/brinkman_operator.csv'
+    call rom_problem_write_matrix_csv(trim(filename), this%candidate_brinkman%x)
+
+    ! The final paired bases are written in Fortran column-major order.  The
+    ! metadata records the shape and layout for numpy.reshape(order='F').
+    filename = trim(this%reduced_system_export_directory)//'/trial_basis.bin'
+    call rom_problem_write_matrix_binary(trim(filename), this%basis%modes%x)
+    if (this%petrov_galerkin .or. this%forward_constrained_enriched) then
+       filename = trim(this%reduced_system_export_directory)//'/test_basis.bin'
+       call rom_problem_write_matrix_binary(trim(filename), this%test_basis%modes%x)
+    end if
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call this%weights%copy_from(DEVICE_TO_HOST, sync=.true.)
+       do i = 1, 3
+          call this%lift_velocity(i)%copy_from(DEVICE_TO_HOST, sync=.true.)
+       end do
+       if (this%has_scalar) call this%scalar_lift%copy_from(DEVICE_TO_HOST, sync=.true.)
+    end if
+    filename = trim(this%reduced_system_export_directory)//'/weights.bin'
+    call rom_problem_write_vector_binary(trim(filename), this%weights%x)
+    filename = trim(this%reduced_system_export_directory)//'/lift_velocity.bin'
+    call rom_problem_write_vector_matrix_binary(trim(filename), this%lift_velocity)
+    if (this%has_scalar) then
+       filename = trim(this%reduced_system_export_directory)//'/scalar_lift.bin'
+       call rom_problem_write_vector_binary(trim(filename), this%scalar_lift%x)
+    end if
+
+    filename = trim(this%reduced_system_export_directory)//'/metadata.json'
+    open(newunit=unit, file=trim(filename), status='replace', action='write')
+    write(unit, '(A)') '{'
+    write(unit, '(A,I0,A)') '  "n_state": ', r, ','
+    write(unit, '(A,I0,A)') '  "retained_rank": ', r, ','
+    write(unit, '(A,I0,A)') '  "trial_basis_rank": ', trial_rank, ','
+    write(unit, '(A,I0,A)') '  "test_basis_rank": ', test_rank, ','
+    write(unit, '(A,I0,A)') '  "enriched_adjoint_rank": ', &
+         this%enriched_adjoint_rank, ','
+    write(unit, '(A,I0,A)') '  "trial_basis_rows": ', this%basis%n_rows, ','
+    write(unit, '(A,I0,A)') '  "test_basis_rows": ', this%test_basis%n_rows, ','
+    write(unit, '(A,A,A)') '  "formulation": "', trim(this%formulation), '",'
+    write(unit, '(A,A,A)') '  "sensitivity_source": "', &
+         trim(this%sensitivity_source), '",'
+    logical_string = rom_problem_json_logical(this%petrov_galerkin)
+    write(unit, '(A,A,A)') '  "petrov_galerkin": ', trim(logical_string), ','
+    logical_string = rom_problem_json_logical(this%forward_constrained_enriched)
+    write(unit, '(A,A,A)') '  "forward_constrained_enriched": ', trim(logical_string), ','
+    logical_string = rom_problem_json_logical(this%has_scalar)
+    write(unit, '(A,A,A)') '  "has_scalar": ', trim(logical_string), ','
+    write(unit, '(A,ES24.16,A)') '  "scalar_metric_weight": ', &
+         this%scalar_metric_weight, ','
+    write(unit, '(A,ES24.16,A)') '  "time_start": ', this%time_start, ','
+    write(unit, '(A,ES24.16,A)') '  "time_end": ', this%time_end, ','
+    write(unit, '(A,ES24.16,A)') '  "dt": ', this%dt, ','
+    write(unit, '(A,I0,A)') '  "n_steps": ', this%n_steps, ','
+    write(unit, '(A,I0,A)') '  "substeps": ', this%substeps, ','
+    write(unit, '(A,ES24.16,A)') '  "viscosity": ', this%viscosity, ','
+    write(unit, '(A,ES24.16,A)') '  "density": ', this%density, ','
+    write(unit, '(A,ES24.16,A)') '  "cross_mass_sigma_min": ', &
+         this%cross_mass_sigma_min, ','
+    write(unit, '(A,ES24.16,A)') '  "cross_mass_sigma_max": ', &
+         this%cross_mass_sigma_max, ','
+    write(unit, '(A,ES24.16,A)') '  "cross_mass_condition": ', &
+         this%cross_mass_condition, ','
+    write(unit, '(A,I0,A)') '  "cross_mass_retained_rank": ', &
+         this%cross_mass_retained_rank, ','
+    write(unit, '(A)', advance='no') '  "cross_mass_singular_values": ['
+    if (allocated(this%cross_mass_singular_values)) then
+       do i = 1, size(this%cross_mass_singular_values)
+          if (i > 1) write(unit, '(A)', advance='no') ', '
+          write(unit, '(ES24.16)', advance='no') this%cross_mass_singular_values(i)
+       end do
+    end if
+    write(unit, '(A)') '],'
+    write(unit, '(A)') '  "basis_layout": "field-major, column-major float64 binary",'
+    write(unit, '(A)') '  "q_indexing": "Q[i,j,k] = sum_jk coefficient for residual i",'
+    write(unit, '(A)') '  "b_definition": "fixed_constant - candidate_brinkman_lift",'
+    write(unit, '(A)') '  "linear_explicit_definition": "fixed_linear",'
+    write(unit, '(A)') '  "linear_implicit_definition": "fixed_implicit - candidate_brinkman",'
+    write(unit, '(A)') '  "files": {'
+    write(unit, '(A)') '    "H": "H.csv", "trial_mass": "trial_mass.csv",'
+    write(unit, '(A)') '    "b": "b.csv", "linear_explicit": "linear_explicit.csv",'
+    write(unit, '(A)') '    "linear_implicit": "linear_implicit.csv", "Q": "Q.csv",'
+    write(unit, '(A)') '    "a0": "a0.csv", "trial_basis": "trial_basis.bin",'
+    if (this%petrov_galerkin .or. this%forward_constrained_enriched) then
+       write(unit, '(A)') '    "test_basis": "test_basis.bin",'
+    end if
+    write(unit, '(A)') '    "weights": "weights.bin", "lift_velocity": "lift_velocity.bin",'
+    if (this%has_scalar) then
+       write(unit, '(A)') '    "scalar_lift": "scalar_lift.bin",'
+    end if
+    write(unit, '(A)') '    "reference_trajectory": "reference_trajectory.csv"'
+    write(unit, '(A)') '  }'
+    write(unit, '(A)') '}'
+    close(unit)
+  end subroutine rom_problem_export_reduced_system
+
+  !> Export the trajectory produced by the same reduced BDF1 call.
+  subroutine rom_problem_export_reference_trajectory(this)
+    class(rom_problem_t), intent(in) :: this
+    integer :: unit, step, mode, r
+    character(len=512) :: filename
+    r = this%states%get_nrows()
+    filename = trim(this%reduced_system_export_directory)//'/reference_trajectory.csv'
+    open(newunit=unit, file=trim(filename), status='replace', action='write')
+    write(unit, '(A)', advance='no') 'step,time'
+    do mode = 1, r
+       write(unit, '(A,I0)', advance='no') ',a_', mode
+    end do
+    write(unit, '(A)') ''
+    do step = 0, this%n_steps
+       write(unit, '(I0,A,ES24.16)', advance='no') step, ',', &
+            this%time_start + real(step, rp) * this%dt
+       do mode = 1, r
+          write(unit, '(A,ES24.16)', advance='no') ',', this%states%x(mode,step+1)
+       end do
+       write(unit, '(A)') ''
+    end do
+    close(unit)
+  end subroutine rom_problem_export_reference_trajectory
+
+  !> Write a dense reduced matrix as comma-separated rows.
+  subroutine rom_problem_write_matrix_csv(filename, values)
+    character(len=*), intent(in) :: filename
+    real(kind=rp), intent(in) :: values(:, :)
+    integer :: unit, i, j
+    open(newunit=unit, file=trim(filename), status='replace', action='write')
+    do i = 1, size(values,1)
+       do j = 1, size(values,2)
+          if (j > 1) write(unit, '(A)', advance='no') ','
+          write(unit, '(ES24.16)', advance='no') values(i,j)
+       end do
+       write(unit, '(A)') ''
+    end do
+    close(unit)
+  end subroutine rom_problem_write_matrix_csv
+
+  !> Write a reduced vector as one value per CSV row.
+  subroutine rom_problem_write_vector_csv(filename, values)
+    character(len=*), intent(in) :: filename
+    real(kind=rp), intent(in) :: values(:)
+    integer :: unit, i
+    open(newunit=unit, file=trim(filename), status='replace', action='write')
+    do i = 1, size(values)
+       write(unit, '(ES24.16)') values(i)
+    end do
+    close(unit)
+  end subroutine rom_problem_write_vector_csv
+
+  !> Write the residual-row quadratic tensor as i,j,k,value CSV records.
+  subroutine rom_problem_write_quadratic_csv(filename, values)
+    character(len=*), intent(in) :: filename
+    type(matrix_t), intent(in) :: values(:)
+    integer :: unit, i, j, k
+    open(newunit=unit, file=trim(filename), status='replace', action='write')
+    write(unit, '(A)') 'i,j,k,value'
+    do i = 1, size(values)
+       do j = 1, values(i)%get_nrows()
+          do k = 1, values(i)%get_ncols()
+             write(unit, '(I0,A,I0,A,I0,A,ES24.16)') i, ',', j, ',', k, ',', &
+                  values(i)%x(j,k)
+          end do
+       end do
+    end do
+    close(unit)
+  end subroutine rom_problem_write_quadratic_csv
+
+  !> Write a dense matrix in raw Fortran column-major float64 form.
+  subroutine rom_problem_write_matrix_binary(filename, values)
+    character(len=*), intent(in) :: filename
+    real(kind=rp), intent(in) :: values(:, :)
+    integer :: unit
+    open(newunit=unit, file=trim(filename), status='replace', &
+         access='stream', form='unformatted', action='write')
+    write(unit) values
+    close(unit)
+  end subroutine rom_problem_write_matrix_binary
+
+  !> Write a reduced vector in raw float64 form.
+  subroutine rom_problem_write_vector_binary(filename, values)
+    character(len=*), intent(in) :: filename
+    real(kind=rp), intent(in) :: values(:)
+    integer :: unit
+    open(newunit=unit, file=trim(filename), status='replace', &
+         access='stream', form='unformatted', action='write')
+    write(unit) values
+    close(unit)
+  end subroutine rom_problem_write_vector_binary
+
+  !> Write three mesh vectors consecutively in component-major raw form.
+  subroutine rom_problem_write_vector_matrix_binary(filename, values)
+    character(len=*), intent(in) :: filename
+    type(vector_t), intent(in) :: values(:)
+    integer :: unit, i
+    open(newunit=unit, file=trim(filename), status='replace', &
+         access='stream', form='unformatted', action='write')
+    do i = 1, size(values)
+       write(unit) values(i)%x
+    end do
+    close(unit)
+  end subroutine rom_problem_write_vector_matrix_binary
+
+  !> Return a JSON-compatible lowercase logical literal.
+  function rom_problem_json_logical(value) result(string)
+    logical, intent(in) :: value
+    character(len=5) :: string
+    if (value) then
+       string = 'true '
+    else
+       string = 'false'
+    end if
+  end function rom_problem_json_logical
 
   !> Evaluate time-integrated ROM objectives and their state derivatives.
   subroutine rom_problem_compute_objectives(this, objective, constraints)
     class(rom_problem_t), intent(inout) :: this
     real(kind=rp), intent(out) :: objective
     real(kind=rp), intent(out), optional :: constraints(:)
-    type(vector_t), pointer :: state, state_gradient
-    integer :: state_index, state_gradient_index
+    type(vector_t), pointer :: state, state_gradient, enriched_state_gradient
+    integer :: state_index, state_gradient_index, enriched_state_gradient_index
     integer :: step
     real(kind=rp) :: state_cost, wv, wb, ws, viscous_time_weight
     real(kind=rp) :: brinkman_time_weight, scalar_mixing_time_weight
@@ -612,6 +1033,10 @@ contains
          'ROM objectives requested before run_forward_unsteady')
     this%running_gradient%x = 0.0_rp
     this%terminal_gradient%x = 0.0_rp
+    if (this%forward_constrained_enriched) then
+       this%enriched_running_gradient%x = 0.0_rp
+       this%enriched_terminal_gradient%x = 0.0_rp
+    end if
     this%cost_sum_a%x = 0.0_rp
     this%cost_sum_aa%x = 0.0_rp
     this%cost_total = 0.0_rp
@@ -633,6 +1058,10 @@ contains
          this%states%get_nrows(), .true.)
     call neko_scratch_registry%request_vector(state_gradient, state_gradient_index, &
          this%states%get_nrows(), .true.)
+    if (this%forward_constrained_enriched) then
+       call neko_scratch_registry%request_vector(enriched_state_gradient, &
+            enriched_state_gradient_index, this%enriched_adjoint_rank, .true.)
+    end if
     do step = 1, this%n_steps
        state%x = this%states%x(:,step+1)
        time_value = this%time_start + real(step, rp) * this%dt
@@ -661,6 +1090,17 @@ contains
           state_gradient%x = (this%viscous_linear%x + &
                matmul(this%viscous_quadratic%x, state%x)) / &
                max(this%viscous_domain, tiny(1.0_rp))
+          if (this%forward_constrained_enriched) then
+             enriched_state_gradient%x = (this%enriched_viscous_linear%x + &
+                  matmul(this%enriched_viscous_cross%x, state%x)) / &
+                  max(this%viscous_domain, tiny(1.0_rp))
+             if (step < this%n_steps) this%enriched_running_gradient%x(:,step+1) = &
+                  this%enriched_running_gradient%x(:,step+1) + wv * &
+                  enriched_state_gradient%x
+             if (step == this%n_steps) this%enriched_terminal_gradient%x = &
+                  this%enriched_terminal_gradient%x + this%dt * wv * &
+                  enriched_state_gradient%x
+          end if
           if (step < this%n_steps) this%running_gradient%x(:,step+1) = &
                this%running_gradient%x(:,step+1) + wv * state_gradient%x
           if (step == this%n_steps) this%terminal_gradient%x = &
@@ -676,6 +1116,17 @@ contains
           state_gradient%x = (this%candidate_objective_lift%x + &
                matmul(this%candidate_objective_brinkman%x, state%x)) / &
                this%brinkman_domain
+          if (this%forward_constrained_enriched) then
+             enriched_state_gradient%x = (this%candidate_objective_enriched_lift%x + &
+                  matmul(this%candidate_objective_enriched_cross%x, state%x)) / &
+                  this%brinkman_domain
+             if (step < this%n_steps) this%enriched_running_gradient%x(:,step+1) = &
+                  this%enriched_running_gradient%x(:,step+1) + wb * &
+                  enriched_state_gradient%x
+             if (step == this%n_steps) this%enriched_terminal_gradient%x = &
+                  this%enriched_terminal_gradient%x + this%dt * wb * &
+                  enriched_state_gradient%x
+          end if
           if (step < this%n_steps) this%running_gradient%x(:,step+1) = &
                this%running_gradient%x(:,step+1) + wb * state_gradient%x
           if (step == this%n_steps) this%terminal_gradient%x = &
@@ -694,6 +1145,17 @@ contains
           state_gradient%x = (this%scalar_mixing_linear%x + &
                matmul(this%scalar_mixing_quadratic%x, state%x)) / &
                max(this%scalar_mixing_domain, tiny(1.0_rp))
+          if (this%forward_constrained_enriched) then
+             enriched_state_gradient%x = (this%enriched_scalar_mixing_linear%x + &
+                  matmul(this%enriched_scalar_mixing_cross%x, state%x)) / &
+                  max(this%scalar_mixing_domain, tiny(1.0_rp))
+             if (step < this%n_steps) this%enriched_running_gradient%x(:,step+1) = &
+                  this%enriched_running_gradient%x(:,step+1) + ws * &
+                  enriched_state_gradient%x
+             if (step == this%n_steps) this%enriched_terminal_gradient%x = &
+                  this%enriched_terminal_gradient%x + this%dt * ws * &
+                  enriched_state_gradient%x
+          end if
           if (step < this%n_steps) this%running_gradient%x(:,step+1) = &
                this%running_gradient%x(:,step+1) + ws * state_gradient%x
           if (step == this%n_steps) this%terminal_gradient%x = &
@@ -712,7 +1174,10 @@ contains
     objective = this%objective_value
     this%objectives_ready = .true.
     call neko_scratch_registry%relinquish_vector([state_index, state_gradient_index])
-    nullify(state); nullify(state_gradient)
+    if (this%forward_constrained_enriched) then
+       call neko_scratch_registry%relinquish_vector(enriched_state_gradient_index)
+    end if
+    nullify(state); nullify(state_gradient); nullify(enriched_state_gradient)
   end subroutine rom_problem_compute_objectives
 
   !> Integrate the reduced discrete adjoint backward through stored states.
@@ -723,6 +1188,10 @@ contains
     integer :: step
     if (.not. this%objectives_ready) call neko_error( &
          'ROM adjoint requested before compute_objectives')
+    if (this%forward_constrained_enriched) then
+       call rom_problem_run_enriched_backward(this)
+       return
+    end if
     call this%adjoint%free(); call this%lambda_sum%free(); call this%correlation%free()
     call this%adjoint%init(this%states%get_nrows(), this%n_steps + 1)
     call this%lambda_sum%init(this%states%get_nrows())
@@ -741,7 +1210,9 @@ contains
                this%states%get_nrows(), .true.)
        end if
        next_adjoint%x = this%adjoint%x(:,step+1)
-       state%x = this%states%x(:,step)
+       ! Brinkman is implicit in the BDF1 map, so its design derivative
+       ! contracts the transpose step solve with the new-time state.
+       state%x = this%states%x(:,step+1)
        call this%rom%solve_step_transpose(this%dt, next_adjoint, lambda)
        this%lambda_sum%x = this%lambda_sum%x + lambda%x
        call add_outer_product(this%correlation, lambda, state, 1.0_rp)
@@ -753,17 +1224,160 @@ contains
     nullify(lambda); nullify(next_adjoint); nullify(state)
   end subroutine rom_problem_run_backward_unsteady
 
+  !> Run both enriched and exact reference adjoints on the stored trajectory.
+  !! `adjoint` is the independently restricted adjoint-POD solve used when
+  !! `sensitivity_source=projected_adjoint`; `exact_adjoint` remains the
+  !! exact discrete adjoint of the forward Galerkin ROM for diagnostics and
+  !! the selectable `exact_galerkin` sensitivity source.
+  subroutine rom_problem_run_enriched_backward(this)
+    class(rom_problem_t), intent(inout) :: this
+    type(matrix_t), allocatable :: time_jacobian(:)
+    type(matrix_t), allocatable :: convection_jacobian(:)
+    type(matrix_t), allocatable :: scalar_advection_jacobian(:)
+    type(vector_t), pointer :: lambda, next_adjoint, state
+    type(vector_t), pointer :: exact_lambda, exact_next_adjoint
+    real(kind=rp), allocatable :: basis_coefficient(:)
+    integer :: lambda_index, next_adjoint_index, state_index
+    integer :: exact_lambda_index, exact_next_adjoint_index
+    integer :: step, e, r, k
+
+    e = this%enriched_adjoint_rank
+    r = this%states%get_nrows()
+    call this%adjoint%free(); call this%exact_adjoint%free()
+    call this%enriched_lambda_sum%free(); call this%enriched_correlation%free()
+    call this%adjoint%init(e, this%n_steps + 1)
+    call this%exact_adjoint%init(r, this%n_steps + 1)
+    call this%enriched_lambda_sum%init(e)
+    call this%enriched_correlation%init(e, r)
+    call this%rom%discrete_adjoint_bdf1(this%states, this%dt, &
+         this%running_gradient, this%terminal_gradient, this%exact_adjoint)
+
+    ! The forward-constrained trajectory is advanced with the forward trial
+    ! basis and the trial--trial Brinkman operator.  Keep its exact discrete
+    ! adjoint in parallel as the reference sensitivity.  The independent
+    ! adjoint-POD solve below is deliberately a different approximation and
+    ! is selected explicitly by the sensitivity_source setting.
+    call this%lambda_sum%free()
+    call this%correlation%free()
+    call this%lambda_sum%init(r)
+    call this%correlation%init(r, r)
+
+    ! The projected nonlinear Jacobian is affine in the forward reduced
+    ! coefficients.  Assemble its basis contributions once, rather than
+    ! repeating mesh-sized contractions and MPI reductions at every adjoint
+    ! timestep.  This is algebraically identical to evaluating the two
+    ! linearized assembly routines with the current coefficient vector.
+    allocate(convection_jacobian(r), basis_coefficient(r))
+    basis_coefficient = 0.0_rp
+    if (this%has_scalar) allocate(scalar_advection_jacobian(r))
+    do k = 1, r
+       call convection_jacobian(k)%init(e,e)
+       convection_jacobian(k)%x = 0.0_rp
+       basis_coefficient(k) = 1.0_rp
+       call rom_add_linearized_convection(this%weights, this%velocity_modes, &
+            this%velocity_gradients, this%test_velocity_modes, &
+            this%test_velocity_modes, this%test_velocity_gradients, &
+            basis_coefficient, convection_jacobian(k))
+       if (this%has_scalar) then
+          call scalar_advection_jacobian(k)%init(e,e)
+          scalar_advection_jacobian(k)%x = 0.0_rp
+          call rom_add_linearized_scalar_advection( &
+               this%weights, this%scalar_metric_weight, this%velocity_modes, &
+               this%scalar_modes, this%scalar_gradients, this%test_scalar_modes, &
+               this%test_velocity_modes, this%test_scalar_modes, &
+               this%test_scalar_gradients, basis_coefficient, &
+               scalar_advection_jacobian(k))
+       end if
+       basis_coefficient(k) = 0.0_rp
+    end do
+    deallocate(basis_coefficient)
+
+    allocate(time_jacobian(this%n_steps))
+    do step = 1, this%n_steps
+       call time_jacobian(step)%init(e,e)
+       time_jacobian(step)%x = this%enriched_fixed_linear%x
+       do k = 1, r
+          time_jacobian(step)%x = time_jacobian(step)%x + &
+               this%states%x(k,step) * convection_jacobian(k)%x
+          if (this%has_scalar) time_jacobian(step)%x = &
+               time_jacobian(step)%x + this%states%x(k,step) * &
+               scalar_advection_jacobian(k)%x
+       end do
+    end do
+    call this%enriched_adjoint_model%discrete_adjoint_bdf1_timevarying(this%dt, &
+         this%enriched_running_gradient, this%enriched_terminal_gradient, &
+         time_jacobian, this%adjoint)
+
+    this%enriched_lambda_sum%x = 0.0_rp
+    this%enriched_correlation%x = 0.0_rp
+    do step = 1, this%n_steps
+       if (step == 1) then
+          call neko_scratch_registry%request_vector(lambda, lambda_index, e, .true.)
+          call neko_scratch_registry%request_vector(next_adjoint, next_adjoint_index, &
+               e, .true.)
+          call neko_scratch_registry%request_vector(state, state_index, r, .true.)
+          call neko_scratch_registry%request_vector(exact_lambda, exact_lambda_index, &
+               r, .true.)
+          call neko_scratch_registry%request_vector(exact_next_adjoint, &
+               exact_next_adjoint_index, r, .true.)
+       end if
+       next_adjoint%x = this%adjoint%x(:,step+1)
+       state%x = this%states%x(:,step+1)
+       call this%enriched_adjoint_model%solve_step_transpose(this%dt, next_adjoint, lambda)
+       this%enriched_lambda_sum%x = this%enriched_lambda_sum%x + lambda%x
+       call add_outer_product(this%enriched_correlation, lambda, state, 1.0_rp)
+
+       exact_next_adjoint%x = this%exact_adjoint%x(:,step+1)
+       call this%rom%solve_step_transpose(this%dt, exact_next_adjoint, exact_lambda)
+       this%lambda_sum%x = this%lambda_sum%x + exact_lambda%x
+       call add_outer_product(this%correlation, exact_lambda, state, 1.0_rp)
+    end do
+    this%backward_ready = .true.
+    if (this%write_trajectory_fields .and. this%rom_outputs_initialized) &
+         call rom_problem_write_adjoint_trajectory(this)
+    call neko_scratch_registry%relinquish_vector([lambda_index, next_adjoint_index, &
+         state_index, exact_lambda_index, exact_next_adjoint_index])
+    nullify(lambda); nullify(next_adjoint); nullify(state)
+    nullify(exact_lambda); nullify(exact_next_adjoint)
+    do step = 1, this%n_steps
+       call time_jacobian(step)%free()
+    end do
+    deallocate(time_jacobian)
+    do k = 1, r
+       call convection_jacobian(k)%free()
+       if (this%has_scalar) call scalar_advection_jacobian(k)%free()
+    end do
+    deallocate(convection_jacobian)
+    if (this%has_scalar) deallocate(scalar_advection_jacobian)
+  end subroutine rom_problem_run_enriched_backward
+
   !> Assemble the mapped full-dimensional ROM design sensitivity density.
-  subroutine rom_problem_compute_density(this, density)
+  subroutine rom_problem_compute_density(this, density, source)
     class(rom_problem_t), intent(in) :: this
     type(vector_t), intent(inout) :: density
+    character(len=*), intent(in), optional :: source
     type(vector_t), pointer :: lift_square, direct, masked_direct, product, component_sum
     type(vector_ptr_t) :: mode_sum(3)
     integer :: lift_square_index, direct_index, masked_direct_index, product_index
     integer :: component_sum_index, mode_sum_index(3)
-    integer :: j, c, r, n
+    integer :: i, j, c, r, e, n
+    logical :: use_projected
+    character(len=32) :: source_name
 
+    source_name = this%sensitivity_source
+    if (present(source)) source_name = trim(source)
+    if (source_name /= 'exact_galerkin' .and. source_name /= 'projected_adjoint') &
+         call neko_error('unknown ROM sensitivity source')
+    use_projected = this%forward_constrained_enriched .and. &
+         source_name == 'projected_adjoint'
     r = this%mass%get_nrows(); n = this%weights%size()
+    e = this%enriched_adjoint_rank
+    if (use_projected) then
+       if (this%enriched_lambda_sum%size() /= e .or. &
+            this%enriched_correlation%get_nrows() /= e .or. &
+            this%enriched_correlation%get_ncols() /= r) call neko_error( &
+            'projected-adjoint ROM sensitivity has inconsistent reduced shapes')
+    end if
     if (density%size() /= n) call density%init(n)
        call vector_cmult(density, 0.0_rp)
     mode_sum_index = 0
@@ -806,22 +1420,62 @@ contains
             max(this%brinkman_domain, tiny(1.0_rp)))
        density = masked_direct
     end if
-    do j = 1, r
-       component_sum = 0.0_rp
-       do c = 1, 3
-          call vector_col3(product, this%velocity_modes(c,j), this%lift_velocity(c))
-          call vector_add2(component_sum, product)
-       end do
-       call vector_add2s2(density, component_sum, -this%dt * this%lambda_sum%x(j))
-       do c = 1, r
+    ! The state-dependent design term is differentiated through the selected
+    ! reduced adjoint.  The exact branch uses the adjoint of the restricted
+    ! forward Galerkin map.  The projected branch contracts the independently
+    ! integrated V_a adjoint against the V_a--V_f Brinkman cross terms.
+    if (use_projected) then
+       do i = 1, e
           component_sum = 0.0_rp
-          do n = 1, 3
-             call vector_col3(product, this%velocity_modes(n,j), this%velocity_modes(n,c))
+          do c = 1, 3
+             call vector_col3(product, this%test_velocity_modes(c,i), &
+                  this%lift_velocity(c))
              call vector_add2(component_sum, product)
           end do
-          call vector_add2s2(density, component_sum, -this%dt * this%correlation%x(j,c))
+          call vector_add2s2(density, component_sum, -this%dt * &
+               this%enriched_lambda_sum%x(i))
+          do j = 1, r
+             component_sum = 0.0_rp
+             do c = 1, 3
+                call vector_col3(product, this%test_velocity_modes(c,i), &
+                     this%velocity_modes(c,j))
+                call vector_add2(component_sum, product)
+             end do
+             call vector_add2s2(density, component_sum, -this%dt * &
+                  this%enriched_correlation%x(i,j))
+          end do
        end do
-    end do
+    else
+       do j = 1, r
+          component_sum = 0.0_rp
+          do c = 1, 3
+             if (this%forward_constrained_enriched) then
+                call vector_col3(product, this%velocity_modes(c,j), &
+                     this%lift_velocity(c))
+             else
+                call vector_col3(product, this%test_velocity_modes(c,j), &
+                     this%lift_velocity(c))
+             end if
+             call vector_add2(component_sum, product)
+          end do
+          call vector_add2s2(density, component_sum, -this%dt * this%lambda_sum%x(j))
+          do c = 1, r
+             component_sum = 0.0_rp
+             do n = 1, 3
+                if (this%forward_constrained_enriched) then
+                   call vector_col3(product, this%velocity_modes(n,j), &
+                        this%velocity_modes(n,c))
+                else
+                   call vector_col3(product, this%test_velocity_modes(n,j), &
+                        this%velocity_modes(n,c))
+                end if
+                call vector_add2(component_sum, product)
+             end do
+             call vector_add2s2(density, component_sum, -this%dt * &
+                  this%correlation%x(j,c))
+          end do
+       end do
+    end if
     do c = 1, 3
        if (mode_sum_index(c) > 0) then
           call neko_scratch_registry%relinquish_vector(mode_sum_index(c))
@@ -978,6 +1632,14 @@ contains
     type(simulation_t), intent(inout) :: simulation
     integer :: n_modes, n_fields
     real(kind=rp), allocatable :: local_basis(:, :)
+    if (this%forward_constrained_enriched) then
+       call rom_problem_load_local_forward_constrained_basis(this, simulation)
+       return
+    end if
+    if (this%petrov_galerkin) then
+       call rom_problem_load_local_petrov_basis(this, simulation)
+       return
+    end if
     call rom_receive_basis(simulation%state_recover, simulation%fluid%u%x, &
          local_basis, n_modes, n_fields)
     if ((n_fields /= 3 .and. n_fields /= 4) .or. &
@@ -986,7 +1648,6 @@ contains
     end if
     call rom_project_basis(simulation, local_basis, n_modes, n_fields)
     this%basis%n_fields = n_fields
-    call rom_problem_restrict_scalar_basis_array(local_basis, n_modes, n_fields, simulation)
     if (n_modes < 1) call neko_error('Python ROM peer returned an empty basis')
     this%basis%n_rows = size(local_basis, 1)
     this%basis%n_modes = n_modes
@@ -1001,61 +1662,269 @@ contains
     deallocate(local_basis)
   end subroutine rom_problem_load_local_basis
 
-  !> Apply Neko's scalar homogeneous Dirichlet projector to every scalar mode.
-  !! The physical scalar lift has already been subtracted by the streamer, so
-  !! the scalar fluctuation must lie in the zero-trace space.
-  subroutine rom_problem_restrict_scalar_basis_array(basis, n_modes, n_fields, &
-       simulation)
-    real(kind=rp), intent(inout) :: basis(:, :)
-    integer, intent(in) :: n_modes, n_fields
+  !> Receive forward and adjoint POD spaces and construct
+  !! the common enriched physical space V_E = span([V_f,V_a]).
+  !!
+  !! The forward and adjoint POD blocks are mass-orthonormalised
+  !! independently.  The forward system retains only V_f, while the
+  !! independent adjoint system retains only V_a; overlapping components are
+  !! preserved rather than replaced by an orthogonal complement.
+  subroutine rom_problem_load_local_forward_constrained_basis(this, simulation)
+    class(rom_problem_t), intent(inout) :: this
     type(simulation_t), intent(inout) :: simulation
-    type(field_t), pointer :: work
-    integer :: work_index, n, mode, first, last
+    integer :: trial_modes, trial_fields, adjoint_modes, adjoint_fields
+    integer :: n, trial_retained, adjoint_retained, fields
+    integer, allocatable :: trial_mode_index(:), adjoint_mode_index(:)
+    real(kind=rp), allocatable :: trial_basis(:, :), adjoint_basis(:, :)
+    real(kind=rp), allocatable :: trial_velocity(:, :), adjoint_velocity(:, :)
+    real(kind=rp), allocatable :: trial_scalar(:,:), adjoint_scalar(:,:), mass(:)
+    real(kind=rp), allocatable :: trial_norms(:), trial_crosses(:)
+    real(kind=rp), allocatable :: adjoint_norms(:), adjoint_crosses(:)
+    real(kind=rp) :: scalar_weight, tolerance
+    logical :: trial_ok, adjoint_ok
 
-    if (n_fields /= 4 .or. .not. associated(simulation%scalars)) return
+    call rom_receive_petrov_bases(simulation%state_recover, simulation%fluid%u%x, &
+         trial_basis, trial_modes, trial_fields, adjoint_basis, adjoint_modes, &
+         adjoint_fields)
+    if (trial_fields /= adjoint_fields .or. &
+         (trial_fields /= 3 .and. trial_fields /= 4)) call neko_error( &
+         'forward_constrained_enriched basis field counts do not match')
+    if (trial_modes < 1 .or. adjoint_modes < 1) call neko_error( &
+         'forward_constrained_enriched requires nonempty forward and adjoint POD spaces')
+    if (trial_fields == 4 .and. .not. associated(simulation%scalars)) call neko_error( &
+         'forward_constrained_enriched scalar basis supplied to a scalar-free simulation')
+    n = simulation%fluid%u%dof%size(); fields = trial_fields
+    if (size(trial_basis, 1) /= fields*n .or. size(adjoint_basis, 1) /= fields*n .or. &
+         size(trial_basis, 2) /= trial_modes .or. size(adjoint_basis, 2) /= adjoint_modes) &
+         call neko_error('forward_constrained_enriched received inconsistent basis shapes')
+    call rom_project_basis(simulation, trial_basis, trial_modes, trial_fields)
+    call rom_project_test_basis(simulation, adjoint_basis, adjoint_modes, adjoint_fields)
+    if (trial_modes < 1 .or. adjoint_modes < 1) call neko_error( &
+         'forward_constrained_enriched admissibility processing removed every basis mode')
+    if (size(trial_basis, 1) /= fields*n .or. size(adjoint_basis, 1) /= fields*n .or. &
+         size(trial_basis, 2) /= trial_modes .or. size(adjoint_basis, 2) /= adjoint_modes) &
+         call neko_error('forward_constrained_enriched projection changed basis shapes')
+
+    scalar_weight = this%scalar_metric_weight
+    tolerance = this%admissibility_tolerance
+    if (scalar_weight <= 0.0_rp) call neko_error( &
+         'ROM scalar_metric_weight must be positive')
+    allocate(mass(n), trial_mode_index(trial_modes), adjoint_mode_index(adjoint_modes), &
+         trial_norms(trial_modes), trial_crosses(trial_modes), &
+         adjoint_norms(adjoint_modes), adjoint_crosses(adjoint_modes))
+    mass = reshape(simulation%fluid%c_Xh%B, [n])
+    ! The streamed forward and adjoint POD blocks define two subspaces of the
+    ! same enriched physical space V_E = span([V_f,V_a]).  Orthonormalise each
+    ! block independently; do not replace V_a by its complement to V_f.
+    if (fields == 4) then
+       allocate(trial_velocity(3*n,trial_modes), adjoint_velocity(3*n,adjoint_modes), &
+            trial_scalar(n,trial_modes), adjoint_scalar(n,adjoint_modes))
+       if (size(trial_scalar,1) /= n .or. size(adjoint_scalar,1) /= n) &
+            call neko_error('forward_constrained_enriched scalar workspace shape mismatch')
+       trial_velocity = trial_basis(1:3*n,:)
+       adjoint_velocity = adjoint_basis(1:3*n,:)
+       trial_scalar = trial_basis(3*n+1:4*n,:)
+       adjoint_scalar = adjoint_basis(3*n+1:4*n,:)
+       call rom_orthonormalize_projected_coupled_device(trial_velocity, trial_scalar, n, &
+            trial_modes, mass, scalar_weight, tolerance, trial_retained, &
+            trial_mode_index, trial_norms, trial_crosses, trial_ok)
+       call rom_orthonormalize_projected_coupled_device(adjoint_velocity, adjoint_scalar, n, &
+            adjoint_modes, mass, scalar_weight, tolerance, adjoint_retained, &
+            adjoint_mode_index, adjoint_norms, adjoint_crosses, adjoint_ok)
+       trial_basis(1:3*n,1:trial_retained) = trial_velocity
+       adjoint_basis(1:3*n,1:adjoint_retained) = adjoint_velocity
+       trial_basis(3*n+1:4*n,1:trial_retained) = trial_scalar
+       adjoint_basis(3*n+1:4*n,1:adjoint_retained) = adjoint_scalar
+    else
+       call rom_orthonormalize_projected_device(trial_basis, n, trial_modes, mass, &
+            tolerance, trial_retained, trial_mode_index, trial_norms, trial_crosses, trial_ok)
+       call rom_orthonormalize_projected_device(adjoint_basis, n, adjoint_modes, mass, &
+            tolerance, adjoint_retained, adjoint_mode_index, adjoint_norms, &
+            adjoint_crosses, adjoint_ok)
+    end if
+    if (.not. trial_ok .or. .not. adjoint_ok .or. trial_retained < 1 .or. &
+         adjoint_retained < 1) call neko_error( &
+         'forward_constrained_enriched failed independent coupled mass orthonormalisation')
+    if (size(trial_basis,1) /= fields*n .or. size(adjoint_basis,1) /= fields*n .or. &
+         size(trial_basis,2) < trial_retained .or. size(adjoint_basis,2) < adjoint_retained) &
+         call neko_error('forward_constrained_enriched independent basis shape mismatch')
+    if (this%rank_total_max < trial_retained) call neko_error( &
+         'forward_constrained_enriched rank_total_max is smaller than the forward rank')
+    ! The configured cap limits the retained adjoint block without changing
+    ! its origin: every retained adjoint column remains in span(V_a).  The
+    ! forward block is never truncated by this cap.
+    trial_modes = trial_retained
+    adjoint_modes = min(adjoint_retained, this%rank_total_max)
+    if (adjoint_modes < 1) call neko_error( &
+         'forward_constrained_enriched retained no adjoint POD modes')
+    if (fields == 4) then
+       trial_basis = trial_basis(:,1:trial_modes)
+       adjoint_basis = adjoint_basis(:,1:adjoint_modes)
+       trial_scalar = trial_scalar(:,1:trial_modes)
+       adjoint_scalar = adjoint_scalar(:,1:adjoint_modes)
+    else
+       trial_basis = trial_basis(:,1:trial_modes)
+       adjoint_basis = adjoint_basis(:,1:adjoint_modes)
+    end if
+
+    call this%basis%modes%free(); call this%test_basis%modes%free()
+    this%basis%n_rows = fields*n; this%basis%n_modes = trial_modes
+    this%basis%n_fields = fields
+    this%test_basis%n_rows = fields*n; this%test_basis%n_modes = adjoint_modes
+    this%test_basis%n_fields = fields
+    call this%basis%modes%init(fields*n, trial_modes)
+    call this%test_basis%modes%init(fields*n, adjoint_modes)
+    if (size(this%basis%modes%x,1) /= fields*n .or. &
+         size(this%test_basis%modes%x,1) /= fields*n) call neko_error( &
+         'forward_constrained_enriched output basis shape mismatch')
+    this%basis%modes%x = trial_basis
+    this%test_basis%modes%x = adjoint_basis
+    this%has_scalar = fields == 4
+    this%enriched_adjoint_rank = adjoint_modes
+
+    deallocate(trial_basis, adjoint_basis, mass, trial_mode_index, adjoint_mode_index, &
+         trial_norms, trial_crosses, adjoint_norms, adjoint_crosses)
+    if (fields == 4) deallocate(trial_velocity, adjoint_velocity, trial_scalar, adjoint_scalar)
+  end subroutine rom_problem_load_local_forward_constrained_basis
+
+  !> Receive and independently prepare the forward trial and adjoint test
+  !! bases used by the Petrov--Galerkin formulation.
+  subroutine rom_problem_load_local_petrov_basis(this, simulation)
+    class(rom_problem_t), intent(inout) :: this
+    type(simulation_t), intent(inout) :: simulation
+    integer :: trial_modes, trial_fields, test_modes, test_fields, common_modes
+    integer :: n
+    real(kind=rp), allocatable :: trial_basis(:, :), test_basis(:, :)
+
+    call rom_receive_petrov_bases(simulation%state_recover, simulation%fluid%u%x, &
+         trial_basis, trial_modes, trial_fields, test_basis, test_modes, test_fields)
+    if (trial_fields /= test_fields .or. (trial_fields /= 3 .and. trial_fields /= 4)) &
+         call neko_error('Petrov trial/test basis field counts do not match')
+    if (trial_modes /= test_modes) call neko_error( &
+         'Petrov trial/test basis ranks must match before admissibility processing')
+    if (trial_fields == 4 .and. .not. associated(simulation%scalars)) then
+       call neko_error('Petrov scalar basis supplied to a scalar-free simulation')
+    end if
+    call rom_project_basis(simulation, trial_basis, trial_modes, trial_fields)
+    call rom_project_test_basis(simulation, test_basis, test_modes, test_fields)
+    call rom_problem_verify_adjoint_basis_bc(this, simulation, test_basis, test_modes)
+    ! The independent admissibility operators can reject different numbers of
+    ! nearly dependent columns.  Petrov assembly requires equal trial/test
+    ! dimensions, so retain their common leading subspace rather than
+    ! aborting after a valid basis handoff.  The spaces remain independent;
+    ! this only enforces the rectangular dimensions required by the reduced
+    ! cross mass.
+    common_modes = min(trial_modes, test_modes)
+    if (common_modes < 1) call neko_error( &
+         'independent Petrov admissibility processing removed every common mode')
+    if (trial_modes /= common_modes) then
+       trial_basis = trial_basis(:, 1:common_modes)
+       trial_modes = common_modes
+    end if
+    if (test_modes /= common_modes) then
+       test_basis = test_basis(:, 1:common_modes)
+       test_modes = common_modes
+    end if
     n = simulation%fluid%u%dof%size()
-    call neko_scratch_registry%request_field(work, work_index, &
-         simulation%scalars%scalar_fields(1)%scalar%s%dof, .true.)
-    select type (scalar_scheme => simulation%scalars%scalar_fields(1)%scalar)
-    type is (scalar_pnpn_t)
+    if (size(trial_basis,1) /= trial_fields*n .or. size(test_basis,1) /= test_fields*n) &
+         call neko_error('Petrov basis rows do not match local velocity fields')
+    call this%basis%modes%free(); call this%test_basis%modes%free()
+    this%basis%n_rows = size(trial_basis,1)
+    this%basis%n_modes = trial_modes
+    this%basis%n_fields = trial_fields
+    this%test_basis%n_rows = size(test_basis,1)
+    this%test_basis%n_modes = test_modes
+    this%test_basis%n_fields = test_fields
+    call this%basis%modes%init(size(trial_basis,1), trial_modes)
+    call this%test_basis%modes%init(size(test_basis,1), test_modes)
+    this%basis%modes%x = trial_basis
+    this%test_basis%modes%x = test_basis
+    this%has_scalar = trial_fields == 4
+    deallocate(trial_basis, test_basis)
+  end subroutine rom_problem_load_local_petrov_basis
+
+  !> Verify that independently received adjoint test modes satisfy Neko's
+  !! actual homogeneous adjoint velocity restriction.  This is a reception
+  !! boundary check; it is deliberately not repeated during ROM integration.
+  subroutine rom_problem_verify_adjoint_basis_bc(this, simulation, basis, n_modes)
+    class(rom_problem_t), intent(in) :: this
+    type(simulation_t), intent(inout) :: simulation
+    real(kind=rp), intent(in) :: basis(:, :)
+    integer, intent(in) :: n_modes
+    type(field_t), pointer :: u, v, w, uc, vc, wc
+    integer :: indices(6), n, mode
+    real(kind=rp) :: residual
+
+    if (.not. allocated(simulation%adjoint_case%fluid_adj)) call neko_error( &
+         'Petrov test-basis BC check requires an initialized adjoint fluid')
+    n = simulation%fluid%u%dof%size()
+    call neko_scratch_registry%request_field(u, indices(1), simulation%fluid%u%dof, .true.)
+    call neko_scratch_registry%request_field(v, indices(2), simulation%fluid%v%dof, .true.)
+    call neko_scratch_registry%request_field(w, indices(3), simulation%fluid%w%dof, .true.)
+    call neko_scratch_registry%request_field(uc, indices(4), simulation%fluid%u%dof, .true.)
+    call neko_scratch_registry%request_field(vc, indices(5), simulation%fluid%v%dof, .true.)
+    call neko_scratch_registry%request_field(wc, indices(6), simulation%fluid%w%dof, .true.)
+    select type (adjoint_fluid => simulation%adjoint_case%fluid_adj)
+    type is (adjoint_fluid_pnpn_t)
        do mode = 1, n_modes
-          first = 3*n + 1
-          last = 4*n
-          work%x = reshape(basis(first:last,mode), shape(work%x))
-          if (NEKO_BCKND_DEVICE .eq. 1) call work%copy_from(HOST_TO_DEVICE, sync=.true.)
-          call scalar_scheme%bc_projector%apply(work%x, n)
-          if (NEKO_BCKND_DEVICE .eq. 1) call work%copy_from(DEVICE_TO_HOST, sync=.true.)
-          basis(first:last,mode) = reshape(work%x, [n])
+          u%x = reshape(basis(1:n,mode), shape(u%x))
+          v%x = reshape(basis(n+1:2*n,mode), shape(v%x))
+          w%x = reshape(basis(2*n+1:3*n,mode), shape(w%x))
+          if (NEKO_BCKND_DEVICE .eq. 1) then
+             call u%copy_from(HOST_TO_DEVICE, sync=.true.)
+             call v%copy_from(HOST_TO_DEVICE, sync=.true.)
+             call w%copy_from(HOST_TO_DEVICE, sync=.true.)
+          end if
+          ! Copy only after the source mirror is current.  On an accelerator
+          ! field_copy is device-aware; copying before the H2D update would
+          ! preserve a stale device source and then overwrite the projected
+          ! check field with stale host data.
+          call field_copy(uc, u); call field_copy(vc, v); call field_copy(wc, w)
+          call adjoint_fluid%bcs_vel_projector%apply(uc%x, vc%x, wc%x, n)
+          if (NEKO_BCKND_DEVICE .eq. 1) then
+             call uc%copy_from(DEVICE_TO_HOST, sync=.true.)
+             call vc%copy_from(DEVICE_TO_HOST, sync=.true.)
+             call wc%copy_from(DEVICE_TO_HOST, sync=.true.)
+          end if
+          residual = max(maxval(abs(uc%x-u%x)), max(maxval(abs(vc%x-v%x)), &
+               maxval(abs(wc%x-w%x))))
+          if (residual > this%admissibility_tolerance) call neko_error( &
+               'Petrov adjoint test basis violates homogeneous adjoint velocity BCs')
        end do
     class default
-       call neko_error('ROM scalar basis restriction requires scalar_pnpn')
+       call neko_error('Petrov test-basis BC check requires adjoint_fluid_pnpn')
     end select
-    call neko_scratch_registry%relinquish_field(work_index)
-    nullify(work)
-  end subroutine rom_problem_restrict_scalar_basis_array
+    call neko_scratch_registry%relinquish_field(indices)
+    nullify(u); nullify(v); nullify(w); nullify(uc); nullify(vc); nullify(wc)
+  end subroutine rom_problem_verify_adjoint_basis_bc
 
   !> Apply scalar boundary restrictions to the owned basis matrix.
   subroutine rom_problem_restrict_scalar_basis(this, simulation)
     class(rom_problem_t), intent(inout) :: this
     type(simulation_t), intent(inout) :: simulation
     if (this%basis%n_fields /= 4) return
-    call rom_problem_restrict_scalar_basis_array(this%basis%modes%x, &
-         this%basis%n_modes, this%basis%n_fields, simulation)
+    call rom_restrict_scalar_basis(simulation, this%basis%modes%x, &
+         this%basis%n_modes)
   end subroutine rom_problem_restrict_scalar_basis
 
   !> Assemble mass, lift, convection and diffusion operators independent of design.
   subroutine rom_problem_assemble_fixed(this, simulation)
     class(rom_problem_t), intent(inout) :: this
     type(simulation_t), intent(inout) :: simulation
-    integer :: n, r, i, c, d, offset
-    type(matrix_t), pointer :: mass_local, linear_local, implicit_local
+    integer :: n, r, e, i, c, d, offset
+    type(matrix_t), pointer :: mass_local, trial_mass_local, linear_local, implicit_local
+    type(matrix_t), pointer :: enriched_mass_local, enriched_linear_local, enriched_implicit_local
     type(matrix_t), allocatable :: quad_local(:)
-    type(vector_t), pointer :: rhs_local, constant_local, initial_difference
+    type(matrix_t), allocatable :: enriched_quad_local(:)
+    type(vector_t), pointer :: rhs_local, constant_local, enriched_constant_local, initial_difference
     type(field_t), pointer :: field, gx, gy, gz
     type(field_t), pointer :: scalar_field, scalar_gx, scalar_gy, scalar_gz
     type(field_t), pointer :: scalar_diff_field, scalar_rho_cp
-    integer :: mass_local_index, linear_local_index, implicit_local_index
-    integer :: rhs_local_index, constant_local_index, initial_difference_index
+    integer :: mass_local_index, trial_mass_local_index, linear_local_index, implicit_local_index
+    integer :: enriched_mass_local_index, enriched_linear_local_index
+    integer :: enriched_implicit_local_index
+    integer :: rhs_local_index, constant_local_index, enriched_constant_local_index
+    integer :: initial_difference_index
     integer :: field_index, gx_index, gy_index, gz_index
     integer :: scalar_field_index, scalar_gx_index, scalar_gy_index, scalar_gz_index
     integer :: scalar_diff_index, scalar_rho_cp_index
@@ -1063,30 +1932,50 @@ contains
 
     call rom_problem_free_arrays(this)
     n = simulation%fluid%u%dof%size()
+    if (this%petrov_galerkin .and. this%test_basis%n_modes /= this%basis%n_modes) then
+       call neko_error('Petrov trial/test basis ranks differ')
+    end if
     r = min(this%rank_total_max, this%basis%n_modes)
+    if (this%petrov_galerkin) r = min(r, this%test_basis%n_modes)
+    e = r
+    if (this%forward_constrained_enriched) e = min(this%rank_total_max, &
+         this%test_basis%n_modes)
+    if (r < 1) call neko_error('ROM basis contains no retained trial/test modes')
     call this%weights%init(n)
     if (NEKO_BCKND_DEVICE .eq. 1) then
        call device_copy(this%weights%x_d, simulation%fluid%c_Xh%B_d, n)
     else
        this%weights%x = reshape(simulation%fluid%c_Xh%B, [n])
     end if
-    allocate(this%velocity_modes(3,r), this%velocity_gradients(3,r,3))
+    allocate(this%velocity_modes(3,r))
+    allocate(this%test_velocity_modes(3,e))
     do i = 1, r
        do c = 1, 3
-          do d = 1, 3
-             call this%velocity_gradients(c,i,d)%init(n)
-          end do
           call this%velocity_modes(c,i)%init(n)
+          if (.not. this%forward_constrained_enriched) then
+             call this%test_velocity_modes(c,i)%init(n)
+          end if
        end do
     end do
+    if (this%forward_constrained_enriched) then
+       do i = 1, e
+          do c = 1, 3
+             call this%test_velocity_modes(c,i)%init(n)
+          end do
+       end do
+    end if
     if (this%has_scalar) then
-       allocate(this%scalar_modes(r), this%scalar_gradients(r,3))
+       allocate(this%scalar_modes(r))
+       allocate(this%test_scalar_modes(e))
        do i = 1, r
           call this%scalar_modes(i)%init(n)
-       do d = 1, 3
-          call this%scalar_gradients(i,d)%init(n)
+          if (.not. this%forward_constrained_enriched) call this%test_scalar_modes(i)%init(n)
        end do
-       end do
+       if (this%forward_constrained_enriched) then
+          do i = 1, e
+             call this%test_scalar_modes(i)%init(n)
+          end do
+       end if
        call this%scalar_lift%free(); call this%scalar_reference%free()
        call this%lift%copy_scalar(this%scalar_lift)
        call this%scalar_reference%init(n)
@@ -1114,17 +2003,92 @@ contains
           offset = (c - 1) * n
           this%velocity_modes(c, i)%x = &
                this%basis%modes%x(offset + 1:offset + n, i)
+          if (.not. this%forward_constrained_enriched) then
+             if (this%petrov_galerkin) then
+                this%test_velocity_modes(c, i)%x = &
+                     this%test_basis%modes%x(offset + 1:offset + n, i)
+             else
+                this%test_velocity_modes(c, i)%x = this%velocity_modes(c, i)%x
+             end if
+          end if
           if (NEKO_BCKND_DEVICE .eq. 1) then
              call this%velocity_modes(c, i)%copy_from(HOST_TO_DEVICE, sync = .true.)
+             if (.not. this%forward_constrained_enriched) then
+                call this%test_velocity_modes(c, i)%copy_from(HOST_TO_DEVICE, sync = .true.)
+             end if
           end if
-      end do
-   end do
+       end do
+    end do
+    if (this%forward_constrained_enriched) then
+       do i = 1, e
+          do c = 1, 3
+             offset = (c - 1) * n
+             this%test_velocity_modes(c,i)%x = this%test_basis%modes%x( &
+                  offset + 1:offset + n, i)
+             if (NEKO_BCKND_DEVICE .eq. 1) call this%test_velocity_modes(c,i)%copy_from( &
+                  HOST_TO_DEVICE, sync = .true.)
+          end do
+       end do
+    end if
     if (this%has_scalar) then
        do i = 1, r
           this%scalar_modes(i)%x = this%basis%modes%x(3*n+1:4*n, i)
+          if (.not. this%forward_constrained_enriched) then
+             if (this%petrov_galerkin) then
+                this%test_scalar_modes(i)%x = this%test_basis%modes%x(3*n+1:4*n, i)
+             else
+                this%test_scalar_modes(i)%x = this%scalar_modes(i)%x
+             end if
+          end if
           if (NEKO_BCKND_DEVICE .eq. 1) then
              call this%scalar_modes(i)%copy_from(HOST_TO_DEVICE, sync = .true.)
+             if (.not. this%forward_constrained_enriched) call this%test_scalar_modes(i)%copy_from( &
+                  HOST_TO_DEVICE, sync = .true.)
           end if
+       end do
+       if (this%forward_constrained_enriched) then
+          do i = 1, e
+             this%test_scalar_modes(i)%x = this%test_basis%modes%x(3*n+1:4*n, i)
+             if (NEKO_BCKND_DEVICE .eq. 1) call this%test_scalar_modes(i)%copy_from( &
+                  HOST_TO_DEVICE, sync = .true.)
+          end do
+       end if
+    end if
+
+    ! Pair the complete trial and test spaces before any gradients or reduced
+    ! operators are formed.  The pairing rotates device-resident mesh vectors
+    ! and truncates weakly overlapping directions; all later assembly therefore
+    ! sees exactly the final Petrov spaces.
+    if (this%petrov_galerkin) call rom_problem_check_cross_mass(this)
+    r = size(this%velocity_modes, 2)
+    allocate(this%velocity_gradients(3,r,3))
+    allocate(this%test_velocity_gradients(3,e,3))
+    do i = 1, r
+       do c = 1, 3
+          do d = 1, 3
+             call this%velocity_gradients(c,i,d)%init(n)
+          end do
+       end do
+    end do
+    do i = 1, e
+       do c = 1, 3
+          do d = 1, 3
+             call this%test_velocity_gradients(c,i,d)%init(n)
+          end do
+       end do
+    end do
+    if (this%has_scalar) then
+       allocate(this%scalar_gradients(r,3))
+       allocate(this%test_scalar_gradients(e,3))
+       do i = 1, r
+          do d = 1, 3
+             call this%scalar_gradients(i,d)%init(n)
+          end do
+       end do
+       do i = 1, e
+          do d = 1, 3
+             call this%test_scalar_gradients(i,d)%init(n)
+          end do
        end do
     end if
 
@@ -1156,6 +2120,19 @@ contains
           call field_to_vector(this%velocity_gradients(c,i,3), gz)
       end do
    end do
+    do i = 1, e
+       do c = 1, 3
+          call vector_to_field(field, this%test_velocity_modes(c,i))
+          if (NEKO_BCKND_DEVICE .eq. 1) then
+             call grad(gx%x_d, gy%x_d, gz%x_d, field%x_d, simulation%fluid%c_Xh)
+          else
+             call grad(gx%x, gy%x, gz%x, field%x, simulation%fluid%c_Xh)
+          end if
+          call field_to_vector(this%test_velocity_gradients(c,i,1), gx)
+          call field_to_vector(this%test_velocity_gradients(c,i,2), gy)
+          call field_to_vector(this%test_velocity_gradients(c,i,3), gz)
+       end do
+    end do
     if (this%has_scalar) then
        do i = 1, r
           call vector_to_field(scalar_field, this%scalar_modes(i))
@@ -1170,33 +2147,100 @@ contains
           call field_to_vector(this%scalar_gradients(i,2), scalar_gy)
           call field_to_vector(this%scalar_gradients(i,3), scalar_gz)
        end do
+       do i = 1, e
+          call vector_to_field(scalar_field, this%test_scalar_modes(i))
+          if (NEKO_BCKND_DEVICE .eq. 1) then
+             call grad(scalar_gx%x_d, scalar_gy%x_d, scalar_gz%x_d, &
+                  scalar_field%x_d, simulation%scalars%scalar_fields(1)%scalar%c_Xh)
+          else
+             call grad(scalar_gx%x, scalar_gy%x, scalar_gz%x, scalar_field%x, &
+                  simulation%scalars%scalar_fields(1)%scalar%c_Xh)
+          end if
+          call field_to_vector(this%test_scalar_gradients(i,1), scalar_gx)
+          call field_to_vector(this%test_scalar_gradients(i,2), scalar_gy)
+          call field_to_vector(this%test_scalar_gradients(i,3), scalar_gz)
+       end do
     end if
 
     call neko_scratch_registry%request_matrix(mass_local, mass_local_index, r, r, .true.)
+    call neko_scratch_registry%request_matrix(trial_mass_local, trial_mass_local_index, r, r, .true.)
     call neko_scratch_registry%request_matrix(linear_local, linear_local_index, r, r, .true.)
     call neko_scratch_registry%request_matrix(implicit_local, implicit_local_index, &
          r, r, .true.)
     call neko_scratch_registry%request_vector(constant_local, constant_local_index, &
          r, .true.)
     allocate(quad_local(r))
+    if (this%forward_constrained_enriched) then
+       call neko_scratch_registry%request_matrix(enriched_mass_local, enriched_mass_local_index, &
+            e, e, .true.)
+       call neko_scratch_registry%request_matrix(enriched_linear_local, enriched_linear_local_index, &
+            e, e, .true.)
+       call neko_scratch_registry%request_matrix(enriched_implicit_local, &
+            enriched_implicit_local_index, e, e, .true.)
+       call neko_scratch_registry%request_vector(enriched_constant_local, &
+            enriched_constant_local_index, e, .true.)
+       if (this%has_scalar) then
+          allocate(enriched_quad_local(e))
+          do i = 1, e
+             call enriched_quad_local(i)%init(e, e)
+          end do
+       end if
+    end if
     if (this%has_scalar) then
        call rom_assemble_mass_coupled(this%weights, this%velocity_modes, &
-            this%scalar_modes, this%scalar_metric_weight, mass_local)
+            this%scalar_modes, this%scalar_metric_weight, trial_mass_local)
+       if (this%petrov_galerkin) then
+          call rom_assemble_cross_mass(this%weights, this%velocity_modes, &
+               this%test_velocity_modes, mass_local, this%scalar_modes, &
+               this%test_scalar_modes, this%scalar_metric_weight)
+       else
+          mass_local%x = trial_mass_local%x
+       end if
     else
-       call rom_assemble_mass(this%weights, this%velocity_modes, mass_local)
+       call rom_assemble_mass(this%weights, this%velocity_modes, trial_mass_local)
+       if (this%petrov_galerkin) then
+          call rom_assemble_cross_mass(this%weights, this%velocity_modes, &
+               this%test_velocity_modes, mass_local)
+       else
+          mass_local%x = trial_mass_local%x
+       end if
     end if
     call rom_uniform_coefficient(simulation%fluid%mu, this%weights, &
          'viscosity', this%viscosity)
     call rom_uniform_coefficient(simulation%fluid%rho, this%weights, &
          'density', this%density)
     nu = this%viscosity / this%density
-    call rom_assemble_lift_convection(this%weights, this%velocity_modes, &
-         this%velocity_gradients, this%lift_velocity, this%lift_gradients, &
-         linear_local, constant_local)
-    call rom_assemble_diffusion(this%weights, nu, this%velocity_gradients, &
-         implicit_local, this%lift_gradients, constant_local)
-    call rom_assemble_convection(this%weights, this%velocity_modes, &
-         this%velocity_gradients, quad_local)
+    if (this%petrov_galerkin) then
+       call rom_assemble_lift_convection_petrov(this%weights, this%velocity_modes, &
+            this%velocity_gradients, this%test_velocity_modes, this%lift_velocity, &
+            this%lift_gradients, linear_local, constant_local)
+       call rom_assemble_diffusion_petrov(this%weights, nu, this%test_velocity_gradients, &
+            this%velocity_gradients, implicit_local, this%lift_gradients, constant_local)
+       call rom_assemble_convection_petrov(this%weights, this%test_velocity_modes, &
+            this%velocity_modes, this%velocity_gradients, quad_local)
+    else
+       call rom_assemble_lift_convection(this%weights, this%velocity_modes, &
+            this%velocity_gradients, this%lift_velocity, this%lift_gradients, &
+            linear_local, constant_local)
+       call rom_assemble_diffusion(this%weights, nu, this%velocity_gradients, &
+            implicit_local, this%lift_gradients, constant_local)
+       call rom_assemble_convection(this%weights, this%velocity_modes, &
+            this%velocity_gradients, quad_local)
+    end if
+    if (this%forward_constrained_enriched) then
+       if (this%has_scalar) then
+          call rom_assemble_mass_coupled(this%weights, this%test_velocity_modes, &
+               this%test_scalar_modes, this%scalar_metric_weight, enriched_mass_local)
+       else
+          call rom_assemble_mass(this%weights, this%test_velocity_modes, enriched_mass_local)
+       end if
+       call rom_assemble_lift_convection_petrov(this%weights, this%test_velocity_modes, &
+            this%test_velocity_gradients, this%test_velocity_modes, this%lift_velocity, &
+            this%lift_gradients, enriched_linear_local, enriched_constant_local)
+       call rom_assemble_diffusion_petrov(this%weights, nu, this%test_velocity_gradients, &
+            this%test_velocity_gradients, enriched_implicit_local, this%lift_gradients, &
+            enriched_constant_local)
+    end if
     do i = 1, r
        quad_local(i)%x = -quad_local(i)%x
     end do
@@ -1213,21 +2257,47 @@ contains
        call field_invcol2(scalar_diff_field, scalar_rho_cp)
        call this%scalar_diffusivity%init(n)
        call field_to_vector(this%scalar_diffusivity, scalar_diff_field)
-       call rom_assemble_scalar_transport(this%weights, this%scalar_metric_weight, &
-            this%velocity_modes, this%scalar_modes, this%velocity_gradients, &
-            this%scalar_gradients, this%lift_velocity, &
-            this%scalar_lift, this%scalar_lift_gradients, this%scalar_diffusivity, &
-            linear_local, &
-            constant_local, quad_local, implicit_local)
+       if (this%petrov_galerkin) then
+          call rom_assemble_scalar_transport_petrov(this%weights, this%scalar_metric_weight, &
+               this%velocity_modes, this%scalar_modes, this%velocity_gradients, &
+               this%scalar_gradients, this%test_scalar_modes, this%test_scalar_gradients, &
+               this%lift_velocity, this%scalar_lift, this%scalar_lift_gradients, &
+               this%scalar_diffusivity, linear_local, constant_local, quad_local, implicit_local)
+       else
+          call rom_assemble_scalar_transport(this%weights, this%scalar_metric_weight, &
+               this%velocity_modes, this%scalar_modes, this%velocity_gradients, &
+               this%scalar_gradients, this%lift_velocity, &
+               this%scalar_lift, this%scalar_lift_gradients, this%scalar_diffusivity, &
+               linear_local, constant_local, quad_local, implicit_local)
+       end if
+       if (this%forward_constrained_enriched) then
+          call rom_assemble_scalar_transport_petrov(this%weights, this%scalar_metric_weight, &
+               this%test_velocity_modes, this%test_scalar_modes, this%test_velocity_gradients, &
+               this%test_scalar_gradients, this%test_scalar_modes, this%test_scalar_gradients, &
+               this%lift_velocity, this%scalar_lift, this%scalar_lift_gradients, &
+               this%scalar_diffusivity, enriched_linear_local, enriched_constant_local, &
+               enriched_quad_local, enriched_implicit_local)
+       end if
     end if
-    call this%mass%init(r,r); call this%fixed_linear%init(r,r)
+    call this%mass%init(r,r); call this%trial_mass%init(r,r)
+    call this%fixed_linear%init(r,r)
     call this%fixed_implicit%init(r,r); call this%fixed_constant%init(r)
     ! The reduced operators are host-owned dense data.  Keep the host mirror
     ! authoritative instead of assigning the (unused) device mirrors.
     this%mass%x = mass_local%x
+    this%trial_mass%x = trial_mass_local%x
     this%fixed_linear%x = linear_local%x
     this%fixed_implicit%x = implicit_local%x
     this%fixed_constant%x = constant_local%x
+    if (this%forward_constrained_enriched) then
+       call this%enriched_mass%init(e,e)
+       call this%enriched_fixed_linear%init(e,e)
+       call this%enriched_fixed_implicit%init(e,e)
+       this%enriched_mass%x = enriched_mass_local%x
+       this%enriched_fixed_linear%x = enriched_linear_local%x
+       this%enriched_fixed_implicit%x = enriched_implicit_local%x
+       this%enriched_adjoint_rank = e
+    end if
     allocate(this%quadratic(r))
     do i = 1, r
        call this%quadratic(i)%init(r,r)
@@ -1236,14 +2306,24 @@ contains
     call this%viscous_constant%init(r); call this%viscous_linear%init(r)
     call this%viscous_quadratic%init(r,r); this%viscous_constant%x = 0.0_rp
     this%viscous_linear%x = 0.0_rp; this%viscous_quadratic%x = 0.0_rp
-    ! The Neko forward initial condition is projected after subtracting the
-    ! same spatial lift used to homogenise the streamed POD snapshots.
+    ! Project Neko's canonical initial condition after subtracting the same
+    ! spatial lift used to homogenise the streamed POD snapshots.  The fields
+    ! are read from the reset Neko case itself rather than from a cached lift
+    ! reference, so user-defined and scalar initial conditions are identical
+    ! to those used by the forward solver.
     call neko_scratch_registry%request_vector(rhs_local, rhs_local_index, r, .true.)
     call neko_scratch_registry%request_vector(initial_difference, &
          initial_difference_index, n, .true.)
     rhs_local%x = 0.0_rp
     do c = 1, 3
-       call field_copy(field, this%lift%reference(c))
+       select case (c)
+       case (1)
+          call field_copy(field, simulation%fluid%u)
+       case (2)
+          call field_copy(field, simulation%fluid%v)
+       case (3)
+          call field_copy(field, simulation%fluid%w)
+       end select
        call field_add2s2(field, this%lift%velocity(c), -1.0_rp, n)
        call field_to_vector(initial_difference, field)
        do i = 1, r
@@ -1263,7 +2343,9 @@ contains
     call this%initial_state%init(r)
     call this%rom%init(this%mass, this%fixed_constant, this%fixed_linear, &
          this%quadratic, this%fixed_implicit)
+    this%rom%mass%x = this%trial_mass%x
     call this%rom%solve_mass(rhs_local, this%initial_state)
+    this%rom%mass%x = this%mass%x
     this%rom_ready = .true.
     call neko_scratch_registry%relinquish_field([field_index, gx_index, gy_index, gz_index])
     if (this%has_scalar) call neko_scratch_registry%relinquish_field([ &
@@ -1272,14 +2354,27 @@ contains
     nullify(field); nullify(gx); nullify(gy); nullify(gz)
     nullify(scalar_field); nullify(scalar_gx); nullify(scalar_gy); nullify(scalar_gz)
     nullify(scalar_diff_field); nullify(scalar_rho_cp)
-    call neko_scratch_registry%relinquish_matrix([mass_local_index, linear_local_index, &
-         implicit_local_index])
+    call neko_scratch_registry%relinquish_matrix([mass_local_index, trial_mass_local_index, &
+         linear_local_index, implicit_local_index])
     nullify(mass_local); nullify(linear_local); nullify(implicit_local)
     do i = 1, r; call quad_local(i)%free(); end do
     deallocate(quad_local)
     call neko_scratch_registry%relinquish_vector(rhs_local_index)
     call neko_scratch_registry%relinquish_vector([constant_local_index, &
          initial_difference_index])
+    if (this%forward_constrained_enriched) then
+       call neko_scratch_registry%relinquish_matrix([enriched_mass_local_index, &
+            enriched_linear_local_index, enriched_implicit_local_index])
+       call neko_scratch_registry%relinquish_vector(enriched_constant_local_index)
+       nullify(enriched_mass_local); nullify(enriched_linear_local)
+       nullify(enriched_implicit_local); nullify(enriched_constant_local)
+       if (allocated(enriched_quad_local)) then
+          do i = 1, size(enriched_quad_local)
+             call enriched_quad_local(i)%free()
+          end do
+          deallocate(enriched_quad_local)
+       end if
+    end if
     nullify(rhs_local); nullify(constant_local); nullify(initial_difference)
   end subroutine rom_problem_assemble_fixed
 
@@ -1361,8 +2456,199 @@ contains
             this%scalar_mixing_constant, this%scalar_mixing_linear, &
             this%scalar_mixing_quadratic)
     end if
+    if (this%forward_constrained_enriched) then
+       call this%enriched_viscous_linear%free()
+       call this%enriched_viscous_cross%free()
+       call this%enriched_scalar_mixing_linear%free()
+       call this%enriched_scalar_mixing_cross%free()
+       call this%enriched_viscous_linear%init(this%test_basis%n_modes)
+       call this%enriched_viscous_cross%init(this%test_basis%n_modes, &
+            this%mass%get_nrows())
+       call this%enriched_scalar_mixing_linear%init(this%test_basis%n_modes)
+       call this%enriched_scalar_mixing_cross%init(this%test_basis%n_modes, &
+            this%mass%get_nrows())
+       if (this%has_viscous) then
+          call rom_assemble_viscous_cross_terms(this%weights, this%viscous_mask, &
+               this%viscosity, this%test_velocity_gradients, this%velocity_gradients, &
+               this%lift_gradients, this%enriched_viscous_linear, &
+               this%enriched_viscous_cross)
+       else
+          this%enriched_viscous_linear%x = 0.0_rp
+          this%enriched_viscous_cross%x = 0.0_rp
+       end if
+       if (this%has_scalar_mixing) then
+          call rom_assemble_scalar_mixing_cross_terms(this%weights, &
+               this%scalar_mixing_mask, this%scalar_lift, this%scalar_modes, &
+               this%test_scalar_modes, this%scalar_reference_value, &
+               this%enriched_scalar_mixing_linear, this%enriched_scalar_mixing_cross)
+       else
+          this%enriched_scalar_mixing_linear%x = 0.0_rp
+          this%enriched_scalar_mixing_cross%x = 0.0_rp
+       end if
+    end if
     ! rom_assemble_viscous_terms is globally assembled through vector_glsc3.
   end subroutine rom_problem_assemble_objective_operators
+
+  !> Pair and truncate the Petrov trial and test spaces by cross-mass SVD.
+  !! For the currently selected equal-rank input spaces this forms
+  !! H = W_a^T M V_f, computes H = U Sigma Z^T, and applies V_f <- V_f Z_k
+  !! and W_a <- W_a U_k to the complete device-resident mode fields before
+  !! any gradients or reduced operators are assembled.  No regularisation is
+  !! applied to a weakly overlapping direction: it is removed instead.
+  subroutine rom_problem_check_cross_mass(this)
+    class(rom_problem_t), intent(inout) :: this
+    real(kind=rp), allocatable :: h(:, :), singular(:), u(:, :), vt(:, :), work(:)
+    type(vector_t), allocatable :: velocity_new(:, :), test_velocity_new(:, :)
+    type(vector_t), allocatable :: scalar_new(:), test_scalar_new(:)
+    integer :: r, k, info, lwork, i, j, c, n, offset
+    real(kind=rp) :: threshold
+
+    if (.not. allocated(this%velocity_modes) .or. &
+         .not. allocated(this%test_velocity_modes)) call neko_error( &
+         'Petrov cross mass requested before trial/test modes were loaded')
+    r = size(this%velocity_modes, 2)
+    if (r < 1 .or. size(this%test_velocity_modes, 2) /= r) call neko_error( &
+         'Petrov cross mass requires equal trial/test ranks')
+    n = this%weights%size()
+    allocate(h(r,r), singular(r), u(r,r), vt(r,r))
+    h = 0.0_rp
+    do i = 1, r
+       do j = 1, r
+          do c = 1, 3
+             h(i,j) = h(i,j) + vector_glsc3(this%test_velocity_modes(c,i), &
+                  this%weights, this%velocity_modes(c,j))
+          end do
+          if (this%has_scalar) h(i,j) = h(i,j) + this%scalar_metric_weight * &
+               vector_glsc3(this%test_scalar_modes(i), this%weights, &
+               this%scalar_modes(j))
+       end do
+    end do
+    lwork = max(1, 5*r)
+    allocate(work(lwork))
+    call dgesvd('A', 'A', r, r, h, r, singular, u, r, vt, r, work, lwork, info)
+    if (info /= 0) call neko_error('LAPACK failed while pairing Petrov cross mass')
+    if (singular(1) <= 0.0_rp) call neko_error( &
+         'Petrov cross mass has no nonzero singular direction')
+    threshold = this%petrov_svd_relative_tolerance * singular(1)
+    k = count(singular >= threshold)
+    if (k < 1) call neko_error( &
+         'Petrov cross mass has no singular direction above its relative threshold')
+
+    if (allocated(this%cross_mass_singular_values)) &
+         deallocate(this%cross_mass_singular_values)
+    allocate(this%cross_mass_singular_values(r))
+    this%cross_mass_singular_values = singular
+    this%cross_mass_retained_rank = k
+    this%cross_mass_sigma_max = singular(1)
+    this%cross_mass_sigma_min = singular(k)
+    this%cross_mass_condition = singular(1) / max(singular(k), tiny(1.0_rp))
+    call neko_log%message('ROM Petrov cross-mass SVD: relative threshold='// &
+         trim(real_to_string(threshold))//', retained rank='// &
+         trim(int_to_string(k))//'/'//trim(int_to_string(r))//', condition='// &
+         trim(real_to_string(this%cross_mass_condition)))
+    do i = 1, r
+       call neko_log%message('ROM Petrov cross-mass singular value '// &
+            trim(int_to_string(i))//'='//trim(real_to_string(singular(i))))
+    end do
+
+    allocate(velocity_new(3,k), test_velocity_new(3,k))
+    do j = 1, k
+       do c = 1, 3
+          call velocity_new(c,j)%init(n)
+          call test_velocity_new(c,j)%init(n)
+          call vector_rzero(velocity_new(c,j))
+          call vector_rzero(test_velocity_new(c,j))
+          do i = 1, r
+             call vector_add2s2(velocity_new(c,j), this%velocity_modes(c,i), &
+                  vt(j,i))
+             call vector_add2s2(test_velocity_new(c,j), this%test_velocity_modes(c,i), &
+                  u(i,j))
+          end do
+       end do
+    end do
+    if (this%has_scalar) then
+       allocate(scalar_new(k), test_scalar_new(k))
+       do j = 1, k
+          call scalar_new(j)%init(n)
+          call test_scalar_new(j)%init(n)
+          call vector_rzero(scalar_new(j))
+          call vector_rzero(test_scalar_new(j))
+          do i = 1, r
+             call vector_add2s2(scalar_new(j), this%scalar_modes(i), vt(j,i))
+             call vector_add2s2(test_scalar_new(j), this%test_scalar_modes(i), u(i,j))
+          end do
+       end do
+    end if
+
+    do i = 1, size(this%velocity_modes,1)
+       do j = 1, size(this%velocity_modes,2)
+          call this%velocity_modes(i,j)%free()
+          call this%test_velocity_modes(i,j)%free()
+       end do
+    end do
+    deallocate(this%velocity_modes, this%test_velocity_modes)
+    call move_alloc(velocity_new, this%velocity_modes)
+    call move_alloc(test_velocity_new, this%test_velocity_modes)
+    if (this%has_scalar) then
+       do i = 1, size(this%scalar_modes)
+          call this%scalar_modes(i)%free()
+          call this%test_scalar_modes(i)%free()
+       end do
+       deallocate(this%scalar_modes, this%test_scalar_modes)
+       call move_alloc(scalar_new, this%scalar_modes)
+       call move_alloc(test_scalar_new, this%test_scalar_modes)
+    end if
+    this%basis%n_modes = k
+    this%test_basis%n_modes = k
+
+    ! Keep the owned host basis metadata consistent with the vectors used for
+    ! assembly.  This is a basis-refresh boundary, so the readback is not part
+    ! of the reduced inner optimisation loop.
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       do j = 1, k
+          do c = 1, 3
+             call this%velocity_modes(c,j)%copy_from(DEVICE_TO_HOST, sync = .true.)
+             call this%test_velocity_modes(c,j)%copy_from(DEVICE_TO_HOST, sync = .true.)
+          end do
+          if (this%has_scalar) then
+             call this%scalar_modes(j)%copy_from(DEVICE_TO_HOST, sync = .true.)
+             call this%test_scalar_modes(j)%copy_from(DEVICE_TO_HOST, sync = .true.)
+          end if
+       end do
+    end if
+    call this%basis%modes%free()
+    call this%basis%modes%init(this%basis%n_fields*n, k)
+    call this%test_basis%modes%free()
+    call this%test_basis%modes%init(this%test_basis%n_fields*n, k)
+    do j = 1, k
+       do c = 1, 3
+          offset = (c-1)*n
+          this%basis%modes%x(offset+1:offset+n,j) = this%velocity_modes(c,j)%x
+          this%test_basis%modes%x(offset+1:offset+n,j) = &
+               this%test_velocity_modes(c,j)%x
+       end do
+       if (this%has_scalar) then
+          this%basis%modes%x(3*n+1:4*n,j) = this%scalar_modes(j)%x
+          this%test_basis%modes%x(3*n+1:4*n,j) = this%test_scalar_modes(j)%x
+       end if
+    end do
+    deallocate(h, singular, u, vt, work)
+  end subroutine rom_problem_check_cross_mass
+
+  !> Format a reduced diagnostic scalar without introducing a mesh-sized I/O
+  !! dependency into the Petrov assembly path.
+  function real_to_string(value) result(string)
+    real(kind=rp), intent(in) :: value
+    character(len=32) :: string
+    write(string, '(ES12.5)') value
+  end function real_to_string
+
+  !> Format a reduced diagnostic integer without introducing an I/O dependency.
+  function int_to_string(value) result(string)
+    integer, intent(in) :: value
+    character(len=32) :: string
+    write(string, '(I0)') value
+  end function int_to_string
 
   !> Check the prescribed velocity trace of an arbitrary ROM reconstruction.
   !!
@@ -1448,11 +2734,14 @@ contains
 
   !> Map one design and assemble its reduced Brinkman operators.
   subroutine rom_problem_assemble_candidate(this, design, brinkman, brinkman_lift, &
-       objective_brinkman, objective_lift, objective_constant, volume)
+       objective_brinkman, objective_lift, objective_constant, enriched_brinkman, &
+       enriched_objective_cross, enriched_objective_lift, volume)
     class(rom_problem_t), intent(inout) :: this
     class(design_t), intent(inout) :: design
     type(matrix_t), intent(inout) :: brinkman, objective_brinkman
     type(vector_t), intent(inout) :: brinkman_lift, objective_lift
+    type(matrix_t), intent(inout) :: enriched_brinkman, enriched_objective_cross
+    type(vector_t), intent(inout) :: enriched_objective_lift
     real(kind=rp), intent(out) :: objective_constant
     real(kind=rp), intent(out), optional :: volume
     type(vector_t), pointer :: mapped, raw_design, local_lift
@@ -1472,8 +2761,13 @@ contains
     r = this%mass%get_nrows()
     call neko_scratch_registry%request_matrix(local, local_index, r, r, .true.)
     call neko_scratch_registry%request_vector(local_lift, local_lift_index, r, .true.)
-    call rom_assemble_brinkman(this%weights, mapped, this%velocity_modes, &
-         this%lift_velocity, local, local_lift)
+    if (this%petrov_galerkin) then
+       call rom_assemble_brinkman_petrov(this%weights, mapped, this%velocity_modes, &
+            this%test_velocity_modes, this%lift_velocity, local, local_lift)
+    else
+       call rom_assemble_brinkman(this%weights, mapped, this%velocity_modes, &
+            this%lift_velocity, local, local_lift)
+    end if
     call brinkman%init(r,r); call brinkman_lift%init(r)
     brinkman%x = local%x
     brinkman_lift%x = local_lift%x
@@ -1482,6 +2776,14 @@ contains
     call objective_brinkman%init(r,r); call objective_lift%init(r)
     objective_brinkman%x = local%x
     objective_lift%x = local_lift%x
+    if (this%forward_constrained_enriched) then
+       call rom_assemble_brinkman_petrov(this%weights, mapped, this%test_velocity_modes, &
+            this%test_velocity_modes, this%lift_velocity, enriched_brinkman, &
+            enriched_objective_lift)
+       call rom_assemble_brinkman_objective_cross(this%weights, this%brinkman_mask, &
+            mapped, this%velocity_modes, this%test_velocity_modes, this%lift_velocity, &
+            enriched_objective_cross, enriched_objective_lift)
+    end if
     if (present(volume)) then
        ! The production volume constraint integrates the unfiltered design
        ! variable, not the mapped Brinkman coefficient used by the PDE.
@@ -1706,11 +3008,12 @@ contains
   subroutine rom_problem_write_coefficients(this, inner)
     class(rom_problem_t), intent(in) :: this
     integer, intent(in) :: inner
-    integer :: unit, step, mode, r
+    integer :: unit, step, mode, r, ra
     character(len=64) :: suffix
     character(len=32) :: mode_name
 
     r = this%states%get_nrows()
+    ra = this%adjoint%get_nrows()
     write(suffix, '(I0)') inner
     open(newunit=unit, file='ROM_forward_coefficients_iter_'//trim(suffix)//'.csv', &
          status='replace', action='write')
@@ -1734,7 +3037,7 @@ contains
     open(newunit=unit, file='ROM_adjoint_coefficients_iter_'//trim(suffix)//'.csv', &
          status='replace', action='write')
     write(unit, '(A)', advance='no') 'step,time'
-    do mode = 1, r
+    do mode = 1, ra
        write(mode_name, '(A,I0)') ',lambda_', mode
        write(unit, '(A)', advance='no') trim(mode_name)
     end do
@@ -1742,7 +3045,7 @@ contains
     do step = 0, this%n_steps
        write(unit, '(I0,",",ES24.16)', advance='no') step, &
             this%time_start + real(step, rp) * this%dt
-       do mode = 1, r
+       do mode = 1, ra
           write(unit, '(",",ES24.16)', advance='no') this%adjoint%x(mode,step+1)
        end do
        write(unit, '(A)') ''
@@ -1756,19 +3059,28 @@ contains
   !! @param fields Destination field wrappers for the three velocity components.
   !! @param include_lift Whether to add the inhomogeneous forward lift.
   subroutine rom_problem_reconstruct_velocity(this, coefficients, fields, &
-       include_lift)
+       include_lift, test_space)
     class(rom_problem_t), intent(in) :: this
     real(kind=rp), intent(in) :: coefficients(:)
     type(field_wrapper_t), intent(inout) :: fields(3)
     logical, intent(in) :: include_lift
+    logical, intent(in), optional :: test_space
     type(vector_t), pointer :: reconstruction
     integer :: reconstruction_index
     integer :: n, r, c, i
+    logical :: use_test
+
+    use_test = .false.
+    if (present(test_space)) use_test = test_space
 
     r = size(coefficients)
     n = this%weights%size()
-    if (r /= this%basis%n_modes) call neko_error( &
-         'ROM trajectory coefficient count does not match the basis')
+    if (use_test) then
+       if (r > this%test_basis%n_modes) call neko_error( &
+            'ROM adjoint coefficient count exceeds the enriched basis')
+    else if (r /= this%mass%get_nrows()) then
+       call neko_error('ROM trajectory coefficient count does not match the retained basis')
+    end if
     call neko_scratch_registry%request_vector(reconstruction, &
          reconstruction_index, n, .true.)
     do c = 1, 3
@@ -1778,8 +3090,13 @@ contains
           reconstruction = 0.0_rp
        end if
        do i = 1, r
-          call vector_add2s2(reconstruction, this%velocity_modes(c,i), &
-               coefficients(i))
+          if (use_test) then
+             call vector_add2s2(reconstruction, this%test_velocity_modes(c,i), &
+                  coefficients(i))
+          else
+             call vector_add2s2(reconstruction, this%velocity_modes(c,i), &
+                  coefficients(i))
+          end if
        end do
        call vector_to_field(fields(c)%field, reconstruction)
     end do
@@ -1788,18 +3105,28 @@ contains
   end subroutine rom_problem_reconstruct_velocity
 
   !> Reconstruct the scalar component from common ROM coefficients.
-  subroutine rom_problem_reconstruct_scalar(this, coefficients, field, include_lift)
+  subroutine rom_problem_reconstruct_scalar(this, coefficients, field, include_lift, &
+       test_space)
     class(rom_problem_t), intent(in) :: this
     real(kind=rp), intent(in) :: coefficients(:)
     type(field_wrapper_t), intent(inout) :: field
     logical, intent(in) :: include_lift
+    logical, intent(in), optional :: test_space
     type(vector_t), pointer :: reconstruction
     integer :: reconstruction_index, n, r, i
+    logical :: use_test
+
+    use_test = .false.
+    if (present(test_space)) use_test = test_space
 
     if (.not. this%has_scalar) return
     r = size(coefficients); n = this%weights%size()
-    if (r /= this%basis%n_modes) call neko_error( &
-         'ROM scalar coefficient count does not match the basis')
+    if (use_test) then
+       if (r > this%test_basis%n_modes) call neko_error( &
+            'ROM adjoint scalar coefficient count exceeds the enriched basis')
+    else if (r /= this%mass%get_nrows()) then
+       call neko_error('ROM scalar coefficient count does not match the retained basis')
+    end if
     call neko_scratch_registry%request_vector(reconstruction, &
          reconstruction_index, n, .true.)
     if (include_lift) then
@@ -1808,7 +3135,11 @@ contains
        reconstruction = 0.0_rp
     end if
     do i = 1, r
-       call vector_add2s2(reconstruction, this%scalar_modes(i), coefficients(i))
+       if (use_test) then
+          call vector_add2s2(reconstruction, this%test_scalar_modes(i), coefficients(i))
+       else
+          call vector_add2s2(reconstruction, this%scalar_modes(i), coefficients(i))
+       end if
     end do
     call vector_to_field(field%field, reconstruction)
     call neko_scratch_registry%relinquish_vector(reconstruction_index)
@@ -1855,9 +3186,11 @@ contains
     do step = 0, this%n_steps
        if (mod(step, stride) == 0 .or. step == this%n_steps) then
           call rom_problem_reconstruct_velocity(this, &
-               this%adjoint%x(:,step+1), this%rom_adjoint_velocity, .false.)
+               this%adjoint%x(:,step+1), this%rom_adjoint_velocity, .false., &
+               this%petrov_galerkin .or. this%forward_constrained_enriched)
           if (this%has_scalar) call rom_problem_reconstruct_scalar(this, &
-               this%adjoint%x(:,step+1), this%rom_adjoint_scalar, .false.)
+               this%adjoint%x(:,step+1), this%rom_adjoint_scalar, .false., &
+               this%petrov_galerkin .or. this%forward_constrained_enriched)
           sample_time = this%time_start + real(step, rp) * this%dt
           call this%rom_adjoint_trajectory_output%sample( &
                real(sample_time, kind=dp))
@@ -1906,6 +3239,24 @@ contains
        end do
        deallocate(this%velocity_gradients)
     end if
+    if (allocated(this%test_velocity_modes)) then
+       do i = 1, size(this%test_velocity_modes,1)
+          do j = 1, size(this%test_velocity_modes,2)
+             call this%test_velocity_modes(i,j)%free()
+          end do
+       end do
+       deallocate(this%test_velocity_modes)
+    end if
+    if (allocated(this%test_velocity_gradients)) then
+       do i = 1, size(this%test_velocity_gradients,1)
+          do j = 1, size(this%test_velocity_gradients,2)
+             do k = 1, size(this%test_velocity_gradients,3)
+                call this%test_velocity_gradients(i,j,k)%free()
+             end do
+          end do
+       end do
+       deallocate(this%test_velocity_gradients)
+    end if
     do i = 1, 3; call this%lift_velocity(i)%free(); end do
     do i = 1, 3
        do j = 1, 3
@@ -1921,19 +3272,44 @@ contains
        end do
        deallocate(this%scalar_modes, this%scalar_gradients)
     end if
+    if (allocated(this%test_scalar_modes)) then
+       do i = 1, size(this%test_scalar_modes)
+          call this%test_scalar_modes(i)%free()
+          do j = 1, size(this%test_scalar_gradients,2)
+             call this%test_scalar_gradients(i,j)%free()
+          end do
+       end do
+       deallocate(this%test_scalar_modes, this%test_scalar_gradients)
+    end if
     call this%scalar_diffusivity%free(); call this%scalar_lift%free()
     call this%scalar_reference%free()
     do i = 1, 3; call this%scalar_lift_gradients(i)%free(); end do
-    call this%mass%free(); call this%fixed_constant%free()
+    call this%mass%free(); call this%trial_mass%free(); call this%fixed_constant%free()
     call this%fixed_linear%free(); call this%fixed_implicit%free()
+    call this%enriched_mass%free(); call this%enriched_fixed_linear%free()
+    call this%enriched_fixed_implicit%free()
+    call this%candidate_enriched_brinkman%free()
+    call this%enriched_adjoint_model%free()
     if (allocated(this%quadratic)) then
        do i = 1, size(this%quadratic); call this%quadratic(i)%free(); end do
        deallocate(this%quadratic)
     end if
     call this%viscous_constant%free(); call this%viscous_linear%free()
     call this%viscous_quadratic%free(); call this%initial_state%free()
+    call this%enriched_viscous_linear%free(); call this%enriched_viscous_cross%free()
+    call this%enriched_scalar_mixing_linear%free()
+    call this%enriched_scalar_mixing_cross%free()
+    call this%candidate_objective_enriched_lift%free()
+    call this%candidate_objective_enriched_cross%free()
     call this%scalar_mixing_constant%free(); call this%scalar_mixing_linear%free()
     call this%scalar_mixing_quadratic%free()
+    if (allocated(this%cross_mass_singular_values)) &
+         deallocate(this%cross_mass_singular_values)
+    this%cross_mass_retained_rank = 0
+    this%cross_mass_sigma_min = 0.0_rp
+    this%cross_mass_sigma_max = 0.0_rp
+    this%cross_mass_condition = huge(0.0_rp)
+    this%enriched_adjoint_rank = 0
   end subroutine rom_problem_free_arrays
 
 end module rom_problem

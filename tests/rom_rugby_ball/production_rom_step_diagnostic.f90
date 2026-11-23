@@ -122,6 +122,7 @@ program production_rom_step_diagnostic
      allocate(basis(3*n, r))
      call build_manufactured_basis(fluid, basis, n)
      n_projected = r
+     call parameters%update('rom.admissibility_projection', 'pressure', found)
      call rom_project_basis(simulation, basis, n_projected)
      if (n_projected /= r) call neko_error( &
           'Manufactured step basis lost a mode during production projection')

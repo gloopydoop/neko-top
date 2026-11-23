@@ -1,6 +1,7 @@
 program rom_projection_diagnostic
   use neko, only: neko_init, neko_finalize
   use neko_top, only: neko_top_register_types
+  use user, only: user_setup
   use simulation_m, only: simulation_t
   use file, only: file_t
   use fld_file_data, only: fld_file_data_t
@@ -32,19 +33,22 @@ program rom_projection_diagnostic
   type(json_file) :: parameters
   real(kind=rp), allocatable :: basis(:, :)
   character(len=1024) :: case_file, modes_path
-  logical :: found, run_production
+  logical :: found, run_projection, run_production
   character(len=64) :: production_arg
-  integer :: argc, n, n_modes, field_size, mode
+  integer :: argc, n, n_modes, field_size, mode, n_fields
 
   argc = command_argument_count()
   if (argc < 2) then
-     call neko_error('Usage: rom_projection_diagnostic CASE MODES.fld [production]')
+     call neko_error('Usage: rom_projection_diagnostic CASE MODES.fld [project|production]')
   end if
   call get_command_argument(1, case_file)
   call get_command_argument(2, modes_path)
+  run_projection = .false.
   run_production = .false.
   if (argc >= 3) then
      call get_command_argument(3, production_arg)
+     run_projection = trim(production_arg) == 'project' .or. &
+          trim(production_arg) == 'production'
      run_production = trim(production_arg) == 'production'
   end if
 
@@ -56,6 +60,7 @@ program rom_projection_diagnostic
   ! unsteady state-recovery peer so this executable cannot enter a DNS/adjoint
   ! lifecycle or wait for Python.
   call parameters%update('unsteady', .false., found)
+  call user_setup(simulation%neko_case%user)
   call simulation%init(parameters)
   select type (fluid_in => simulation%fluid)
   type is (fluid_pnpn_t)
@@ -68,8 +73,15 @@ program rom_projection_diagnostic
   call modes_file%init(trim(modes_path))
   call modes_file%set_counter(0)
   call modes_file%read(modes_data)
-  if (modes_data%n_scalars < 3 .or. mod(modes_data%n_scalars, 3) /= 0) then
-     call neko_error('Projection diagnostic mode file must contain 3*N scalar fields')
+  if (modes_data%n_scalars >= 4 .and. mod(modes_data%n_scalars, 4) == 0) then
+     ! Coupled ROM mode files store u,v,w,s for each mode.  The pressure
+     ! projection acts on the velocity block; the scalar block is irrelevant
+     ! to this focused diagnostic.
+     n_fields = 4
+  else if (modes_data%n_scalars >= 3 .and. mod(modes_data%n_scalars, 3) == 0) then
+     n_fields = 3
+  else
+     call neko_error('Projection diagnostic mode file must contain 3*N or 4*N scalar fields')
   end if
 
   n = simulation%fluid%u%dof%size()
@@ -77,23 +89,26 @@ program rom_projection_diagnostic
   if (field_size /= n) then
      call neko_error('Projection diagnostic mode file does not match the case partition')
   end if
-  n_modes = modes_data%n_scalars / 3
+  n_modes = modes_data%n_scalars / n_fields
   allocate(basis(3 * n, n_modes))
   do mode = 1, n_modes
-     basis(1:n, mode) = modes_data%s(3 * (mode - 1) + 1)%x
-     basis(n + 1:2 * n, mode) = modes_data%s(3 * (mode - 1) + 2)%x
-     basis(2 * n + 1:3 * n, mode) = modes_data%s(3 * (mode - 1) + 3)%x
+     basis(1:n, mode) = modes_data%s(n_fields * (mode - 1) + 1)%x
+     basis(n + 1:2 * n, mode) = modes_data%s(n_fields * (mode - 1) + 2)%x
+     basis(2 * n + 1:3 * n, mode) = modes_data%s(n_fields * (mode - 1) + 3)%x
   end do
   call diagnose_actual_modes(fluid, basis, n, n_modes, &
        'rom_schur_mode_diagnostic.csv')
   call modes_data%free()
   call modes_file%free()
 
-  if (run_production) then
-     ! This command is the strict scientific acceptance diagnostic.  Keep it
-     ! fail-closed even though the runnable engineering case opts into the
-     ! explicit warning fallback.
-     call parameters%update('rom.strict_admissibility', .true., found)
+  if (run_projection) then
+     ! `project` is the controlled projection-only path: it uses the settings
+     ! in the case file and preserves the per-mode CSV even when the scientific
+     ! gate is not met.  `production` retains the fail-closed acceptance test.
+     call parameters%update('rom.strict_admissibility', run_production, found)
+     ! This executable is the legacy pressure-projection diagnostic even when
+     ! the engineering ROM example selects the direct-POD handoff.
+     call parameters%update('rom.admissibility_projection', 'pressure', found)
      call rom_project_basis(simulation, basis, n_modes)
      if (n_modes < 1) call neko_error('Projection diagnostic returned no modes')
   end if

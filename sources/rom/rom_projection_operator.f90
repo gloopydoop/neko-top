@@ -15,6 +15,7 @@
 module rom_projection_operator
   use ax_product, only: ax_t
   use fluid_pnpn, only: fluid_pnpn_t
+  use vector_bc_projector, only: vector_bc_projector_t
   use field, only: field_t
   use field_math, only: field_col3, field_rzero
   use operators, only: grad, ortho
@@ -45,6 +46,7 @@ module rom_projection_operator
      type(field_t), pointer :: u_zero => null()
      type(field_t), pointer :: v_zero => null()
      type(field_t), pointer :: w_zero => null()
+     class(vector_bc_projector_t), pointer :: velocity_projector => null()
      type(c_ptr) :: event
    contains
      procedure, pass(this) :: init => rom_projection_ax_init
@@ -57,13 +59,14 @@ contains
 
   !> Bind the ROM Schur-complement operator to Neko fluid work fields.
   subroutine rom_projection_ax_init(this, fluid, q, p_zero, p_res, grad_x, &
-       grad_y, grad_z, f_x, f_y, f_z, u_zero, v_zero, w_zero)
+       grad_y, grad_z, f_x, f_y, f_z, u_zero, v_zero, w_zero, velocity_projector)
     class(rom_projection_ax_t), intent(inout) :: this
     type(fluid_pnpn_t), target, intent(inout) :: fluid
     type(field_t), target, intent(inout) :: q, p_zero, p_res
     type(field_t), target, intent(inout) :: grad_x, grad_y, grad_z
     type(field_t), target, intent(inout) :: f_x, f_y, f_z
     type(field_t), target, intent(inout) :: u_zero, v_zero, w_zero
+    class(vector_bc_projector_t), target, intent(inout), optional :: velocity_projector
 
     this%fluid => fluid
     this%q => q
@@ -78,6 +81,8 @@ contains
     this%u_zero => u_zero
     this%v_zero => v_zero
     this%w_zero => w_zero
+    nullify(this%velocity_projector)
+    if (present(velocity_projector)) this%velocity_projector => velocity_projector
     this%event = c_null_ptr
   end subroutine rom_projection_ax_init
 
@@ -133,8 +138,13 @@ contains
        call col2(this%grad_y%x, this%fluid%c_Xh%mult, n)
        call col2(this%grad_z%x, this%fluid%c_Xh%mult, n)
     end if
-    call this%fluid%bcs_vel_projector%apply(this%grad_x%x, this%grad_y%x, &
-         this%grad_z%x, n)
+    if (associated(this%velocity_projector)) then
+       call this%velocity_projector%apply(this%grad_x%x, this%grad_y%x, &
+            this%grad_z%x, n)
+    else
+       call this%fluid%bcs_vel_projector%apply(this%grad_x%x, this%grad_y%x, &
+            this%grad_z%x, n)
+    end if
 
     ! Apply C to the restricted mass-adjoint gradient.  The result is left
     ! in local elemental form because the surrounding Neko KSP applies its
@@ -194,6 +204,7 @@ contains
     nullify(this%grad_x, this%grad_y, this%grad_z)
     nullify(this%f_x, this%f_y, this%f_z)
     nullify(this%u_zero, this%v_zero, this%w_zero)
+    nullify(this%velocity_projector)
     this%event = c_null_ptr
   end subroutine rom_projection_ax_free
 

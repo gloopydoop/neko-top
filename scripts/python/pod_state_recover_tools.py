@@ -174,6 +174,7 @@ class PODConfig:
     rank_total_max: int | None = None
     scalar_metric_weight: float = 1.0
     admissibility_projection: str = "velocity_inlet_xmin"
+    formulation: str = "galerkin"
 
     @property
     def n_fields(self) -> int:
@@ -336,6 +337,7 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
                 ),
             )
         ).lower(),
+        formulation=str(rom_cfg.get("formulation", "galerkin")).strip().lower(),
     )
     if cfg.input_mode not in ("instantaneous", "windowed_statistics"):
         raise ValueError("input_mode must be instantaneous or windowed_statistics")
@@ -353,6 +355,21 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
         raise ValueError("turbulent_schmidt must be positive")
     if cfg.scalar_metric_weight <= 0.0:
         raise ValueError("scalar_metric_weight must be positive")
+    if cfg.formulation not in (
+        "galerkin", "petrov_galerkin", "forward_constrained_enriched",
+        "enriched_adjoint_galerkin"
+    ):
+        raise ValueError(
+            "rom.formulation must be galerkin, petrov_galerkin, or "
+            "forward_constrained_enriched, or enriched_adjoint_galerkin"
+        )
+    if cfg.formulation in (
+        "petrov_galerkin", "forward_constrained_enriched", "enriched_adjoint_galerkin"
+    ) \
+            and not cfg.stream_adjoint:
+        raise ValueError(
+            f"{cfg.formulation} requires state_recovery.stream_adjoint=true"
+        )
     if cfg.input_mode == "windowed_statistics" and cfg.window_duration <= 0.0:
         raise ValueError("window_duration must be positive for windowed_statistics")
     for name, value in (

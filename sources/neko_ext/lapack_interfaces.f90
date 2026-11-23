@@ -38,7 +38,7 @@ module lapack_interfaces
   implicit none
   private
 
-  public :: dgesv
+  public :: dgesv, dgesvd
 
   interface
      pure subroutine dgesv(n, nrhs, a, lda, ipiv, b, ldb, info)
@@ -49,6 +49,16 @@ module lapack_interfaces
        real(kind=rp), intent(inout), dimension(ldb, nrhs) :: b
        integer, intent(out) :: info
      end subroutine dgesv
+
+     subroutine dgesvd(jobu, jobvt, m, n, a, lda, s, u, ldu, vt, ldvt, &
+          work, lwork, info)
+       import :: rp
+       character(len=1), intent(in) :: jobu, jobvt
+       integer, intent(in) :: m, n, lda, ldu, ldvt, lwork
+       real(kind=rp), intent(inout) :: a(lda,*)
+       real(kind=rp), intent(out) :: s(*), u(ldu,*), vt(ldvt,*), work(*)
+       integer, intent(out) :: info
+     end subroutine dgesvd
   end interface
 
 end module lapack_interfaces

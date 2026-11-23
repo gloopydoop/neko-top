@@ -140,6 +140,7 @@ program production_rom_gradient_diagnostic
         basis(2*n+1:3*n, mode) = reshape(w%x, [n])
      end do
      n_modes = r
+     call parameters%update('rom.admissibility_projection', 'pressure', found)
      call rom_project_basis(simulation, basis, n_modes)
      if (n_modes /= r) call neko_error( &
           'Manufactured admissible basis lost a mode during projection')
