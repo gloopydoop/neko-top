@@ -89,6 +89,18 @@ def _global_gram(comm: MPI.Comm, left: np.ndarray, right: np.ndarray, mass: np.n
     return comm.allreduce(local, op=MPI.SUM)
 
 
+def cross_mass_singular_values(
+    comm: MPI.Comm,
+    left: np.ndarray,
+    right: np.ndarray,
+    mass: np.ndarray,
+) -> np.ndarray:
+    """Return singular values of the global cross mass product ``left^T M right``."""
+
+    gram = _global_gram(comm, left, right, mass)
+    return np.linalg.svd(gram, compute_uv=False) if gram.size else np.empty(0)
+
+
 def recycle_distributed(
     comm: MPI.Comm,
     factors: list[DistributedPODFactors],

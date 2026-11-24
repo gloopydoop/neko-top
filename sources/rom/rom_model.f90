@@ -223,9 +223,10 @@ contains
     real(kind=rp), intent(in) :: dt
     type(matrix_t), intent(inout) :: states
     type(vector_t), pointer :: state, residual, rhs
-    type(matrix_t), pointer :: step_matrix
+    type(matrix_t), pointer :: step_matrix, step_inverse, identity_rhs
     integer :: state_index, residual_index, rhs_index, step_matrix_index
-    integer :: n_steps, step
+    integer :: step_inverse_index, identity_rhs_index
+    integer :: n_steps, step, i
 
     n_steps = states%get_ncols() - 1
     if (states%get_nrows() /= this%n_state .or. initial_state%size() /= this%n_state) &
@@ -235,10 +236,25 @@ contains
     call neko_scratch_registry%request_vector(rhs, rhs_index, this%n_state, .true.)
     call neko_scratch_registry%request_matrix(step_matrix, step_matrix_index, &
          this%n_state, this%n_state, .true.)
+    call neko_scratch_registry%request_matrix(step_inverse, step_inverse_index, &
+         this%n_state, this%n_state, .true.)
+    call neko_scratch_registry%request_matrix(identity_rhs, identity_rhs_index, &
+         this%n_state, this%n_state, .true.)
     step_matrix%x = this%mass%x - dt * this%implicit_linear%x
     if (any(.not. ieee_is_finite(step_matrix%x))) then
        write(*,'(A)') 'ROM BDF1 failure: non-finite implicit step matrix'
        error stop 'non-finite ROM BDF1 step matrix'
+    end if
+    identity_rhs%x = 0.0_rp
+    do i = 1, this%n_state
+       identity_rhs%x(i,i) = 1.0_rp
+    end do
+    ! The BDF1 matrix is fixed throughout this trajectory.  Solve for its
+    ! inverse once, rather than refactorising it at every ROM substep.
+    call rom_solve_matrix(step_matrix, identity_rhs, step_inverse)
+    if (any(.not. ieee_is_finite(step_inverse%x))) then
+       write(*,'(A)') 'ROM BDF1 failure: non-finite inverse step matrix'
+       error stop 'non-finite ROM BDF1 inverse step matrix'
     end if
     states%x(:,1) = initial_state%x
     if (any(.not. ieee_is_finite(states%x(:,1)))) then
@@ -258,7 +274,7 @@ contains
           write(*,'(A,I0)') 'ROM BDF1 failure: non-finite right-hand side at step ', step
           error stop 'non-finite ROM BDF1 right-hand side'
        end if
-       call rom_solve(step_matrix, rhs, state)
+       state%x = matmul(step_inverse%x, rhs%x)
        if (any(.not. ieee_is_finite(state%x))) then
           write(*,'(A,I0)') 'ROM BDF1 failure: non-finite state at step ', step
           error stop 'non-finite ROM BDF1 state'
@@ -266,8 +282,10 @@ contains
        states%x(:,step+1) = state%x
     end do
     call neko_scratch_registry%relinquish_vector([state_index, residual_index, rhs_index])
-    call neko_scratch_registry%relinquish_matrix(step_matrix_index)
+    call neko_scratch_registry%relinquish_matrix([step_matrix_index, &
+         step_inverse_index, identity_rhs_index])
     nullify(state); nullify(residual); nullify(rhs); nullify(step_matrix)
+    nullify(step_inverse); nullify(identity_rhs)
   end subroutine rom_model_forward_bdf1
 
   !> Discrete adjoint of the explicit Euler map used above.
@@ -338,9 +356,11 @@ contains
     type(matrix_t), intent(inout) :: adjoint
     type(vector_t), pointer :: state, running, terminal, next_adjoint, current_adjoint
     type(matrix_t), pointer :: jacobian, map_jacobian, step_matrix, rhs_matrix
+    type(matrix_t), pointer :: step_inverse, identity_rhs
     integer :: state_index, running_index, terminal_index, next_index, current_index
     integer :: jacobian_index, map_index, step_index, rhs_index
-    integer :: n_steps, step
+    integer :: step_inverse_index, identity_rhs_index
+    integer :: n_steps, step, i
 
     n_steps = states%get_ncols() - 1
     if (states%get_nrows() /= this%n_state .or. &
@@ -367,16 +387,25 @@ contains
          this%n_state, this%n_state, .true.)
     call neko_scratch_registry%request_matrix(step_matrix, step_index, &
          this%n_state, this%n_state, .true.)
+    call neko_scratch_registry%request_matrix(step_inverse, step_inverse_index, &
+         this%n_state, this%n_state, .true.)
+    call neko_scratch_registry%request_matrix(identity_rhs, identity_rhs_index, &
+         this%n_state, this%n_state, .true.)
     call neko_scratch_registry%request_matrix(rhs_matrix, rhs_index, &
          this%n_state, this%n_state, .true.)
     step_matrix%x = this%mass%x - dt * this%implicit_linear%x
+    identity_rhs%x = 0.0_rp
+    do i = 1, this%n_state
+       identity_rhs%x(i,i) = 1.0_rp
+    end do
+    call rom_solve_matrix(step_matrix, identity_rhs, step_inverse)
     do step = n_steps, 1, -1
        state%x = states%x(:,step)
        next_adjoint%x = adjoint%x(:,step+1)
        running%x = running_state_gradient%x(:,step)
        call this%jacobian_state(state, jacobian)
        rhs_matrix%x = this%mass%x + dt * matmul(this%mass%x, jacobian%x)
-       call rom_solve_matrix(step_matrix, rhs_matrix, map_jacobian)
+       map_jacobian%x = matmul(step_inverse%x, rhs_matrix%x)
        current_adjoint%x = matmul(transpose(map_jacobian%x), next_adjoint%x) + dt * running%x
        if (any(.not. ieee_is_finite(current_adjoint%x))) then
           error stop 'non-finite ROM BDF1 adjoint state'
@@ -386,10 +415,11 @@ contains
     call neko_scratch_registry%relinquish_vector([state_index, running_index, &
          terminal_index, next_index, current_index])
     call neko_scratch_registry%relinquish_matrix([jacobian_index, map_index, &
-         step_index, rhs_index])
+         step_index, rhs_index, step_inverse_index, identity_rhs_index])
     nullify(state); nullify(running); nullify(terminal); nullify(next_adjoint)
     nullify(current_adjoint); nullify(jacobian); nullify(map_jacobian)
-    nullify(step_matrix); nullify(rhs_matrix)
+    nullify(step_matrix); nullify(rhs_matrix); nullify(step_inverse)
+    nullify(identity_rhs)
   end subroutine rom_model_discrete_adjoint_bdf1
 
   !> Integrate an enriched adjoint with a time-dependent projected Jacobian.
@@ -414,9 +444,11 @@ contains
     type(matrix_t), intent(inout) :: adjoint
     type(vector_t), pointer :: running, next_adjoint, current_adjoint
     type(matrix_t), pointer :: step_matrix, rhs_matrix, map_jacobian
+    type(matrix_t), pointer :: step_inverse, identity_rhs
     integer :: running_index, next_index, current_index
     integer :: step_index, rhs_index, map_index
-    integer :: n_steps, step
+    integer :: step_inverse_index, identity_rhs_index
+    integer :: n_steps, step, i
 
     n_steps = running_state_gradient%get_ncols()
     if (running_state_gradient%get_nrows() /= this%n_state .or. &
@@ -435,12 +467,21 @@ contains
          this%n_state, .true.)
     call neko_scratch_registry%request_matrix(step_matrix, step_index, &
          this%n_state, this%n_state, .true.)
+    call neko_scratch_registry%request_matrix(step_inverse, step_inverse_index, &
+         this%n_state, this%n_state, .true.)
+    call neko_scratch_registry%request_matrix(identity_rhs, identity_rhs_index, &
+         this%n_state, this%n_state, .true.)
     call neko_scratch_registry%request_matrix(rhs_matrix, rhs_index, &
          this%n_state, this%n_state, .true.)
     call neko_scratch_registry%request_matrix(map_jacobian, map_index, &
          this%n_state, this%n_state, .true.)
 
     step_matrix%x = this%mass%x - dt * this%implicit_linear%x
+    identity_rhs%x = 0.0_rp
+    do i = 1, this%n_state
+       identity_rhs%x(i,i) = 1.0_rp
+    end do
+    call rom_solve_matrix(step_matrix, identity_rhs, step_inverse)
     adjoint%x(:,n_steps+1) = terminal_state_gradient%x
     if (any(.not. ieee_is_finite(adjoint%x(:,n_steps+1)))) then
        write(*,'(A)') 'ROM time-varying adjoint failure: non-finite terminal gradient'
@@ -454,7 +495,7 @@ contains
           write(*,'(A,I0)') 'ROM time-varying adjoint failure: non-finite map at step ', step
           error stop 'non-finite ROM time-varying adjoint map'
        end if
-       call rom_solve_matrix(step_matrix, rhs_matrix, map_jacobian)
+       map_jacobian%x = matmul(step_inverse%x, rhs_matrix%x)
        current_adjoint%x = matmul(transpose(map_jacobian%x), next_adjoint%x) + &
             dt * running%x
        if (any(.not. ieee_is_finite(current_adjoint%x))) then
@@ -466,9 +507,11 @@ contains
 
     call neko_scratch_registry%relinquish_vector([running_index, next_index, &
          current_index])
-    call neko_scratch_registry%relinquish_matrix([step_index, rhs_index, map_index])
+    call neko_scratch_registry%relinquish_matrix([step_index, rhs_index, map_index, &
+         step_inverse_index, identity_rhs_index])
     nullify(running); nullify(next_adjoint); nullify(current_adjoint)
     nullify(step_matrix); nullify(rhs_matrix); nullify(map_jacobian)
+    nullify(step_inverse); nullify(identity_rhs)
   end subroutine rom_model_discrete_adjoint_bdf1_timevarying
 
   !> Solve the transpose reduced mass system.

@@ -92,7 +92,9 @@ program production_rom_step_diagnostic
   call optimizer%init_from_json(parameters, problem, design, simulation)
   optimizer%enable_output = engineering_mode
   if (.not. engineering_mode) optimizer%inner_iterations = 1
-  optimizer%rom_problem%rank_total_max = 1
+  optimizer%rom_problem%rank_forward = 1
+  optimizer%rom_problem%rank_adjoint = 1
+  optimizer%rom_problem%rank_enriched = 2
   optimizer%rom_problem%time_start = real(simulation%neko_case%time%start_time, rp)
   ! Engineering mode exercises the real reduced forward/adjoint, MMA,
   ! full-order refresh, objective and sensitivity path on an explicitly
@@ -117,7 +119,9 @@ program production_rom_step_diagnostic
 
   n = fluid%u%dof%size()
   if (trim(basis_source) == 'manufactured') then
-     optimizer%rom_problem%rank_total_max = 2
+     optimizer%rom_problem%rank_forward = 2
+     optimizer%rom_problem%rank_adjoint = 2
+     optimizer%rom_problem%rank_enriched = 4
      r = 2
      allocate(basis(3*n, r))
      call build_manufactured_basis(fluid, basis, n)

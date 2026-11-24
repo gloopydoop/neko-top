@@ -21,6 +21,7 @@ module rom_objectives
   public :: rom_assemble_brinkman_objective
   public :: rom_assemble_brinkman_objective_cross
   public :: rom_viscous_value
+  public :: rom_scalar_mixing_value
   public :: rom_brinkman_value
   public :: rom_brinkman_density
 
@@ -318,6 +319,24 @@ contains
          dot_product(state%x, matmul(quadratic%x, state%x))) / &
          max(domain, tiny(1.0_rp))
   end function rom_viscous_value
+
+  !> Evaluate the reduced scalar-mixing quadratic objective.
+  !! The algebra is the same quadratic lift expansion as the viscous
+  !! objective, but the separate entry point keeps the physical objective
+  !! identity explicit at the ROM/problem boundary.
+  function rom_scalar_mixing_value(state, constant, linear, quadratic, domain) result(value)
+    type(vector_t), intent(in) :: state
+    real(kind=rp), intent(in) :: constant
+    type(vector_t), intent(in) :: linear
+    type(matrix_t), intent(in) :: quadratic
+    real(kind=rp), intent(in) :: domain
+    real(kind=rp) :: value
+    if (linear%size() /= state%size() .or. quadratic%get_nrows() /= state%size() .or. &
+         quadratic%get_ncols() /= state%size()) error stop 'ROM scalar objective value shape mismatch'
+    value = 0.5_rp * (constant + 2.0_rp * dot_product(linear%x, state%x) + &
+         dot_product(state%x, matmul(quadratic%x, state%x))) / &
+         max(domain, tiny(1.0_rp))
+  end function rom_scalar_mixing_value
 
   !> Evaluate the reduced Brinkman-dissipation quadratic objective.
   function rom_brinkman_value(state, constant, lift_linear, quadratic, domain) result(value)

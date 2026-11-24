@@ -15,6 +15,7 @@ module rom_problem
        field_sub3
   use matrix, only: matrix_t
   use rom_model, only: rom_model_t
+  use rom_config, only: rom_config_t
   use rom_lift, only: rom_lift_t
        use rom_assembly, only: rom_assemble_mass, rom_assemble_brinkman, &
        rom_assemble_mass_coupled, rom_assemble_scalar_transport, &
@@ -28,7 +29,7 @@ module rom_problem
        rom_assemble_viscous_cross_terms, rom_assemble_brinkman_objective, &
        rom_assemble_brinkman_objective_cross, rom_assemble_scalar_mixing_terms, &
        rom_assemble_scalar_mixing_cross_terms, &
-       rom_viscous_value, rom_brinkman_value
+       rom_viscous_value, rom_scalar_mixing_value, rom_brinkman_value
   use rom_basis_handoff, only: rom_receive_basis, rom_receive_petrov_bases, &
        rom_project_basis, rom_project_test_basis, rom_restrict_scalar_basis, &
        rom_orthonormalize_projected_device, &
@@ -70,13 +71,27 @@ module rom_problem
      type(rom_basis_storage_t) :: basis
      type(rom_basis_storage_t) :: test_basis
 
-     character(len=32) :: formulation = 'galerkin'
+     character(len=32) :: basis_forward = 'forward'
+     character(len=32) :: basis_adjoint = 'forward'
+     character(len=64) :: formulation = 'forward_galerkin'
      character(len=32) :: sensitivity_source = 'exact_galerkin'
      logical :: petrov_galerkin = .false.
      logical :: forward_constrained_enriched = .false.
+     logical :: forward_galerkin = .true.
+     logical :: separate_pod = .false.
+     logical :: forward_enriched_adjoint = .false.
+     logical :: enriched_galerkin = .false.
+     logical :: uses_dual_basis = .false.
 
      integer :: inner_iterations = 1
-     integer :: rank_total_max = 1
+     ! Actual ranks after the received POD blocks have been projected and
+     ! orthonormalised.  A positive value before handoff is a legacy cap only.
+     integer :: rank_forward = 0
+     integer :: rank_adjoint = 0
+     integer :: rank_enriched = 0
+     integer :: rank_cap_forward = 0
+     integer :: rank_cap_adjoint = 0
+     integer :: rank_cap_enriched = 0
      integer :: history_outer_iterations = 3
      real(kind=rp) :: scalar_metric_weight = 1.0_rp
      real(kind=rp) :: admissibility_tolerance = 1.0e-8_rp
@@ -189,6 +204,11 @@ module rom_problem
      type(field_wrapper_t) :: rom_scalar
      type(field_wrapper_t) :: rom_adjoint_velocity(3)
      type(field_wrapper_t) :: rom_adjoint_scalar
+     character(len=:), allocatable :: rom_output_root
+     character(len=:), allocatable :: rom_outer_directory
+     character(len=:), allocatable :: rom_inner_directory
+     integer :: output_outer_iteration = -1
+     integer :: output_inner_iteration = -1
      logical :: rom_outputs_initialized = .false.
    contains
      procedure, pass(this), public :: init_from_json => rom_problem_init_from_json
@@ -214,6 +234,8 @@ module rom_problem
      procedure, pass(this), public :: write_forward_output => &
           rom_problem_write_forward_output
      procedure, pass(this), public :: write_outputs => rom_problem_write_outputs
+     procedure, pass(this), public :: write_inner_diagnostics => &
+          rom_problem_write_inner_diagnostics
      procedure, pass(this), public :: compute_objectives => rom_problem_compute_objectives
      procedure, pass(this), public :: compute_density => rom_problem_compute_density
      procedure, pass(this), public :: compute_volume_constraint => &
@@ -273,92 +295,45 @@ contains
     class(rom_problem_t), intent(inout) :: this
     type(json_file), intent(inout) :: parameters
     class(problem_t), intent(in) :: problem
-    type(json_file) :: rom_parameters, solver_parameters
+    type(rom_config_t) :: config
     logical :: dealias, variable_dt
-    character(len=:), allocatable :: time_scheme, pressure_treatment, formulation
-    character(len=:), allocatable :: sensitivity_source
     integer :: time_order
 
     call this%free()
-    if ('rom' .in. parameters) then
-       call json_get(parameters, 'rom', rom_parameters)
-    else
-       call json_get(parameters, 'optimization.solver', solver_parameters)
-       if ('rom' .in. solver_parameters) then
-          call json_get(solver_parameters, 'rom', rom_parameters)
-       else
-          rom_parameters = solver_parameters
-       end if
-    end if
-    call json_get_or_default(rom_parameters, 'inner_iterations', &
-         this%inner_iterations, 3)
-    call json_get_or_default(rom_parameters, 'history_outer_iterations', &
-         this%history_outer_iterations, 3)
-    call json_get_or_default(rom_parameters, 'rank_total_max', &
-         this%rank_total_max, 12)
-    call json_get_or_default(rom_parameters, 'substeps', this%substeps, 1)
-    call json_get_or_default(rom_parameters, 'formulation', formulation, 'galerkin')
-    this%formulation = trim(formulation)
-    call json_get_or_default(rom_parameters, 'sensitivity_source', sensitivity_source, &
-         'exact_galerkin')
-    this%sensitivity_source = trim(sensitivity_source)
-    if (this%sensitivity_source /= 'exact_galerkin' .and. &
-         this%sensitivity_source /= 'projected_adjoint') call neko_error( &
-         'rom_mma sensitivity_source must be exact_galerkin or projected_adjoint')
-    if (this%sensitivity_source == 'projected_adjoint' .and. &
-         .not. (trim(formulation) == 'forward_constrained_enriched' .or. &
-         trim(formulation) == 'enriched_adjoint_galerkin')) call neko_error( &
-         'projected_adjoint sensitivity_source requires forward_constrained_enriched')
-    this%petrov_galerkin = trim(formulation) == 'petrov_galerkin'
-    this%forward_constrained_enriched = trim(formulation) == &
-         'forward_constrained_enriched' .or. trim(formulation) == &
-         'enriched_adjoint_galerkin'
-    if (.not. this%petrov_galerkin .and. .not. this%forward_constrained_enriched .and. &
-         trim(formulation) /= 'galerkin') then
-       call neko_error('rom_mma formulation must be galerkin, petrov_galerkin, or forward_constrained_enriched')
-    end if
-    call json_get_or_default(rom_parameters, 'scalar_metric_weight', &
-         this%scalar_metric_weight, 1.0_rp)
-    call json_get_or_default(rom_parameters, 'admissibility_tolerance', &
-         this%admissibility_tolerance, 1.0e-8_rp)
-    call json_get_or_default(rom_parameters, 'petrov_svd_relative_tolerance', &
-         this%petrov_svd_relative_tolerance, 1.0e-8_rp)
-    call json_get_or_default(rom_parameters, 'enable_output', &
-         this%enable_output, .true.)
-    call json_get_or_default(rom_parameters, 'write_trajectory_fields', &
-         this%write_trajectory_fields, .false.)
-    call json_get_or_default(rom_parameters, 'trajectory_output_interval', &
-         this%trajectory_output_interval, 0.5_rp)
-    call json_get_or_default(rom_parameters, 'export_reduced_system', &
-         this%export_reduced_system, .false.)
-    call json_get_or_default(rom_parameters, 'reduced_system_export_directory', &
-         this%reduced_system_export_directory, 'rom_reduced_system')
-    if (this%inner_iterations < 1) call neko_error( &
-         'rom_mma requires inner_iterations >= 1')
-    if (this%history_outer_iterations < 1) call neko_error( &
-         'rom_mma requires history_outer_iterations >= 1')
-    if (this%rank_total_max < 1) call neko_error( &
-         'rom_mma requires rank_total_max >= 1')
-    if (this%substeps < 1) call neko_error( &
-         'rom_mma requires substeps >= 1')
-    if (this%admissibility_tolerance <= 0.0_rp) call neko_error( &
-         'rom_mma requires admissibility_tolerance > 0')
-    if (this%petrov_svd_relative_tolerance <= 0.0_rp .or. &
-         this%petrov_svd_relative_tolerance > 1.0_rp) call neko_error( &
-         'rom_mma requires 0 < petrov_svd_relative_tolerance <= 1')
-    if (this%write_trajectory_fields .and. &
-         this%trajectory_output_interval <= 0.0_rp) call neko_error( &
-         'rom_mma requires trajectory_output_interval > 0')
-    call json_get_or_default(rom_parameters, 'time_scheme', time_scheme, &
-         'bdf1')
-    call json_get_or_default(rom_parameters, 'pressure_treatment', &
-         pressure_treatment, 'solenoidal_galerkin')
-    if (trim(time_scheme) /= 'bdf1') then
-       call neko_error('rom_mma requires the explicitly documented time_scheme=bdf1')
-    end if
-    if (trim(pressure_treatment) /= 'solenoidal_galerkin') then
-       call neko_error('rom_mma requires pressure_treatment=solenoidal_galerkin')
-    end if
+    call config%init(parameters)
+    this%basis_forward = trim(config%basis_forward)
+    this%basis_adjoint = trim(config%basis_adjoint)
+    this%formulation = trim(config%formulation)
+    this%sensitivity_source = trim(config%sensitivity_source)
+    this%inner_iterations = config%inner_iterations
+    this%history_outer_iterations = config%history_outer_iterations
+    this%rank_forward = 0
+    this%rank_adjoint = 0
+    this%rank_enriched = 0
+    this%rank_cap_forward = config%legacy_rank_forward
+    this%rank_cap_adjoint = config%legacy_rank_adjoint
+    this%rank_cap_enriched = config%legacy_rank_enriched
+    this%substeps = config%substeps
+    this%scalar_metric_weight = config%scalar_metric_weight
+    this%admissibility_tolerance = config%admissibility_tolerance
+    this%petrov_svd_relative_tolerance = config%petrov_svd_relative_tolerance
+    this%enable_output = config%enable_output
+    this%write_trajectory_fields = config%write_trajectory_fields
+    this%trajectory_output_interval = config%trajectory_output_interval
+    this%export_reduced_system = config%export_reduced_system
+    this%reduced_system_export_directory = config%reduced_system_export_directory
+    this%forward_galerkin = this%formulation == 'forward_galerkin'
+    this%separate_pod = this%formulation == 'separate_pod'
+    this%forward_enriched_adjoint = this%formulation == 'forward_enriched_adjoint'
+    this%enriched_galerkin = this%formulation == 'enriched_galerkin'
+    this%forward_constrained_enriched = this%separate_pod .or. &
+         this%forward_enriched_adjoint
+    this%uses_dual_basis = this%separate_pod .or. &
+         this%forward_enriched_adjoint .or. this%enriched_galerkin
+    ! Canonical formulations use Galerkin forward dynamics.  The old flag is
+    ! retained only as a compatibility field for diagnostics; no new case
+    ! silently selects a Petrov forward operator.
+    this%petrov_galerkin = .false.
     call json_get(parameters, 'case.numerics.dealias', dealias)
     if (dealias) call neko_error('rom_mma requires case.numerics.dealias=false')
     call json_get_or_lookup(parameters, 'case.numerics.time_order', time_order)
@@ -475,7 +450,7 @@ contains
     integer, intent(in) :: n_modes, n_fields
     type(simulation_t), intent(inout) :: simulation
     integer :: expected_rows
-    if (this%petrov_galerkin .or. this%forward_constrained_enriched) call neko_error( &
+    if (this%uses_dual_basis) call neko_error( &
          'This ROM formulation requires separate streamed forward and adjoint bases')
     if (n_modes < 1 .or. size(basis, 2) /= n_modes .or. &
          (n_fields /= 3 .and. n_fields /= 4)) then
@@ -499,6 +474,9 @@ contains
     this%basis%n_rows = size(basis, 1)
     this%basis%n_modes = n_modes
     this%basis%n_fields = n_fields
+    this%rank_forward = n_modes
+    this%rank_adjoint = n_modes
+    this%rank_enriched = n_modes
     call this%basis%modes%init(size(basis,1), size(basis,2))
     this%basis%modes%x = basis
     call rom_problem_restrict_scalar_basis(this, simulation)
@@ -779,7 +757,7 @@ contains
     r = this%mass%get_nrows()
     trial_rank = this%basis%n_modes
     test_rank = trial_rank
-    if (this%petrov_galerkin .or. this%forward_constrained_enriched) &
+    if (this%uses_dual_basis) &
          test_rank = this%test_basis%n_modes
 
     filename = trim(this%reduced_system_export_directory)//'/H.csv'
@@ -814,7 +792,7 @@ contains
     ! metadata records the shape and layout for numpy.reshape(order='F').
     filename = trim(this%reduced_system_export_directory)//'/trial_basis.bin'
     call rom_problem_write_matrix_binary(trim(filename), this%basis%modes%x)
-    if (this%petrov_galerkin .or. this%forward_constrained_enriched) then
+    if (this%uses_dual_basis) then
        filename = trim(this%reduced_system_export_directory)//'/test_basis.bin'
        call rom_problem_write_matrix_binary(trim(filename), this%test_basis%modes%x)
     end if
@@ -843,6 +821,16 @@ contains
     write(unit, '(A,I0,A)') '  "test_basis_rank": ', test_rank, ','
     write(unit, '(A,I0,A)') '  "enriched_adjoint_rank": ', &
          this%enriched_adjoint_rank, ','
+    write(unit, '(A,A,A)') '  "basis_forward": "', &
+         trim(this%basis_forward), '",'
+    write(unit, '(A,A,A)') '  "basis_adjoint": "', &
+         trim(this%basis_adjoint), '",'
+    write(unit, '(A,I0,A)') '  "forward_retained_rank": ', &
+         this%rank_forward, ','
+    write(unit, '(A,I0,A)') '  "adjoint_retained_rank": ', &
+         this%rank_adjoint, ','
+    write(unit, '(A,I0,A)') '  "enriched_retained_rank": ', &
+         this%rank_enriched, ','
     write(unit, '(A,I0,A)') '  "trial_basis_rows": ', this%basis%n_rows, ','
     write(unit, '(A,I0,A)') '  "test_basis_rows": ', this%test_basis%n_rows, ','
     write(unit, '(A,A,A)') '  "formulation": "', trim(this%formulation), '",'
@@ -852,6 +840,14 @@ contains
     write(unit, '(A,A,A)') '  "petrov_galerkin": ', trim(logical_string), ','
     logical_string = rom_problem_json_logical(this%forward_constrained_enriched)
     write(unit, '(A,A,A)') '  "forward_constrained_enriched": ', trim(logical_string), ','
+    logical_string = rom_problem_json_logical(this%forward_galerkin)
+    write(unit, '(A,A,A)') '  "forward_galerkin": ', trim(logical_string), ','
+    logical_string = rom_problem_json_logical(this%separate_pod)
+    write(unit, '(A,A,A)') '  "separate_pod": ', trim(logical_string), ','
+    logical_string = rom_problem_json_logical(this%forward_enriched_adjoint)
+    write(unit, '(A,A,A)') '  "forward_enriched_adjoint": ', trim(logical_string), ','
+    logical_string = rom_problem_json_logical(this%enriched_galerkin)
+    write(unit, '(A,A,A)') '  "enriched_galerkin": ', trim(logical_string), ','
     logical_string = rom_problem_json_logical(this%has_scalar)
     write(unit, '(A,A,A)') '  "has_scalar": ', trim(logical_string), ','
     write(unit, '(A,ES24.16,A)') '  "scalar_metric_weight": ', &
@@ -889,7 +885,7 @@ contains
     write(unit, '(A)') '    "b": "b.csv", "linear_explicit": "linear_explicit.csv",'
     write(unit, '(A)') '    "linear_implicit": "linear_implicit.csv", "Q": "Q.csv",'
     write(unit, '(A)') '    "a0": "a0.csv", "trial_basis": "trial_basis.bin",'
-    if (this%petrov_galerkin .or. this%forward_constrained_enriched) then
+    if (this%uses_dual_basis) then
        write(unit, '(A)') '    "test_basis": "test_basis.bin",'
     end if
     write(unit, '(A)') '    "weights": "weights.bin", "lift_velocity": "lift_velocity.bin",'
@@ -907,6 +903,7 @@ contains
     class(rom_problem_t), intent(in) :: this
     integer :: unit, step, mode, r
     character(len=512) :: filename
+    if (pe_rank /= 0) return
     r = this%states%get_nrows()
     filename = trim(this%reduced_system_export_directory)//'/reference_trajectory.csv'
     open(newunit=unit, file=trim(filename), status='replace', action='write')
@@ -1080,7 +1077,7 @@ contains
        wv = viscous_time_weight * this%viscous_weight
        wb = brinkman_time_weight * this%brinkman_weight
        ws = scalar_mixing_time_weight * this%scalar_mixing_weight
-       if (abs(wv) > tiny(1.0_rp)) then
+       if (this%has_viscous) then
           state_cost = rom_viscous_value(state, &
                this%viscous_constant%x(1), this%viscous_linear, &
                this%viscous_quadratic, this%viscous_domain)
@@ -1106,7 +1103,7 @@ contains
           if (step == this%n_steps) this%terminal_gradient%x = &
                this%terminal_gradient%x + this%dt * wv * state_gradient%x
        end if
-       if (abs(wb) > tiny(1.0_rp)) then
+       if (this%has_brinkman) then
           state_cost = rom_brinkman_value(state, &
                this%candidate_objective_constant, this%candidate_objective_lift, &
                this%candidate_objective_brinkman, this%brinkman_domain)
@@ -1135,8 +1132,8 @@ contains
           call add_outer_product(this%cost_sum_aa, state, state, this%dt * wb)
           this%cost_total = this%cost_total + this%dt * wb
        end if
-       if (abs(ws) > tiny(1.0_rp)) then
-          state_cost = rom_viscous_value(state, this%scalar_mixing_constant%x(1), &
+       if (this%has_scalar_mixing) then
+          state_cost = rom_scalar_mixing_value(state, this%scalar_mixing_constant%x(1), &
                this%scalar_mixing_linear, this%scalar_mixing_quadratic, &
                this%scalar_mixing_domain)
           this%scalar_mixing_value = this%scalar_mixing_value + this%dt * &
@@ -1390,7 +1387,7 @@ contains
          this%lift_velocity(3), this%lift_velocity(1), this%lift_velocity(2), &
          this%lift_velocity(3))
     direct = 0.0_rp
-    if (this%has_brinkman .and. this%cost_total > 0.0_rp) then
+    if (this%has_brinkman) then
        call vector_cmult2(direct, lift_square, this%cost_total)
        do c = 1, 3
           call neko_scratch_registry%request_vector(mode_sum(c)%ptr, mode_sum_index(c), &
@@ -1626,13 +1623,14 @@ contains
     call rom_problem_assemble_objective_operators(this)
   end subroutine rom_problem_refresh
 
-  !> Receive and project the common local velocity basis from Python.
+  !> Receive and construct the selected forward/adjoint basis spaces.
   subroutine rom_problem_load_local_basis(this, simulation)
     class(rom_problem_t), intent(inout) :: this
     type(simulation_t), intent(inout) :: simulation
     integer :: n_modes, n_fields
     real(kind=rp), allocatable :: local_basis(:, :)
-    if (this%forward_constrained_enriched) then
+    character(len=256) :: log_message
+    if (this%uses_dual_basis) then
        call rom_problem_load_local_forward_constrained_basis(this, simulation)
        return
     end if
@@ -1651,6 +1649,12 @@ contains
     if (n_modes < 1) call neko_error('Python ROM peer returned an empty basis')
     this%basis%n_rows = size(local_basis, 1)
     this%basis%n_modes = n_modes
+    this%rank_forward = n_modes
+    this%rank_adjoint = n_modes
+    this%rank_enriched = n_modes
+    write(log_message, '("ROM basis selection: forward=",A,", adjoint=",A,", retained forward rank=",I0)') &
+         trim(this%basis_forward), trim(this%basis_adjoint), this%rank_forward
+    call neko_log%message(trim(log_message))
     if (this%basis%n_rows /= n_fields * simulation%fluid%u%dof%size()) then
        call neko_error('ROM basis rows do not match local velocity fields')
     end if
@@ -1663,25 +1667,33 @@ contains
   end subroutine rom_problem_load_local_basis
 
   !> Receive forward and adjoint POD spaces and construct
-  !! the common enriched physical space V_E = span([V_f,V_a]).
+  !! the forward POD space V_f and the independently streamed adjoint POD
+  !! space V_a.  The selected formulation then chooses between V_f, V_a and
+  !! V_E = orth_M([V_f,V_a]) without allowing adjoint modes into a restricted
+  !! forward trajectory.
   !!
   !! The forward and adjoint POD blocks are mass-orthonormalised
-  !! independently.  The forward system retains only V_f, while the
-  !! independent adjoint system retains only V_a; overlapping components are
-  !! preserved rather than replaced by an orthogonal complement.
+  !! independently.  `separate_pod` retains those two spaces.  The enriched
+  !! formulations additionally build V_E from their concatenation.  The
+  !! original V_a overlap is retained in the span; it is not replaced by an
+  !! orthogonal-complement-only construction.
   subroutine rom_problem_load_local_forward_constrained_basis(this, simulation)
     class(rom_problem_t), intent(inout) :: this
     type(simulation_t), intent(inout) :: simulation
     integer :: trial_modes, trial_fields, adjoint_modes, adjoint_fields
-    integer :: n, trial_retained, adjoint_retained, fields
+    integer :: n, trial_retained, adjoint_retained, enriched_retained, fields
+    integer :: enriched_input_modes, trial_use, adjoint_use, enriched_use
     integer, allocatable :: trial_mode_index(:), adjoint_mode_index(:)
     real(kind=rp), allocatable :: trial_basis(:, :), adjoint_basis(:, :)
     real(kind=rp), allocatable :: trial_velocity(:, :), adjoint_velocity(:, :)
     real(kind=rp), allocatable :: trial_scalar(:,:), adjoint_scalar(:,:), mass(:)
+    real(kind=rp), allocatable :: enriched_velocity(:, :), enriched_scalar(:,:)
     real(kind=rp), allocatable :: trial_norms(:), trial_crosses(:)
     real(kind=rp), allocatable :: adjoint_norms(:), adjoint_crosses(:)
     real(kind=rp) :: scalar_weight, tolerance
-    logical :: trial_ok, adjoint_ok
+    logical :: trial_ok, adjoint_ok, enriched_ok
+    integer :: forward_cap, adjoint_cap, enriched_cap
+    character(len=256) :: log_message
 
     call rom_receive_petrov_bases(simulation%state_recover, simulation%fluid%u%x, &
          trial_basis, trial_modes, trial_fields, adjoint_basis, adjoint_modes, &
@@ -1707,11 +1719,16 @@ contains
 
     scalar_weight = this%scalar_metric_weight
     tolerance = this%admissibility_tolerance
+    forward_cap = this%rank_cap_forward
+    adjoint_cap = this%rank_cap_adjoint
+    enriched_cap = this%rank_cap_enriched
     if (scalar_weight <= 0.0_rp) call neko_error( &
          'ROM scalar_metric_weight must be positive')
-    allocate(mass(n), trial_mode_index(trial_modes), adjoint_mode_index(adjoint_modes), &
+    allocate(mass(n), trial_mode_index(trial_modes), &
+         adjoint_mode_index(trial_modes + adjoint_modes), &
          trial_norms(trial_modes), trial_crosses(trial_modes), &
-         adjoint_norms(adjoint_modes), adjoint_crosses(adjoint_modes))
+         adjoint_norms(trial_modes + adjoint_modes), &
+         adjoint_crosses(trial_modes + adjoint_modes))
     mass = reshape(simulation%fluid%c_Xh%B, [n])
     ! The streamed forward and adjoint POD blocks define two subspaces of the
     ! same enriched physical space V_E = span([V_f,V_a]).  Orthonormalise each
@@ -1730,7 +1747,8 @@ contains
             trial_mode_index, trial_norms, trial_crosses, trial_ok)
        call rom_orthonormalize_projected_coupled_device(adjoint_velocity, adjoint_scalar, n, &
             adjoint_modes, mass, scalar_weight, tolerance, adjoint_retained, &
-            adjoint_mode_index, adjoint_norms, adjoint_crosses, adjoint_ok)
+            adjoint_mode_index(1:adjoint_modes), adjoint_norms(1:adjoint_modes), &
+            adjoint_crosses(1:adjoint_modes), adjoint_ok)
        trial_basis(1:3*n,1:trial_retained) = trial_velocity
        adjoint_basis(1:3*n,1:adjoint_retained) = adjoint_velocity
        trial_basis(3*n+1:4*n,1:trial_retained) = trial_scalar
@@ -1739,8 +1757,9 @@ contains
        call rom_orthonormalize_projected_device(trial_basis, n, trial_modes, mass, &
             tolerance, trial_retained, trial_mode_index, trial_norms, trial_crosses, trial_ok)
        call rom_orthonormalize_projected_device(adjoint_basis, n, adjoint_modes, mass, &
-            tolerance, adjoint_retained, adjoint_mode_index, adjoint_norms, &
-            adjoint_crosses, adjoint_ok)
+            tolerance, adjoint_retained, adjoint_mode_index(1:adjoint_modes), &
+            adjoint_norms(1:adjoint_modes), adjoint_crosses(1:adjoint_modes), &
+            adjoint_ok)
     end if
     if (.not. trial_ok .or. .not. adjoint_ok .or. trial_retained < 1 .or. &
          adjoint_retained < 1) call neko_error( &
@@ -1748,43 +1767,103 @@ contains
     if (size(trial_basis,1) /= fields*n .or. size(adjoint_basis,1) /= fields*n .or. &
          size(trial_basis,2) < trial_retained .or. size(adjoint_basis,2) < adjoint_retained) &
          call neko_error('forward_constrained_enriched independent basis shape mismatch')
-    if (this%rank_total_max < trial_retained) call neko_error( &
-         'forward_constrained_enriched rank_total_max is smaller than the forward rank')
-    ! The configured cap limits the retained adjoint block without changing
-    ! its origin: every retained adjoint column remains in span(V_a).  The
-    ! forward block is never truncated by this cap.
-    trial_modes = trial_retained
-    adjoint_modes = min(adjoint_retained, this%rank_total_max)
-    if (adjoint_modes < 1) call neko_error( &
-         'forward_constrained_enriched retained no adjoint POD modes')
+    trial_use = trial_retained
+    adjoint_use = adjoint_retained
+    if (forward_cap > 0) trial_use = min(forward_cap, trial_use)
+    if (adjoint_cap > 0) adjoint_use = min(adjoint_cap, adjoint_use)
+    if (trial_use < 1 .or. adjoint_use < 1) call neko_error( &
+         'ROM rank control removed every forward or adjoint mode')
+    trial_modes = trial_use
+    adjoint_modes = adjoint_use
+    trial_basis = trial_basis(:,1:trial_modes)
+    adjoint_basis = adjoint_basis(:,1:adjoint_modes)
     if (fields == 4) then
-       trial_basis = trial_basis(:,1:trial_modes)
-       adjoint_basis = adjoint_basis(:,1:adjoint_modes)
        trial_scalar = trial_scalar(:,1:trial_modes)
        adjoint_scalar = adjoint_scalar(:,1:adjoint_modes)
+    end if
+
+    ! Build the full enriched space only for formulations that request it.
+    ! The concatenation is mass-orthonormalised as one coupled basis, so the
+    ! scalar component follows exactly the same mode rotations and rejection
+    ! decisions as the velocity component.
+    if (this%forward_enriched_adjoint .or. this%enriched_galerkin) then
+       enriched_input_modes = trial_modes + adjoint_modes
+       allocate(enriched_velocity(3*n,enriched_input_modes))
+       enriched_velocity(:,1:trial_modes) = trial_basis(1:3*n,:)
+       enriched_velocity(:,trial_modes+1:enriched_input_modes) = &
+            adjoint_basis(1:3*n,:)
+       if (fields == 4) then
+          allocate(enriched_scalar(n,enriched_input_modes))
+          enriched_scalar(:,1:trial_modes) = trial_scalar
+          enriched_scalar(:,trial_modes+1:enriched_input_modes) = adjoint_scalar
+          call rom_orthonormalize_projected_coupled_device(enriched_velocity, &
+               enriched_scalar, n, enriched_input_modes, mass, scalar_weight, &
+               tolerance, enriched_retained, adjoint_mode_index, adjoint_norms, &
+               adjoint_crosses, enriched_ok)
+       else
+          call rom_orthonormalize_projected_device(enriched_velocity, n, &
+               enriched_input_modes, mass, tolerance, enriched_retained, &
+               adjoint_mode_index, adjoint_norms, adjoint_crosses, enriched_ok)
+       end if
+       if (.not. enriched_ok .or. enriched_retained < 1) call neko_error( &
+            'ROM enriched basis lost every mode during mass orthonormalisation')
+       enriched_use = enriched_retained
+       if (enriched_cap > 0) enriched_use = min(enriched_cap, enriched_use)
+       if (enriched_use < 1) call neko_error( &
+            'rank_enriched removed every enriched mode')
     else
-       trial_basis = trial_basis(:,1:trial_modes)
-       adjoint_basis = adjoint_basis(:,1:adjoint_modes)
+       enriched_use = 0
     end if
 
     call this%basis%modes%free(); call this%test_basis%modes%free()
-    this%basis%n_rows = fields*n; this%basis%n_modes = trial_modes
+    if (this%enriched_galerkin) then
+       this%basis%n_rows = fields*n; this%basis%n_modes = enriched_use
+       this%test_basis%n_rows = fields*n; this%test_basis%n_modes = enriched_use
+    else if (this%forward_enriched_adjoint) then
+       this%basis%n_rows = fields*n; this%basis%n_modes = trial_modes
+       this%test_basis%n_rows = fields*n; this%test_basis%n_modes = enriched_use
+    else
+       this%basis%n_rows = fields*n; this%basis%n_modes = trial_modes
+       this%test_basis%n_rows = fields*n; this%test_basis%n_modes = adjoint_modes
+    end if
     this%basis%n_fields = fields
-    this%test_basis%n_rows = fields*n; this%test_basis%n_modes = adjoint_modes
     this%test_basis%n_fields = fields
-    call this%basis%modes%init(fields*n, trial_modes)
-    call this%test_basis%modes%init(fields*n, adjoint_modes)
+    call this%basis%modes%init(fields*n, this%basis%n_modes)
+    call this%test_basis%modes%init(fields*n, this%test_basis%n_modes)
     if (size(this%basis%modes%x,1) /= fields*n .or. &
          size(this%test_basis%modes%x,1) /= fields*n) call neko_error( &
          'forward_constrained_enriched output basis shape mismatch')
-    this%basis%modes%x = trial_basis
-    this%test_basis%modes%x = adjoint_basis
+    if (this%enriched_galerkin) then
+       this%basis%modes%x(1:3*n,:) = enriched_velocity(:,1:enriched_use)
+       this%test_basis%modes%x(1:3*n,:) = enriched_velocity(:,1:enriched_use)
+       if (fields == 4) then
+          this%basis%modes%x(3*n+1:4*n,:) = enriched_scalar(:,1:enriched_use)
+          this%test_basis%modes%x(3*n+1:4*n,:) = enriched_scalar(:,1:enriched_use)
+       end if
+    else if (this%forward_enriched_adjoint) then
+       this%basis%modes%x = trial_basis
+       this%test_basis%modes%x(1:3*n,:) = enriched_velocity(:,1:enriched_use)
+       if (fields == 4) this%test_basis%modes%x(3*n+1:4*n,:) = &
+            enriched_scalar(:,1:enriched_use)
+    else
+       this%basis%modes%x = trial_basis
+       this%test_basis%modes%x = adjoint_basis
+    end if
     this%has_scalar = fields == 4
-    this%enriched_adjoint_rank = adjoint_modes
+    this%rank_forward = trial_modes
+    this%rank_adjoint = adjoint_modes
+    this%rank_enriched = enriched_use
+    this%enriched_adjoint_rank = this%test_basis%n_modes
+    write(log_message, '("ROM basis selection: forward=",A,", adjoint=",A,", retained Vf/Va/VE=",I0,"/",I0,"/",I0)') &
+         trim(this%basis_forward), trim(this%basis_adjoint), this%rank_forward, &
+         this%rank_adjoint, this%rank_enriched
+    call neko_log%message(trim(log_message))
 
     deallocate(trial_basis, adjoint_basis, mass, trial_mode_index, adjoint_mode_index, &
          trial_norms, trial_crosses, adjoint_norms, adjoint_crosses)
     if (fields == 4) deallocate(trial_velocity, adjoint_velocity, trial_scalar, adjoint_scalar)
+    if (allocated(enriched_velocity)) deallocate(enriched_velocity)
+    if (allocated(enriched_scalar)) deallocate(enriched_scalar)
   end subroutine rom_problem_load_local_forward_constrained_basis
 
   !> Receive and independently prepare the forward trial and adjoint test
@@ -1835,6 +1914,9 @@ contains
     this%test_basis%n_rows = size(test_basis,1)
     this%test_basis%n_modes = test_modes
     this%test_basis%n_fields = test_fields
+    this%rank_forward = trial_modes
+    this%rank_adjoint = test_modes
+    this%rank_enriched = max(trial_modes, test_modes)
     call this%basis%modes%init(size(trial_basis,1), trial_modes)
     call this%test_basis%modes%init(size(test_basis,1), test_modes)
     this%basis%modes%x = trial_basis
@@ -1932,14 +2014,16 @@ contains
 
     call rom_problem_free_arrays(this)
     n = simulation%fluid%u%dof%size()
-    if (this%petrov_galerkin .and. this%test_basis%n_modes /= this%basis%n_modes) then
-       call neko_error('Petrov trial/test basis ranks differ')
+    if (this%enriched_galerkin) then
+       r = this%basis%n_modes
+    else
+       r = this%basis%n_modes
     end if
-    r = min(this%rank_total_max, this%basis%n_modes)
-    if (this%petrov_galerkin) r = min(r, this%test_basis%n_modes)
     e = r
-    if (this%forward_constrained_enriched) e = min(this%rank_total_max, &
-         this%test_basis%n_modes)
+    if (this%separate_pod) e = this%test_basis%n_modes
+    if (this%forward_enriched_adjoint .or. this%enriched_galerkin) then
+       e = this%test_basis%n_modes
+    end if
     if (r < 1) call neko_error('ROM basis contains no retained trial/test modes')
     call this%weights%init(n)
     if (NEKO_BCKND_DEVICE .eq. 1) then
@@ -2869,11 +2953,32 @@ contains
     class(design_t), intent(inout) :: design
     type(simulation_t), intent(inout) :: simulation
     integer, intent(in) :: iter
-    character(len=1024) :: output_path
-    character(len=80) :: suffix
+    character(len=1024) :: trajectory_path
     integer :: n_output_fields
     call rom_problem_free_outputs(this)
-    call filename_path(simulation%output_forward%file_%get_base_fname(), output_path)
+    ! ROM outputs are deliberately independent of Neko's generic field-output
+    ! directory.  Every basis/optimization design gets a permanent outer
+    ! directory.  The field_output_t streams below stay open for the whole
+    ! outer iteration, so Neko supplies the normal f00000, f00001, ...
+    ! counters for successive inner samples.
+    this%rom_output_root = 'rom_output'
+    write(trajectory_path, '("",A,"/outer_",I3.3)') &
+         trim(this%rom_output_root), iter
+    this%rom_outer_directory = trim(trajectory_path)
+    call mkdir(trim(this%rom_output_root))
+    call mkdir(trim(this%rom_outer_directory))
+    this%output_outer_iteration = iter
+    this%output_inner_iteration = -1
+    this%rom_inner_directory = ''
+
+    ! The reduced system export is tied to the basis and design of this outer
+    ! iteration.  The configured root name remains a compatibility setting,
+    ! while each permanent copy is stored below the outer directory.
+    if (this%export_reduced_system) then
+       this%reduced_system_export_directory = trim(this%rom_outer_directory)// &
+            '/reduced_system'
+    end if
+
     call this%rom_velocity(1)%init(simulation%fluid%u%dof, 'ROM_u')
     call this%rom_velocity(2)%init(simulation%fluid%v%dof, 'ROM_v')
     call this%rom_velocity(3)%init(simulation%fluid%w%dof, 'ROM_w')
@@ -2883,6 +2988,30 @@ contains
             'ROM_scalar')
        n_output_fields = 4
     end if
+    ! Keep one standard Neko fld output stream per field family for the
+    ! complete outer iteration.  Each sample advances Neko's normal fld
+    ! counter, producing e.g.
+    !   outer_000/forward_fields0.f00000
+    !   outer_000/forward_fields0.f00001
+    ! without inventing an inner-iteration directory or filename scheme.
+    call this%rom_forward_output%init('forward_fields', n_output_fields, &
+         precision=sp, path=trim(this%rom_outer_directory)//'/', format='fld')
+    call this%rom_forward_output%fields%assign(1, this%rom_velocity(1)%field)
+    call this%rom_forward_output%fields%assign(2, this%rom_velocity(2)%field)
+    call this%rom_forward_output%fields%assign(3, this%rom_velocity(3)%field)
+    if (this%has_scalar) call this%rom_forward_output%fields%assign(4, &
+         this%rom_scalar%field)
+    call this%rom_design_output%init('design', 1, precision=sp, &
+         path=trim(this%rom_outer_directory)//'/', format='fld')
+    call this%rom_sensitivity_output%init('sensitivity', 1, precision=sp, &
+         path=trim(this%rom_outer_directory)//'/', format='fld')
+    select type (des => design)
+    type is (brinkman_design_t)
+       call des%configure_rom_outputs(this%rom_design_output, &
+            this%rom_sensitivity_output)
+    class default
+       call neko_error('rom_mma requires a Brinkman design')
+    end select
     if (this%write_trajectory_fields) then
        call this%rom_adjoint_velocity(1)%init(simulation%fluid%u%dof, 'ROM_adj_u')
        call this%rom_adjoint_velocity(2)%init(simulation%fluid%v%dof, 'ROM_adj_v')
@@ -2890,24 +3019,13 @@ contains
        if (this%has_scalar) call this%rom_adjoint_scalar%init( &
             simulation%scalars%scalar_fields(1)%scalar%s%dof, 'ROM_adj_scalar')
     end if
-    write(suffix, '(i0)') iter
-    call this%rom_forward_output%init('ROM_forward_fields_iter_'//trim(suffix), &
-         n_output_fields, &
-         precision=sp, path=trim(output_path), format='fld')
-    call this%rom_forward_output%fields%assign(1, this%rom_velocity(1)%field)
-    call this%rom_forward_output%fields%assign(2, this%rom_velocity(2)%field)
-    call this%rom_forward_output%fields%assign(3, this%rom_velocity(3)%field)
-    if (this%has_scalar) call this%rom_forward_output%fields%assign(4, &
-         this%rom_scalar%field)
-    call this%rom_design_output%init('ROM_design_iter_'//trim(suffix), 1, &
-         precision=sp, path=trim(output_path), format='fld')
-    call this%rom_sensitivity_output%init('ROM_sensitivity_iter_'//trim(suffix), 1, &
-         precision=sp, path=trim(output_path), format='fld')
     if (this%write_trajectory_fields) then
+       trajectory_path = trim(this%rom_outer_directory)//'/trajectory/'
+       call mkdir(trim(trajectory_path))
        call this%rom_forward_trajectory_output%init( &
-            'ROM_forward_trajectory_iter_'//trim(suffix), n_output_fields, &
+            'forward_trajectory', n_output_fields, &
             precision=sp, &
-            path=trim(output_path), format='fld')
+            path=trim(trajectory_path), format='fld')
        call this%rom_forward_trajectory_output%fields%assign(1, &
             this%rom_velocity(1)%field)
        call this%rom_forward_trajectory_output%fields%assign(2, &
@@ -2917,9 +3035,9 @@ contains
        if (this%has_scalar) call this%rom_forward_trajectory_output%fields%assign(4, &
             this%rom_scalar%field)
        call this%rom_adjoint_trajectory_output%init( &
-            'ROM_adjoint_trajectory_iter_'//trim(suffix), n_output_fields, &
+            'adjoint_trajectory', n_output_fields, &
             precision=sp, &
-            path=trim(output_path), format='fld')
+            path=trim(trajectory_path), format='fld')
        call this%rom_adjoint_trajectory_output%fields%assign(1, &
             this%rom_adjoint_velocity(1)%field)
        call this%rom_adjoint_trajectory_output%fields%assign(2, &
@@ -2929,14 +3047,64 @@ contains
        if (this%has_scalar) call this%rom_adjoint_trajectory_output%fields%assign(4, &
             this%rom_adjoint_scalar%field)
     end if
-    select type (des => design)
-    type is (brinkman_design_t)
-       call des%configure_rom_outputs(this%rom_design_output, this%rom_sensitivity_output)
-    class default
-       call neko_error('rom_mma requires a Brinkman design')
-    end select
     this%rom_outputs_initialized = .true.
+    call rom_problem_write_outer_metadata(this)
   end subroutine rom_problem_initialize_outputs
+
+  !> Select the current inner sample of the outer field-output streams.
+  !! @param[inout] this ROM problem owning the outer output directory.
+  !! @param[inout] design Design object used to attach design/sensitivity fields.
+  !! @param[in] inner ROM candidate index, with zero reserved for the reference.
+  subroutine rom_problem_prepare_inner_outputs(this, design, inner)
+    class(rom_problem_t), intent(inout) :: this
+    class(design_t), intent(inout) :: design
+    integer, intent(in) :: inner
+    if (.not. this%rom_outputs_initialized) return
+    ! The field_output_t streams are initialized once per outer iteration and
+    ! use Neko's standard counter to distinguish inner samples.  Keep the
+    ! outer directory as the CSV destination as well; no inner directory is
+    ! created.
+    this%rom_inner_directory = trim(this%rom_outer_directory)//'/'
+    this%output_inner_iteration = inner
+  end subroutine rom_problem_prepare_inner_outputs
+
+  !> Write immutable Fortran-side provenance for one ROM outer iteration.
+  !! Python writes the complementary basis_metadata.json after the streamed
+  !! POD blocks have been assembled.
+  subroutine rom_problem_write_outer_metadata(this)
+    class(rom_problem_t), intent(in) :: this
+    integer :: unit, ios
+    character(len=1024) :: filename
+
+    if (pe_rank /= 0 .or. .not. allocated(this%rom_outer_directory)) return
+    filename = trim(this%rom_outer_directory)//'/rom_metadata.json'
+    open(newunit=unit, file=trim(filename), status='replace', action='write', &
+         iostat=ios)
+    if (ios /= 0) call neko_error('could not open ROM outer metadata')
+    write(unit, '(A)') '{'
+    write(unit, '(A,I0,A)') '  "outer_iteration": ', &
+         this%output_outer_iteration, ','
+    write(unit, '(A,A,A)') '  "basis_forward": "', trim(this%basis_forward), '",'
+    write(unit, '(A,A,A)') '  "basis_adjoint": "', trim(this%basis_adjoint), '",'
+    write(unit, '(A,A,A)') '  "formulation": "', trim(this%formulation), '",'
+    write(unit, '(A,A,A)') '  "sensitivity_source": "', &
+         trim(this%sensitivity_source), '",'
+    write(unit, '(A,I0,A)') '  "forward_retained_rank": ', this%rank_forward, ','
+    write(unit, '(A,I0,A)') '  "adjoint_retained_rank": ', this%rank_adjoint, ','
+    write(unit, '(A,I0,A)') '  "enriched_retained_rank": ', this%rank_enriched, ','
+    write(unit, '(A,I0,A)') '  "history_outer_iterations": ', &
+         this%history_outer_iterations, ','
+    write(unit, '(A,ES24.16,A)') '  "time_start": ', this%time_start, ','
+    write(unit, '(A,ES24.16,A)') '  "time_end": ', this%time_end, ','
+    write(unit, '(A,ES24.16,A)') '  "dt": ', this%dt, ','
+    write(unit, '(A,I0,A)') '  "n_steps": ', this%n_steps, ','
+    write(unit, '(A,I0,A)') '  "substeps": ', this%substeps, ','
+    write(unit, '(A)') '  "source_revision": "not_available_in_fortran",'
+    write(unit, '(A)') '  "output_layout": "outer_NNN with standard fld counters and flat inner-indexed CSV files",'
+    write(unit, '(A)') '  "latest_aliases": "root-level aliases are optional and explicit"'
+    write(unit, '(A)') '}'
+    close(unit)
+  end subroutine rom_problem_write_outer_metadata
 
   !> Write the reduced forward field at the initial MMA output sample.
   !!
@@ -2956,10 +3124,18 @@ contains
     real(kind=rp), intent(in) :: state(:)
 
     if (.not. this%rom_outputs_initialized) return
-
+    ! This entry point is retained for callers that only have the initial
+    ! forward state.  The complete candidate lifecycle is written by
+    ! rom_problem_write_outputs below.
     call rom_problem_reconstruct_velocity(this, state, this%rom_velocity, .true.)
     if (this%has_scalar) call rom_problem_reconstruct_scalar(this, state, &
          this%rom_scalar, .true.)
+    if (this%output_inner_iteration /= inner) then
+       ! A design is required only for the complete output path.  The
+       ! initial-forward compatibility path therefore uses the already
+       ! initialised stream when available.
+       if (this%output_inner_iteration < 0) return
+    end if
     call this%rom_forward_output%sample(real(inner, kind=dp))
   end subroutine rom_problem_write_forward_output
 
@@ -2974,6 +3150,7 @@ contains
     integer :: state_index, reconstruction_index
     integer :: n, r, c, i
     if (.not. this%rom_outputs_initialized) return
+    call rom_problem_prepare_inner_outputs(this, design, inner)
     n = simulation%fluid%u%dof%size(); r = size(state)
     call neko_scratch_registry%request_vector(state_vector, state_index, r, .true.)
     state_vector%x = state
@@ -3009,13 +3186,15 @@ contains
     class(rom_problem_t), intent(in) :: this
     integer, intent(in) :: inner
     integer :: unit, step, mode, r, ra
-    character(len=64) :: suffix
-    character(len=32) :: mode_name
+    character(len=128) :: mode_name
 
+    ! The reduced trajectory is replicated on all ranks, but this is one
+    ! shared CSV per candidate.  Restrict the write to Neko's root rank.
+    if (pe_rank /= 0 .or. .not. allocated(this%rom_inner_directory)) return
     r = this%states%get_nrows()
     ra = this%adjoint%get_nrows()
-    write(suffix, '(I0)') inner
-    open(newunit=unit, file='ROM_forward_coefficients_iter_'//trim(suffix)//'.csv', &
+    write(mode_name, '("forward_coefficients_inner_",I3.3,".csv")') inner
+    open(newunit=unit, file=trim(this%rom_inner_directory)//trim(mode_name), &
          status='replace', action='write')
     write(unit, '(A)', advance='no') 'step,time'
     do mode = 1, r
@@ -3034,7 +3213,8 @@ contains
     close(unit)
 
     if (.not. this%backward_ready) return
-    open(newunit=unit, file='ROM_adjoint_coefficients_iter_'//trim(suffix)//'.csv', &
+    write(mode_name, '("adjoint_coefficients_inner_",I3.3,".csv")') inner
+    open(newunit=unit, file=trim(this%rom_inner_directory)//trim(mode_name), &
          status='replace', action='write')
     write(unit, '(A)', advance='no') 'step,time'
     do mode = 1, ra
@@ -3052,6 +3232,50 @@ contains
     end do
     close(unit)
   end subroutine rom_problem_write_coefficients
+
+  !> Write the scalar ROM diagnostics for one candidate design.
+  !! @param[in] outer Outer optimization index.
+  !! @param[in] inner Inner candidate index, zero for the reference design.
+  !! @param[in] objective Weighted ROM objective.
+  !! @param[in] constraint ROM constraint value.
+  !! @param[in] rom_forward_seconds Forward wall time.
+  !! @param[in] rom_adjoint_seconds Adjoint/sensitivity wall time.
+  !! @param[in] mma_seconds MMA wall time.
+  subroutine rom_problem_write_inner_diagnostics(this, outer, inner, objective, &
+       constraint, rom_forward_seconds, rom_adjoint_seconds, mma_seconds)
+    class(rom_problem_t), intent(in) :: this
+    integer, intent(in) :: outer, inner
+    real(kind=rp), intent(in) :: objective, constraint
+    real(kind=rp), intent(in) :: rom_forward_seconds, rom_adjoint_seconds
+    real(kind=rp), intent(in) :: mma_seconds
+    integer :: unit, ios
+    character(len=1024) :: filename
+    character(len=128) :: diagnostics_file, design_file
+    character(len=128) :: forward_file, adjoint_coeff_file
+
+    if (pe_rank /= 0 .or. .not. allocated(this%rom_inner_directory)) return
+    write(diagnostics_file, '("objective_diagnostics_inner_",I3.3,".csv")') inner
+    filename = trim(this%rom_inner_directory)//trim(diagnostics_file)
+    open(newunit=unit, file=trim(filename), status='replace', action='write', &
+         iostat=ios)
+    if (ios /= 0) call neko_error('could not open ROM objective diagnostics')
+    write(design_file, '("design0.f",I5.5)') inner
+    write(forward_file, '("forward_coefficients_inner_",I3.3,".csv")') inner
+    write(adjoint_coeff_file, '("adjoint_coefficients_inner_",I3.3,".csv")') inner
+    write(unit, '(A)') 'outer_iteration,inner_iteration,objective,'// &
+         'scalar_mixing,viscous_dissipation,brinkman_dissipation,'// &
+         'volume_constraint,rom_forward_seconds,rom_adjoint_seconds,'// &
+         'mma_seconds,sensitivity_source,design_file,'// &
+         'forward_coefficients,adjoint_coefficients,update_status'
+    write(unit, '(I0,",",I0,8(",",ES24.16),",",A,",",A,",",A,",",A,",",A)') &
+         outer, inner, &
+         objective, this%scalar_mixing_value, this%viscous_value, &
+         this%brinkman_value, constraint, rom_forward_seconds, &
+         rom_adjoint_seconds, mma_seconds, trim(this%sensitivity_source), &
+         trim(design_file), trim(forward_file), trim(adjoint_coeff_file), &
+         'accepted'
+    close(unit)
+  end subroutine rom_problem_write_inner_diagnostics
 
   !> Reconstruct a three-component physical velocity from ROM coefficients.
   !! @param this ROM problem containing the common basis and lift.
@@ -3211,6 +3435,11 @@ contains
        call this%rom_adjoint_velocity(i)%free()
     end do
     call this%rom_scalar%free(); call this%rom_adjoint_scalar%free()
+    if (allocated(this%rom_inner_directory)) deallocate(this%rom_inner_directory)
+    if (allocated(this%rom_outer_directory)) deallocate(this%rom_outer_directory)
+    if (allocated(this%rom_output_root)) deallocate(this%rom_output_root)
+    this%output_outer_iteration = -1
+    this%output_inner_iteration = -1
     this%rom_outputs_initialized = .false.
   end subroutine rom_problem_free_outputs
 

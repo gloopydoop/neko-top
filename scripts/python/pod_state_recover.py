@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import json
+import subprocess
 from dataclasses import replace
 
 import numpy as np
@@ -49,9 +50,163 @@ from statistical_closure import fit_boussinesq_nut, fit_scalar_gammat
 from recycled_pod_tools import (
     append_factor_history,
     common_basis_distributed,
+    cross_mass_singular_values,
     factors_from_pod,
     recycle_distributed,
 )
+
+
+def source_revision() -> str:
+    """Return the repository revision used by this POD peer, if available."""
+
+    try:
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        revision = result.stdout.strip()
+        dirty = subprocess.run(
+            ["git", "diff", "--quiet"], cwd=root, check=False
+        ).returncode != 0 or bool(subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=root, check=True, capture_output=True, text=True,
+        ).stdout.strip())
+        return revision + ("-dirty" if dirty else "")
+    except (OSError, subprocess.SubprocessError):
+        return os.environ.get("ROM_SOURCE_REVISION", "unknown")
+
+
+ROM_OUTPUT_ROOT = "rom_output"
+
+
+def outer_output_directory(outer: int) -> str:
+    """Return the permanent POD output directory for one ROM outer index."""
+
+    return os.path.join(ROM_OUTPUT_ROOT, f"outer_{outer:03d}")
+
+
+def prepare_outer_output_directory(comm: MPI.Comm, outer: int) -> str:
+    """Create one shared outer directory from the Python root rank."""
+
+    path = outer_output_directory(outer)
+    if comm.Get_rank() == 0:
+        os.makedirs(path, exist_ok=True)
+    comm.Barrier()
+    return path
+
+
+def update_latest_alias(comm: MPI.Comm, target: str, alias: str) -> None:
+    """Maintain an explicit root-level symlink to the newest permanent file."""
+
+    if comm.Get_rank() == 0:
+        if os.path.lexists(alias):
+            os.unlink(alias)
+        relative_target = os.path.relpath(target, os.path.dirname(alias) or ".")
+        os.symlink(relative_target, alias)
+    comm.Barrier()
+
+
+def write_basis_metadata(
+    comm: MPI.Comm,
+    outer: int,
+    outer_dir: str,
+    cfg: PODConfig,
+    history_length: int,
+    forward_history: list,
+    adjoint_history: list,
+    forward_candidate_modes: int,
+    adjoint_candidate_modes: int,
+    forward_rank: int,
+    adjoint_rank: int,
+    overlap_singular_values: np.ndarray | None,
+    adjoint_enrichment: bool,
+) -> None:
+    """Write one explicit provenance manifest for a streamed ROM basis."""
+
+    metadata = {
+        "outer_iteration": outer,
+        "basis_forward": cfg.basis_forward,
+        "basis_adjoint": cfg.basis_adjoint,
+        "formulation": cfg.formulation,
+        "sensitivity_source": cfg.sensitivity_source,
+        "history_outer_iterations_requested": cfg.history_outer_iterations,
+        "history_outer_iterations_included": history_length,
+        "forward_history_iterations": [
+            int(item.iteration) for item in forward_history
+        ],
+        "adjoint_history_iterations": [
+            int(item.iteration) for item in adjoint_history
+        ],
+        "forward_candidate_modes": int(forward_candidate_modes),
+        "adjoint_candidate_modes": int(adjoint_candidate_modes),
+        "forward_retained_rank": int(forward_rank),
+        "adjoint_retained_rank": int(adjoint_rank),
+        "adjoint_enrichment": bool(adjoint_enrichment),
+        "forward_pod_files": {
+            "time_coefficients": "forward_pod_coefficients.csv",
+            "singular_values": "forward_pod_singular_values.csv",
+            "modes": "forward_pod_modes",
+        },
+        "forward_pod_contributors": [
+            {
+                "pod_iteration": int(item.iteration),
+                "outer_iteration": int(item.iteration),
+                "modes": os.path.join(
+                    "..",
+                    f"outer_{int(item.iteration):03d}",
+                    "forward_pod_modes",
+                ),
+                "singular_values": os.path.join(
+                    "..",
+                    f"outer_{int(item.iteration):03d}",
+                    "forward_pod_singular_values.csv",
+                ),
+            }
+            for item in forward_history
+        ],
+        "adjoint_pod_files": (
+            {
+                "time_coefficients": "adjoint_pod_coefficients.csv",
+                "singular_values": "adjoint_pod_singular_values.csv",
+                "modes": "adjoint_pod_modes",
+            }
+            if adjoint_history
+            else None
+        ),
+        "adjoint_pod_contributors": [
+            {
+                "pod_iteration": int(item.iteration),
+                "outer_iteration": int(item.iteration),
+                "modes": os.path.join(
+                    "..",
+                    f"outer_{int(item.iteration):03d}",
+                    "adjoint_pod_modes",
+                ),
+                "singular_values": os.path.join(
+                    "..",
+                    f"outer_{int(item.iteration):03d}",
+                    "adjoint_pod_singular_values.csv",
+                ),
+            }
+            for item in adjoint_history
+        ],
+        "source_revision": source_revision() if comm.Get_rank() == 0 else "",
+        "output_layout": "outer_NNN with standard fld counters and flat inner-indexed ROM CSV files",
+        "paths_relative_to": "this basis_metadata.json",
+    }
+    if overlap_singular_values is not None:
+        metadata["forward_adjoint_mass_overlap_singular_values"] = (
+            np.asarray(overlap_singular_values, dtype=np.float64).tolist()
+        )
+    path = os.path.join(outer_dir, "basis_metadata.json")
+    if comm.Get_rank() == 0:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+    update_latest_alias(comm, path, "basis_metadata.json")
 
 
 def stream_rom_basis(comm, ds, ctrl, common_basis, bm, cfg) -> None:
@@ -158,6 +313,7 @@ def build_forward_only_basis(
     ioh: IoHelp,
     pod_iteration: int,
     forward_history: list,
+    outer_dir: str,
 ) -> None:
     """Recycle and stream a forward-only common velocity/scalar basis.
 
@@ -170,7 +326,7 @@ def build_forward_only_basis(
     append_factor_history(
         forward_history,
         factors_from_pod(
-            pod, ioh, bm, cfg.n_input_fields, pod_iteration - 1,
+            pod, ioh, bm, cfg.n_input_fields, pod_iteration,
             cfg.scalar_metric_weight,
         ),
         cfg.history_outer_iterations,
@@ -180,32 +336,71 @@ def build_forward_only_basis(
         weight * np.asarray(bm, dtype=np.float64).reshape(-1)
         for weight in local_field_weights
     ])
+    rank_cap = cfg.legacy_rank_forward if cfg.legacy_rank_forward > 0 else None
     recycled_forward = recycle_distributed(
-        comm, forward_history, local_mass, cfg.rank_forward
+        comm, forward_history, local_mass, rank_cap
     )
     common_basis, basis_diag = common_basis_distributed(
         comm,
         recycled_forward,
         None,
         local_mass,
-        cfg.rank_total_max,
+        rank_cap,
         adjoint_projector=make_admissibility_projector(mesh, bm, cfg),
     )
-    stream_rom_basis(comm, ds, ctrl, common_basis, bm, cfg)
     if comm.Get_rank() == 0:
-        with open("recycled_rom_history.json", "w", encoding="utf-8") as handle:
+        print(
+            f"Forward basis: {cfg.basis_forward}\n"
+            f"Adjoint basis: {cfg.basis_adjoint}\n"
+            f"POD history requested: {cfg.history_outer_iterations}\n"
+            f"POD history available: {len(forward_history)}\n"
+            f"Forward candidate modes: {sum(item.modes.shape[1] for item in forward_history)}\n"
+            "Adjoint candidate modes: 0\n"
+            f"Forward streamed rank: {common_basis.modes.shape[1]}",
+            flush=True,
+        )
+    stream_rom_basis(comm, ds, ctrl, common_basis, bm, cfg)
+    history_path = os.path.join(outer_dir, "recycled_rom_history.json")
+    if comm.Get_rank() == 0:
+        with open(history_path, "w", encoding="utf-8") as handle:
             json.dump(
                 {
                     "history_outer_iterations": cfg.history_outer_iterations,
+                    "history_requested": cfg.history_outer_iterations,
+                    "history_available": len(forward_history),
                     "forward_iterations": [item.iteration for item in forward_history],
                     "adjoint_iterations": [],
+                    "forward_candidate_modes": int(sum(item.modes.shape[1] for item in forward_history)),
+                    "adjoint_candidate_modes": 0,
                     "basis_rank": int(common_basis.modes.shape[1]),
                     "mass_gram_error": basis_diag["mass_gram_error"],
                     "adjoint_enrichment": False,
+                    "basis_forward": cfg.basis_forward,
+                    "basis_adjoint": cfg.basis_adjoint,
+                    "formulation": cfg.formulation,
+                    "sensitivity_source": cfg.sensitivity_source,
+                    "streamed_forward_rank": int(common_basis.modes.shape[1]),
+                    "source_revision": source_revision(),
                 },
                 handle,
                 indent=2,
             )
+    update_latest_alias(comm, history_path, "recycled_rom_history.json")
+    write_basis_metadata(
+        comm,
+        pod_iteration,
+        outer_dir,
+        cfg,
+        len(forward_history),
+        forward_history,
+        [],
+        sum(item.modes.shape[1] for item in forward_history),
+        0,
+        int(common_basis.modes.shape[1]),
+        0,
+        None,
+        False,
+    )
 
 
 def main() -> None:
@@ -257,7 +452,7 @@ def main() -> None:
         cfg,
         closure_enabled=False,
         scalar_closure="off",
-        keep_modes=cfg.rank_adjoint or cfg.keep_modes,
+        keep_modes=cfg.keep_modes,
         mode_output_file_name=cfg.adjoint_mode_output_file_name,
     )
     forward_history = []
@@ -295,6 +490,14 @@ def main() -> None:
                 continue
 
             if mode == MODE_FORWARD and phase == PHASE_FWD_DONE:
+                # Reserve the permanent outer directory before writing any
+                # window/closure diagnostics.  These diagnostics belong to
+                # the POD basis produced by this forward lifecycle, not to a
+                # moving root-level "latest" file.
+                outer_iteration = pod_iteration
+                outer_dir = prepare_outer_output_directory(
+                    comm, outer_iteration
+                )
                 if window_stats is not None:
                     windows = window_stats.finish()
                     if not windows:
@@ -303,7 +506,13 @@ def main() -> None:
                             "check statistics_start_time, window_duration and run length"
                         )
                     if rank == 0:
-                        with open("window_statistics_manifest.json", "w", encoding="utf-8") as handle:
+                        with open(
+                            os.path.join(
+                                outer_dir, "window_statistics_manifest.json"
+                            ),
+                            "w",
+                            encoding="utf-8",
+                        ) as handle:
                             json.dump(
                                 {
                                     "input_mode": cfg.input_mode,
@@ -331,7 +540,13 @@ def main() -> None:
                                 handle,
                                 indent=2,
                             )
-                        with open("window_statistics_diagnostics.csv", "w", encoding="utf-8") as handle:
+                        with open(
+                            os.path.join(
+                                outer_dir, "window_statistics_diagnostics.csv"
+                            ),
+                            "w",
+                            encoding="utf-8",
+                        ) as handle:
                             handle.write("window,center,samples,weight,mean_k_local_sum\n")
                             for idx, item in enumerate(windows):
                                 reynolds = item["reynolds"]
@@ -407,7 +622,11 @@ def main() -> None:
                             flush=True,
                         )
                     if rank == 0 and closure_rows:
-                        with open("closure_diagnostics.csv", "w", encoding="utf-8") as handle:
+                        with open(
+                            os.path.join(outer_dir, "closure_diagnostics.csv"),
+                            "w",
+                            encoding="utf-8",
+                        ) as handle:
                             handle.write(
                                 "center,valid_fraction,negative_fraction_raw,"
                                 "clipped_fraction,mean_fit_relative_residual,max_nut\n"
@@ -421,7 +640,13 @@ def main() -> None:
                                     f"{diag['max_nut']:.16e}\n"
                                 )
                     if rank == 0 and scalar_closure_rows:
-                        with open("scalar_closure_diagnostics.csv", "w", encoding="utf-8") as handle:
+                        with open(
+                            os.path.join(
+                                outer_dir, "scalar_closure_diagnostics.csv"
+                            ),
+                            "w",
+                            encoding="utf-8",
+                        ) as handle:
                             handle.write(
                                 "center,valid_fraction,negative_fraction_raw,"
                                 "clipped_fraction,mean_fit_relative_residual,max_gammat\n"
@@ -441,16 +666,31 @@ def main() -> None:
                 coeffs, header, n_avail = build_time_coefficients(
                     comm, pod, cfg, times
                 )
-                write_time_coefficients(
-                    comm, coeffs, header, cfg.write_modes
+                forward_output_cfg = replace(
+                    cfg,
+                    mode_output_file_name=os.path.join(
+                        outer_dir, "forward_pod_modes"
+                    ),
                 )
-                pod_iteration += 1
+                write_time_coefficients(
+                    comm,
+                    coeffs,
+                    header,
+                    file_name=os.path.join(
+                        outer_dir, "forward_pod_coefficients.csv"
+                    ),
+                    latest_alias="pod_time_coeffs.csv",
+                )
+                pod_iteration = outer_iteration
                 write_singular_values(
                     comm,
                     pod,
                     cfg.keep_modes,
                     pod_iteration,
-                    singular_value_history_new,
+                    file_name=os.path.join(
+                        outer_dir, "forward_pod_singular_values.csv"
+                    ),
+                    latest_alias="pod_singular_values.csv",
                 )
                 singular_value_history_new = False
                 if rank == 0:
@@ -463,56 +703,65 @@ def main() -> None:
                     mesh,
                     ioh,
                     pod,
-                    cfg,
+                    forward_output_cfg,
                     zero_field,
                     n_avail,
-                    mode_output_index,
+                    0,
                 )
-                if cfg.stream_adjoint:
+                if cfg.basis_adjoint != "forward":
                     adjoint_pod, adjoint_ioh = make_pod(comm, bm, adjoint_cfg)
                     adjoint_times = []
                     adjoint_energy = EnergyState()
                 continue
 
             if mode == MODE_ADJOINT and phase == PHASE_ADJ_SNAPSHOT:
-                if not cfg.stream_adjoint:
-                    raise RuntimeError(
-                        "Neko streamed an adjoint snapshot but stream_adjoint is disabled"
-                    )
                 fields = recv_fields(ds, cfg.n_input_fields, cfg.dtype)
-                add_snapshot(
-                    comm, adjoint_pod, adjoint_ioh, bm, fields, tcur,
-                    adjoint_times, adjoint_energy
-                )
+                if cfg.basis_adjoint != "forward":
+                    add_snapshot(
+                        comm, adjoint_pod, adjoint_ioh, bm, fields, tcur,
+                        adjoint_times, adjoint_energy
+                    )
                 continue
 
             if mode == MODE_ADJOINT and phase == PHASE_ADJ_DONE:
-                if not cfg.stream_adjoint:
+                if cfg.basis_adjoint == "forward":
                     build_forward_only_basis(
                         comm, ds, ctrl, mesh, bm, cfg, pod, ioh,
                         pod_iteration, forward_history,
+                        outer_output_directory(pod_iteration),
                     )
-                if cfg.stream_adjoint and adjoint_pod is not None:
+                if cfg.basis_adjoint != "forward" and adjoint_pod is not None:
                     flush_buffer(comm, adjoint_pod, adjoint_ioh)
                     adjoint_pod.scale_modes(comm, bm1sqrt=adjoint_ioh.bm1sqrt, op="div")
                     adjoint_pod.rotate_local_modes_to_global(comm)
                     adjoint_coeffs, adjoint_header, _ = build_time_coefficients(
                         comm, adjoint_pod, adjoint_cfg, adjoint_times
                     )
+                    outer_dir = outer_output_directory(pod_iteration)
+                    adjoint_output_cfg = replace(
+                        adjoint_cfg,
+                        mode_output_file_name=os.path.join(
+                            outer_dir, "adjoint_pod_modes"
+                        ),
+                    )
                     write_time_coefficients(
                         comm,
                         adjoint_coeffs,
                         adjoint_header,
-                        rotate_existing=adjoint_mode_output_index > 0,
-                        file_name="adjoint_pod_time_coeffs.csv",
+                        file_name=os.path.join(
+                            outer_dir, "adjoint_pod_coefficients.csv"
+                        ),
+                        latest_alias="adjoint_pod_time_coeffs.csv",
                     )
                     write_singular_values(
                         comm,
                         adjoint_pod,
                         adjoint_cfg.keep_modes,
                         pod_iteration,
-                        rotate_existing=adjoint_mode_output_index > 0,
-                        file_name="adjoint_pod_singular_values.csv",
+                        file_name=os.path.join(
+                            outer_dir, "adjoint_pod_singular_values.csv"
+                        ),
+                        latest_alias="adjoint_pod_singular_values.csv",
                     )
                     if rank == 0:
                         print(
@@ -525,10 +774,10 @@ def main() -> None:
                         mesh,
                         adjoint_ioh,
                         adjoint_pod,
-                        adjoint_cfg,
+                        adjoint_output_cfg,
                         zero_field,
                         available_modes(adjoint_pod, adjoint_cfg.keep_modes),
-                        adjoint_mode_output_index,
+                        0,
                     )
                     # Keep compact factor metadata for the next three
                     # outer iterations.  The local pySEMTools mode block is
@@ -539,7 +788,7 @@ def main() -> None:
                     append_factor_history(
                         forward_history,
                         factors_from_pod(
-                            pod, ioh, bm, cfg.n_input_fields, pod_iteration - 1,
+                        pod, ioh, bm, cfg.n_input_fields, pod_iteration,
                             cfg.scalar_metric_weight,
                         ),
                         cfg.history_outer_iterations,
@@ -548,130 +797,125 @@ def main() -> None:
                         adjoint_history,
                         factors_from_pod(
                             adjoint_pod, adjoint_ioh, bm,
-                            adjoint_cfg.n_fields, pod_iteration - 1,
+                            adjoint_cfg.n_fields, pod_iteration,
                             cfg.scalar_metric_weight,
                         ),
                         cfg.history_outer_iterations,
                     )
-                    history_length = cfg.history_outer_iterations
+                    history_length = min(len(forward_history), len(adjoint_history))
+                    forward_candidate_modes = int(sum(
+                        item.modes.shape[1] for item in forward_history
+                    ))
+                    adjoint_candidate_modes = int(sum(
+                        item.modes.shape[1] for item in adjoint_history
+                    ))
                     local_field_weights = cfg.field_metric_weights[:cfg.n_input_fields]
                     local_mass = np.concatenate([
                         weight * np.asarray(bm, dtype=np.float64).reshape(-1)
                         for weight in local_field_weights
                     ])
-                    if cfg.formulation == "petrov_galerkin":
-                        # Recycle the two spaces independently.  In
-                        # particular, do not call common_basis_distributed:
-                        # its forward Gram projection would construct an
-                        # orthogonal complement instead of an adjoint test
-                        # space.
-                        available_rank = min(
-                            recycled_rank for recycled_rank in (
-                                sum(item.modes.shape[1] for item in forward_history),
-                                sum(item.modes.shape[1] for item in adjoint_history),
-                            )
-                        )
-                        petrov_rank = cfg.rank_total_max or available_rank
-                        recycled_forward = recycle_distributed(
-                            comm, forward_history, local_mass, petrov_rank
-                        )
-                        recycled_adjoint = recycle_distributed(
-                            comm, adjoint_history, local_mass, petrov_rank
-                        )
-                        # The two independently recycled spaces can have
-                        # different numerical ranks (especially during the
-                        # first short history).  Petrov assembly requires
-                        # equal trial/test dimensions, so retain the common
-                        # leading singular subspace instead of aborting the
-                        # entire forward/adjoint lifecycle.  This is a
-                        # rank-selection operation, not a projection of the
-                        # adjoint space into the trial space.
-                        common_rank = min(
-                            recycled_forward.modes.shape[1],
-                            recycled_adjoint.modes.shape[1],
-                        )
-                        if common_rank < 1:
-                            raise RuntimeError(
-                                "independent Petrov recycling produced no common rank"
-                            )
-                        if recycled_forward.modes.shape[1] != common_rank:
-                            recycled_forward = type(recycled_forward)(
-                                recycled_forward.modes[:, :common_rank].copy(),
-                                recycled_forward.singular_values[:common_rank].copy(),
-                                recycled_forward.iteration,
-                            )
-                        if recycled_adjoint.modes.shape[1] != common_rank:
-                            recycled_adjoint = type(recycled_adjoint)(
-                                recycled_adjoint.modes[:, :common_rank].copy(),
-                                recycled_adjoint.singular_values[:common_rank].copy(),
-                                recycled_adjoint.iteration,
-                            )
-                        stream_rom_bases(
-                            comm, ds, ctrl, recycled_forward, recycled_adjoint, bm, cfg
-                        )
-                        basis_rank = int(recycled_forward.modes.shape[1])
-                        basis_diag = {"mass_gram_error": 0.0}
-                    elif cfg.formulation in (
-                        "forward_constrained_enriched", "enriched_adjoint_galerkin"
-                    ):
-                        # The enriched formulation constructs [V_f,V_perp]
-                        # on the Fortran side in the coupled SEM mass
-                        # product.  Keep the two streamed POD spaces
-                        # independent here: their ranks may differ and the
-                        # adjoint block must not be projected into the
-                        # forward space by the Python recycler.
-                        recycled_forward = recycle_distributed(
-                            comm, forward_history, local_mass, cfg.rank_forward
-                        )
-                        recycled_adjoint = recycle_distributed(
-                            comm, adjoint_history, local_mass, cfg.rank_adjoint
-                        )
-                        if recycled_forward.modes.shape[1] < 1:
-                            raise RuntimeError(
-                                "forward-constrained enrichment produced no forward modes"
-                            )
-                        if recycled_adjoint.modes.shape[1] < 1:
-                            raise RuntimeError(
-                                "forward-constrained enrichment produced no adjoint modes"
-                            )
-                        stream_rom_bases(
-                            comm, ds, ctrl, recycled_forward, recycled_adjoint, bm, cfg
-                        )
-                        basis_rank = int(recycled_forward.modes.shape[1])
-                        basis_diag = {"mass_gram_error": 0.0}
-                    else:
-                        recycled_forward = recycle_distributed(
-                            comm, forward_history, local_mass, cfg.rank_forward
-                        )
-                        recycled_adjoint = recycle_distributed(
-                            comm, adjoint_history, local_mass, cfg.rank_adjoint
-                        )
-                        common_basis, basis_diag = common_basis_distributed(
-                            comm,
-                            recycled_forward,
-                            recycled_adjoint,
-                            local_mass,
-                            cfg.rank_total_max,
-                            adjoint_projector=make_admissibility_projector(mesh, bm, cfg),
-                        )
-                        stream_rom_basis(comm, ds, ctrl, common_basis, bm, cfg)
-                        basis_rank = int(common_basis.modes.shape[1])
+                    # Dual-space formulations always stream independent V_f and
+                    # V_a blocks.  The Fortran handoff constructs V_E when the
+                    # selected formulation requests it; Python never projects
+                    # V_a into V_f or silently replaces it by a complement.
+                    forward_cap = (
+                        cfg.legacy_rank_forward
+                        if cfg.legacy_rank_forward > 0 else None
+                    )
+                    adjoint_cap = (
+                        cfg.legacy_rank_adjoint
+                        if cfg.legacy_rank_adjoint > 0 else None
+                    )
+                    recycled_forward = recycle_distributed(
+                        comm, forward_history, local_mass, forward_cap
+                    )
+                    recycled_adjoint = recycle_distributed(
+                        comm, adjoint_history, local_mass, adjoint_cap
+                    )
+                    if recycled_forward.modes.shape[1] < 1:
+                        raise RuntimeError("ROM recycling produced no forward modes")
+                    if recycled_adjoint.modes.shape[1] < 1:
+                        raise RuntimeError("ROM recycling produced no adjoint modes")
                     if rank == 0:
-                        with open("recycled_rom_history.json", "w", encoding="utf-8") as handle:
+                        print(
+                            f"Forward basis: {cfg.basis_forward}\n"
+                            f"Adjoint basis: {cfg.basis_adjoint}\n"
+                            f"POD history requested: {cfg.history_outer_iterations}\n"
+                            f"POD history available: {history_length}\n"
+                            f"Forward candidate modes: {forward_candidate_modes}\n"
+                            f"Adjoint candidate modes: {adjoint_candidate_modes}\n"
+                            f"Forward streamed rank: {recycled_forward.modes.shape[1]}\n"
+                            f"Adjoint streamed rank: {recycled_adjoint.modes.shape[1]}",
+                            flush=True,
+                        )
+                    stream_rom_bases(
+                        comm, ds, ctrl, recycled_forward, recycled_adjoint, bm, cfg
+                    )
+                    basis_rank = int(recycled_forward.modes.shape[1])
+                    basis_diag = {"mass_gram_error": 0.0}
+                    overlap_singular_values = cross_mass_singular_values(
+                        comm,
+                        recycled_forward.modes,
+                        recycled_adjoint.modes,
+                        local_mass,
+                    )
+                    history_path = os.path.join(
+                        outer_dir, "recycled_rom_history.json"
+                    )
+                    if rank == 0:
+                        with open(history_path, "w", encoding="utf-8") as handle:
                             json.dump(
                                 {
                                     "history_outer_iterations": history_length,
+                                    "history_requested": cfg.history_outer_iterations,
+                                    "history_available": history_length,
                                     "forward_iterations": [item.iteration for item in forward_history],
                                     "adjoint_iterations": [item.iteration for item in adjoint_history],
+                                    "forward_candidate_modes": forward_candidate_modes,
+                                    "adjoint_candidate_modes": adjoint_candidate_modes,
                                     "basis_rank": basis_rank,
                                     "mass_gram_error": basis_diag["mass_gram_error"],
+                                    "basis_forward": cfg.basis_forward,
+                                    "basis_adjoint": cfg.basis_adjoint,
                                     "formulation": cfg.formulation,
+                                    "sensitivity_source": cfg.sensitivity_source,
+                                    "streamed_forward_rank": int(recycled_forward.modes.shape[1]),
+                                    "streamed_adjoint_rank": int(recycled_adjoint.modes.shape[1]),
+                                    "streamed_enriched_candidate_rank": (
+                                        int(recycled_forward.modes.shape[1] + recycled_adjoint.modes.shape[1])
+                                        if cfg.formulation in ("forward_enriched_adjoint", "enriched_galerkin")
+                                        else 0
+                                    ),
+                                    "forward_adjoint_mass_overlap_singular_values": overlap_singular_values.tolist(),
+                                    "source_revision": source_revision(),
                                 },
                                 handle,
                                 indent=2,
                             )
+                    update_latest_alias(
+                        comm, history_path, "recycled_rom_history.json"
+                    )
+                    write_basis_metadata(
+                        comm,
+                        pod_iteration,
+                        outer_dir,
+                        cfg,
+                        history_length,
+                        forward_history,
+                        adjoint_history,
+                        forward_candidate_modes,
+                        adjoint_candidate_modes,
+                        int(recycled_forward.modes.shape[1]),
+                        int(recycled_adjoint.modes.shape[1]),
+                        overlap_singular_values,
+                        cfg.basis_adjoint != "forward",
+                    )
                     adjoint_pod = None
                     adjoint_ioh = None
+                # The next forward/adjoint lifecycle belongs to the next
+                # physical design.  The current basis and all of its files
+                # remain permanently under outer_NNN.
+                pod_iteration += 1
                 pod, ioh = make_pod(comm, bm, cfg)
                 times = []
                 energy = EnergyState()

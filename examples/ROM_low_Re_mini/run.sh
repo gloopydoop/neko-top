@@ -8,7 +8,7 @@ fi
 source "${MAIN_DIR}/scripts/mpmd_run_helpers.sh"
 
 CASE_DIR=$(pwd)
-CASE_FILE=${1:-"${CASE_DIR}/ROM_low_Re_mini.case"}
+CASE_FILE=${1:-"${CASE_DIR}/$(basename "${CASE_DIR}").case"}
 PY_SCRIPT=${2:-"${MAIN_DIR}/scripts/python/rom_state_recover.py"}
 
 NEKO_RANKS=${NEKO_RANKS:-9}

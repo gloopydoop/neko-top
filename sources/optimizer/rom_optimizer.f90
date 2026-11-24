@@ -15,6 +15,7 @@ module rom_optimizer
   use dummy_constraint, only: dummy_constraint_t
   use simulation_m, only: simulation_t
   use rom_problem, only: rom_problem_t
+  use rom_config, only: rom_config_t
   use rom_diagnostic_audit, only: rom_diagnostic_audit_t
   use rom_validation, only: rom_validation_metrics_t, rom_validation_accept
   use num_types, only: rp
@@ -98,7 +99,8 @@ contains
     class(problem_t), intent(inout) :: problem
     class(design_t), intent(in) :: design
     type(simulation_t), optional, intent(in) :: simulation
-    type(json_file) :: solver_parameters, rom_parameters
+    type(json_file) :: solver_parameters
+    type(rom_config_t) :: rom_config
     class(constraint_t), allocatable :: dummy_con
     integer :: max_iterations
 
@@ -132,19 +134,11 @@ contains
 
     call this%rom_problem%init_from_json(parameters, problem)
     this%inner_iterations = this%rom_problem%inner_iterations
-    if ('rom' .in. parameters) then
-       call json_get(parameters, 'rom', rom_parameters)
-    else
-       rom_parameters = solver_parameters
-    end if
-    call json_get_or_default(rom_parameters, 'validate_full_order', &
-         this%validate_full_order, .true.)
-    call json_get_or_default(rom_parameters, 'validation_tolerance', &
-         this%validation_tolerance, 5.0e-2_rp)
-    call json_get_or_default(rom_parameters, 'validation_gradient_tolerance', &
-         this%validation_gradient_tolerance, 5.0e-2_rp)
-    call json_get_or_default(rom_parameters, 'diagnostic_audit', &
-         this%diagnostic_audit, .false.)
+    call rom_config%init(parameters)
+    this%validate_full_order = rom_config%validate_full_order
+    this%validation_tolerance = rom_config%validation_tolerance
+    this%validation_gradient_tolerance = rom_config%validation_gradient_tolerance
+    this%diagnostic_audit = rom_config%diagnostic_audit
     call json_get_or_default(solver_parameters, 'mma.asyinit', &
          this%mma_asyinit, 0.2_rp)
     call json_get_or_default(solver_parameters, 'mma.asyincr', &
@@ -305,7 +299,7 @@ contains
     logical :: reference_available
     type(rom_validation_metrics_t) :: validation_metrics
     logical :: converged, validation_checked, validation_passed
-    integer :: inner, n, m
+    integer :: inner, n, m, rom_outer
     real(kind=rp) :: timer_start
     logical :: audit_active
     character(len=512) :: audit_design_file
@@ -325,16 +319,25 @@ contains
     this%mma_seconds = 0.0_rp
     this%full_order_seconds = 0.0_rp
     call simulation%reset()
+    ! The first ROM lifecycle is entered by the optimizer with index one,
+    ! while its reference state is the design-zero full-order solution.
+    ! Archive ROM/POD data by the physical design being integrated.
+    rom_outer = max(0, iter - 1)
+    ! The basis handoff runs before the ROM output streams are initialised.
+    ! Set the shared design index first so its admissibility diagnostics land
+    ! in the same outer_NNN directory as the Fortran/Python ROM artifacts.
+    call simulation%set_design_iteration(rom_outer)
     if (.not. this%supplied_basis_for_step) then
        call this%rom_problem%refresh(simulation)
     end if
-    if (this%enable_output) call this%rom_problem%initialize_outputs(design, simulation, iter)
+    if (this%enable_output) call this%rom_problem%initialize_outputs(design, simulation, rom_outer)
 
     ! The streamed/POD basis is not available during optimizer initialization.
     ! Create the audit only after refresh (or an externally supplied basis), so
     ! its metadata and vector partition describe the actual final basis.
     if (this%diagnostic_audit .and. .not. this%audit%initialized) then
-       call this%audit%init('rom_diagnostic_audit', this%rom_problem, this%mma, &
+       call this%audit%init(trim(this%rom_problem%rom_output_root)// &
+            '/diagnostic_audit', this%rom_problem, this%mma, &
             this%outer_max_iterations, this%inner_iterations, this%tolerance, &
             this%validation_tolerance, this%validation_gradient_tolerance, &
             this%mma_scale, this%mma_auto_scale, this%mma_asyinit, &
@@ -418,12 +421,16 @@ contains
     ! Evaluate the current design once before the first MMA update.  The
     ! resulting ROM forward/adjoint and gradients are consumed by the first
     ! inner update and then replaced only after the design has changed.
+    timer_start = real(MPI_WTIME(), rp)
     call this%rom_problem%compute(design, rom_objective, final_state=rom_state)
+    this%rom_forward_seconds = real(MPI_WTIME(), rp) - timer_start
     rom_reference_objective = rom_objective
     call rom_optimizer_check_finite_scalar('initial ROM objective', rom_objective)
     if (allocated(rom_state)) call rom_optimizer_check_finite_vector( &
          'initial ROM state', rom_state)
+    timer_start = real(MPI_WTIME(), rp)
     call this%rom_problem%compute_sensitivity(density)
+    this%rom_adjoint_seconds = real(MPI_WTIME(), rp) - timer_start
     call rom_optimizer_check_finite_vector('initial ROM raw density', density%x)
     if (this%unconstrained_problem) then
        fval = -1.0_rp
@@ -478,11 +485,17 @@ contains
             this%mma%get_residumax(), this%mma%get_residunorm(), &
             selected_gradient_device_error)
     end if
+    ! Record the reference ROM lifecycle before the first MMA update.  This is
+    ! the reduced counterpart of the full-order outer record and is essential
+    ! for comparing the first ROM trajectory against the unchanged design.
+    call rom_optimizer_write_inner(this, rom_outer, 0, rom_objective, fval%x)
     ! Stamp the complete initial ROM state after its adjoint sensitivity has
     ! been formed.  This produces the inner-zero forward, design and
     ! sensitivity fields in the same output lifecycle as later inner steps.
     if (this%enable_output .and. allocated(rom_state)) then
        call this%rom_problem%write_outputs(design, simulation, 0, rom_state)
+       call this%rom_problem%write_inner_diagnostics(rom_outer, 0, rom_objective, &
+            fval%x(1), this%rom_forward_seconds, this%rom_adjoint_seconds, 0.0_rp)
     end if
 
     do inner = 1, this%inner_iterations
@@ -573,6 +586,10 @@ contains
        call rom_optimizer_write_inner(this, iter, inner, rom_objective, fval%x)
        if (this%enable_output .and. allocated(rom_state)) &
             call this%rom_problem%write_outputs(design, simulation, inner, rom_state)
+       if (this%enable_output .and. allocated(rom_state)) &
+       call this%rom_problem%write_inner_diagnostics(rom_outer, inner, &
+            rom_objective, fval%x(1), this%rom_forward_seconds, &
+            this%rom_adjoint_seconds, this%mma_seconds)
        if (pe_rank == 0) write(*,'(A,I0,A,I0,A,ES12.4,A,ES12.4)') &
             'ROM outer ', iter, ', inner ', inner, ': objective=', rom_objective, &
             ', max design change=', global_max
@@ -788,19 +805,21 @@ contains
   subroutine rom_optimizer_init_log(this)
     class(rom_optimizer_t), intent(inout) :: this
     integer :: ios
+    logical :: exists
 
     if (pe_rank /= 0) return
+    inquire(file='optimization_data.csv', exist=exists)
     open(newunit=this%rom_log_unit, file='optimization_data.csv', &
-         status='replace', action='write', iostat=ios)
+         status='unknown', position='append', action='write', iostat=ios)
     if (ios /= 0) call neko_error('could not open ROM optimization_data.csv')
-    write(this%rom_log_unit, '(A)') &
-         'phase,outer_iteration,inner_iteration,source,total_objective,'// &
-         'scalar_mixing,scalar_mixing.weight,'// &
-         'viscous_dissipation,viscous_dissipation.weight,'// &
-         'brinkman_dissipation,brinkman_dissipation.weight,'// &
-         'volume_constraint,volume_constraint.volume,max_design_change,'// &
-         'norm2_design_change,rom_forward_seconds,rom_adjoint_seconds,'// &
-         'mma_seconds,full_order_seconds,status'
+    if (.not. exists) write(this%rom_log_unit, '(A)') &
+        'phase,outer_iteration,inner_iteration,source,total_objective,'// &
+        'scalar_mixing,scalar_mixing.weight,'// &
+        'viscous_dissipation,viscous_dissipation.weight,'// &
+        'brinkman_dissipation,brinkman_dissipation.weight,'// &
+        'volume_constraint,volume_constraint.volume,max_design_change,'// &
+        'norm2_design_change,rom_forward_seconds,rom_adjoint_seconds,'// &
+        'mma_seconds,full_order_seconds,status'
     this%rom_log_initialized = .true.
   end subroutine rom_optimizer_init_log
 
@@ -870,6 +889,16 @@ contains
        volume = this%rom_problem%volume_limit + constraint
     else
        volume = this%rom_problem%volume_limit - constraint
+    end if
+    if (inner == 0) then
+       call rom_optimizer_write_record(this, 'inner', outer, inner, 'rom', &
+            objective, this%rom_problem%scalar_mixing_value, &
+            this%rom_problem%scalar_mixing_weight, this%rom_problem%viscous_value, &
+            this%rom_problem%viscous_weight, this%rom_problem%brinkman_value, &
+            this%rom_problem%brinkman_weight, constraint, volume, &
+            this%rom_forward_seconds, this%rom_adjoint_seconds, this%mma_seconds, &
+            0.0_rp, 'reference')
+       return
     end if
     call rom_optimizer_write_record(this, 'inner', outer, inner, 'rom', &
          objective, this%rom_problem%scalar_mixing_value, &

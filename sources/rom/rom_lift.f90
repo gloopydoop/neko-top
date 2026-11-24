@@ -9,10 +9,10 @@ module rom_lift
   use case, only: case_t
   use data_streamer, only: data_streamer_t
   use field, only: field_t
+  use rom_config, only: rom_config_t, rom_config_get_json
   use scalar_pnpn, only: scalar_pnpn_t
+  use json_module, only: json_file
   use field_math, only: field_add2s2, field_copy
-  use json_file_module, only: json_file
-  use json_utils, only: json_get, json_get_or_default
   use operators, only: grad
   use scratch_registry, only: neko_scratch_registry
   use num_types, only: rp
@@ -60,19 +60,17 @@ contains
   subroutine rom_lift_init(this, neko_case)
     class(rom_lift_t), intent(inout) :: this
     class(case_t), target, intent(inout) :: neko_case
-    type(json_file) :: lift_parameters
-    character(len=:), allocatable :: source
+    type(rom_config_t) :: rom_parameters
+    type(json_file) :: unused_parameters
+    logical :: found
+    character(len=64) :: source
     integer :: component, direction
 
     call this%free()
-    if (.not. neko_case%params%valid_path('rom')) return
-
-    source = 'initial_velocity'
-    if ('rom.lift' .in. neko_case%params) then
-       call json_get(neko_case%params, 'rom.lift', lift_parameters)
-       call json_get_or_default(lift_parameters, 'source', source, &
-            'initial_velocity')
-    end if
+    call rom_config_get_json(neko_case%params, unused_parameters, found)
+    if (.not. found) return
+    call rom_parameters%init(neko_case%params)
+    source = trim(rom_parameters%lift_source)
     select case (trim(source))
     case ('initial_velocity', 'reference_velocity')
        ! The case velocity at initialisation is the reference solution for the

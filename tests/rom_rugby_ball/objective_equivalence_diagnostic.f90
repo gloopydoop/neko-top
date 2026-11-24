@@ -1,6 +1,7 @@
 program rom_objective_equivalence_diagnostic
   use neko, only: neko_init, neko_finalize
   use neko_top, only: neko_top_register_types
+  use user, only: user_setup
   use simulation_m, only: simulation_t
   use fluid_pnpn, only: fluid_pnpn_t
   use file, only: file_t
@@ -68,6 +69,7 @@ program rom_objective_equivalence_diagnostic
   call neko_top_register_types()
   parameters = json_read_file(trim(case_file))
   call parameters%update('unsteady', .false., found)
+  call user_setup(simulation%neko_case%user)
   call simulation%init(parameters)
   select type (fluid_in => simulation%fluid)
   type is (fluid_pnpn_t)

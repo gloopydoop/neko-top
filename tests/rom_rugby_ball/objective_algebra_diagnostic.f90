@@ -3,7 +3,7 @@ program rom_objective_algebra_diagnostic
   use num_types, only: rp
   use rom_array_test_adapters, only: test_assemble_viscous_quadratic, &
        test_assemble_brinkman_objective, test_viscous_value, test_brinkman_value, &
-       test_brinkman_density, test_assemble_scalar_mixing
+       test_brinkman_density, test_assemble_scalar_mixing, test_scalar_mixing_value
   implicit none
 
   integer, parameter :: n = 11, r = 3
@@ -95,9 +95,8 @@ program rom_objective_algebra_diagnostic
            scalar_ref)**2
   end do
   scalar_expected = scalar_expected / domain
-  value = test_viscous_value(scalar_state, scalar_quadratic, domain) + &
-       dot_product(scalar_linear, scalar_state) / domain + &
-       0.5_rp * scalar_constant / domain
+  value = test_scalar_mixing_value(scalar_state, scalar_constant, scalar_linear, &
+       scalar_quadratic, domain)
   if (abs(value - scalar_expected) > 1.0e-13_rp) &
        error stop 'scalar mixing objective algebra mismatch'
   eps = 1.0e-7_rp

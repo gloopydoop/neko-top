@@ -179,34 +179,9 @@
         "n_modes": 8,
         "i_stream": 200,
         "stream_adjoint": true,
-        "history_outer_iterations": 3,
-        "rank_forward": 8,
-        "rank_total_max": 20,
-        "scalar_metric_weight": 0.5,
         "dtype": "double",
         "write_modes": false,
         "output_reconstruction": false
-    },
-    "rom": {
-        "enabled": true,
-        "inner_iterations": 5,
-        "formulation": "forward_constrained_enriched",
-        "sensitivity_source": "projected_adjoint",
-        "substeps": 4,
-        "history_outer_iterations": 3,
-        "rank_forward": 8,
-        "rank_total_max": 20,
-        "scalar_metric_weight": 0.5,
-        "validate_full_order": false,
-        "admissibility_projection": "direct_pod",
-        "time_scheme": "bdf1",
-        "pressure_treatment": "solenoidal_galerkin",
-        "strict_admissibility": false,
-        "export_reduced_system": true,
-        "reduced_system_export_directory": "rom_reduced_system",
-        "write_trajectory_fields": false,
-        "trajectory_output_interval": 0.02,
-        "lift": {"source": "initial_velocity"}
     },
     "optimization": {
         "design": {
@@ -241,6 +216,27 @@
             "type": "rom_mma",
             "max_iterations": 50,
             "tolerance": 1.0e-12,
+            "rom": {
+                "enabled": true,
+                "inner_iterations": 5,
+                "basis": {
+                    "forward": "forward",
+                    "adjoint": "forward"
+                },
+                "substeps": 4,
+                "history_outer_iterations": 3,
+                "scalar_metric_weight": 0.5,
+                "validate_full_order": true,
+                "admissibility_projection": "direct_pod",
+                "time_scheme": "bdf1",
+                "pressure_treatment": "solenoidal_galerkin",
+                "strict_admissibility": false,
+                "export_reduced_system": true,
+                "reduced_system_export_directory": "rom_reduced_system",
+                "write_trajectory_fields": false,
+                "trajectory_output_interval": 0.02,
+                "lift": {"source": "initial_velocity"}
+            },
             "mma": {
                 "scale": 1.0,
                 "asyinit": 0.4,
@@ -262,7 +258,7 @@
                 "type": "scalar_mixing",
                 "mask_name": "objective_domain",
                 "start_time": 10.0,
-                "weight": 0.0,
+                "weight": 120.0,
             },
             {
                 "type": "viscous_dissipation",

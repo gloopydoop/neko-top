@@ -12,7 +12,7 @@ module rom_array_test_adapters
        rom_assemble_scalar_transport
   use rom_objectives, only: rom_assemble_viscous_quadratic, &
        rom_assemble_brinkman_objective, rom_viscous_value, rom_brinkman_value, &
-       rom_brinkman_density, rom_assemble_scalar_mixing_terms
+       rom_scalar_mixing_value, rom_brinkman_density, rom_assemble_scalar_mixing_terms
   implicit none
   private
   public :: test_assemble_mass, test_assemble_brinkman
@@ -240,7 +240,7 @@ contains
     call s%init(size(state)); call l%init(size(state))
     call q%init(size(state), size(state))
     s%x = state; l%x = linear; q%x = quadratic
-    value = rom_viscous_value(s, constant, l, q, domain)
+    value = rom_scalar_mixing_value(s, constant, l, q, domain)
     call s%free(); call l%free(); call q%free()
   end function test_scalar_mixing_value
 

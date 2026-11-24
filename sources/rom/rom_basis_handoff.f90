@@ -23,9 +23,10 @@ module rom_basis_handoff
   use comm, only: pe_rank
   use, intrinsic :: iso_c_binding, only: c_ptr, C_NULL_PTR
   use logger, only: neko_log
-  use utils, only: neko_error
+  use utils, only: neko_error, mkdir
   use rom_basis_orthogonalization, only: rom_mass_dot, &
        rom_mass_orthonormalize_device, rom_mass_orthonormalize_coupled_device
+  use rom_config, only: rom_config_get_json
   use rom_projection_operator, only: rom_projection_ax_t
   implicit none
   private
@@ -271,19 +272,11 @@ contains
   subroutine rom_get_parameters(simulation, parameters)
     type(simulation_t), intent(inout) :: simulation
     type(json_file), intent(out) :: parameters
-    type(json_file) :: solver_parameters
+    logical :: found
 
-    if ('rom' .in. simulation%neko_case%params) then
-       call json_get(simulation%neko_case%params, 'rom', parameters)
-    else
-       call json_get(simulation%neko_case%params, 'optimization.solver', &
-            solver_parameters)
-       if ('rom' .in. solver_parameters) then
-          call json_get(solver_parameters, 'rom', parameters)
-       else
-          parameters = solver_parameters
-       end if
-    end if
+    call rom_config_get_json(simulation%neko_case%params, parameters, found)
+    if (.not. found) call neko_error( &
+         'ROM basis handoff requires optimization.solver.rom')
   end subroutine rom_get_parameters
 
   !> Apply the native scalar homogeneous Dirichlet projector to all columns.
@@ -450,6 +443,7 @@ contains
          strict_admissibility, .false.)
     call json_get_or_default(rom_parameters, 'projection_diagnostics_file', &
          diagnostics_file, 'rom_direct_pod_diagnostics.csv')
+    call rom_basis_diagnostics_path(simulation, diagnostics_file)
     call json_get_or_default(rom_parameters, 'scalar_metric_weight', &
          scalar_weight, 1.0_rp)
     if (admissibility_tolerance <= 0.0_rp .or. scalar_weight <= 0.0_rp) then
@@ -702,6 +696,7 @@ contains
     call json_get_or_default(rom_parameters, &
          'projection_diagnostics_file', diagnostics_file, &
          'rom_projection_diagnostics.csv')
+    call rom_basis_diagnostics_path(simulation, diagnostics_file)
     call json_get_or_default(rom_parameters, 'strict_admissibility', &
          strict_admissibility, .false.)
     if (pressure_abs_tol <= 0.0_rp .or. pressure_rel_tol < 0.0_rp .or. &
@@ -1507,6 +1502,26 @@ contains
     value = sqrt(max(0.0_rp, rom_weighted_norm(p_rhs, fluid%c_Xh%mult, &
          fluid%c_Xh%mult_d, n)))
   end subroutine rom_weak_continuity_norm
+
+  !> Place basis-admissibility diagnostics below the matching ROM outer output.
+  !! @param[in] simulation Simulation carrying the current outer index.
+  !! @param[inout] configured Configured diagnostic filename; its basename is
+  !! retained while the ROM output directory is made authoritative.
+  subroutine rom_basis_diagnostics_path(simulation, configured)
+    type(simulation_t), intent(in) :: simulation
+    character(len=:), allocatable, intent(inout) :: configured
+    character(len=1024) :: basename, directory
+    integer :: slash
+
+    basename = trim(configured)
+    slash = scan(trim(basename), '/', back=.true.)
+    if (slash > 0) basename = basename(slash+1:)
+    write(directory, '("rom_output/outer_",I3.3,"/basis_diagnostics/")') &
+         simulation%current_design_iteration
+    call mkdir('rom_output')
+    call mkdir(trim(directory))
+    configured = trim(directory)//trim(basename)
+  end subroutine rom_basis_diagnostics_path
 
   !> Reset the simulation
 end module rom_basis_handoff

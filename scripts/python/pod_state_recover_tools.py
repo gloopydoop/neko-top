@@ -12,6 +12,10 @@ try:
     from statistical_closure import reynolds_stress, fit_scalar_gammat
 except ModuleNotFoundError:  # imported as scripts.python.* from the repo root
     from .statistical_closure import reynolds_stress, fit_scalar_gammat
+try:
+    from rom_config_tools import derive_rom_basis_pair
+except ModuleNotFoundError:  # imported as scripts.python.* from the repo root
+    from .rom_config_tools import derive_rom_basis_pair
 from mpi4py import MPI
 
 from pysemtools.datatypes.msh import Mesh
@@ -169,12 +173,17 @@ class PODConfig:
     stream_adjoint: bool = False
     adjoint_i_stream: int = 1
     history_outer_iterations: int = 3
-    rank_forward: int | None = None
-    rank_adjoint: int | None = None
-    rank_total_max: int | None = None
+    basis_forward: str = "forward"
+    basis_adjoint: str = "forward"
     scalar_metric_weight: float = 1.0
     admissibility_projection: str = "velocity_inlet_xmin"
-    formulation: str = "galerkin"
+    # These are derived implementation labels retained in the peer metadata;
+    # they are never read from a migrated nested case.
+    formulation: str = "forward_galerkin"
+    sensitivity_source: str = "exact_galerkin"
+    legacy_rank_forward: int = 0
+    legacy_rank_adjoint: int = 0
+    legacy_rank_enriched: int = 0
 
     @property
     def n_fields(self) -> int:
@@ -222,9 +231,21 @@ class EnergyState:
 def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
     case = load_case_config(case_path)
     state_recovery = case.get("state_recovery", {})
-    rom_cfg = case.get("rom", {})
+    optimization = case.get("optimization", {})
+    solver = optimization.get("solver", {}) if isinstance(optimization, dict) else {}
+    nested_rom = solver.get("rom") if isinstance(solver, dict) else None
+    legacy_rom = case.get("rom")
+    if nested_rom is not None and legacy_rom is not None:
+        raise ValueError(
+            "ROM configuration is present in both optimization.solver.rom "
+            "and legacy top-level rom; remove the legacy object"
+        )
+    if nested_rom is None and legacy_rom is None:
+        raise KeyError("case requires optimization.solver.rom for the ROM peer")
+    rom_cfg = nested_rom if nested_rom is not None else legacy_rom
     if not isinstance(rom_cfg, dict):
-        rom_cfg = {}
+        raise KeyError("optimization.solver.rom must be a JSON object")
+    legacy_rom_path = nested_rom is None
     if not isinstance(state_recovery, dict):
         raise KeyError("case['state_recovery'] must be a dict")
 
@@ -269,19 +290,118 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
     i_stream = int(state_recovery["i_stream"])
     timestep = float(case["case"]["time"]["timestep"])
 
-    # Resolve the forward rank first.  Every adjoint numeric setting inherits
-    # its forward counterpart unless the user explicitly supplies an adjoint
-    # override.  In particular, this keeps the streamed adjoint cadence and
-    # adjoint POD rank synchronized with the forward POD by default.
-    rank_forward_value = state_recovery.get("rank_forward")
-    if rank_forward_value is None:
-        rank_forward_value = rom_cfg.get("rank_forward")
-    rank_adjoint_value = state_recovery.get("rank_adjoint")
-    if rank_adjoint_value is None:
-        rank_adjoint_value = rom_cfg.get("rank_adjoint")
-    if rank_adjoint_value is None:
-        rank_adjoint_value = rank_forward_value
+    # The nested configuration has one deliberately small public selection:
+    # the two basis names.  Keep the old top-level object as a migration path,
+    # but never mix its formulation/rank controls with the new interface.
+    state_rank_keys = {
+        "rank_forward", "rank_adjoint", "rank_enriched", "rank_total_max"
+    }
+    if not legacy_rom_path and any(key in state_recovery for key in state_rank_keys):
+        raise ValueError(
+            "state_recovery rank fields are obsolete; use state_recovery.n_modes"
+        )
+    if not legacy_rom_path and "history_outer_iterations" in state_recovery:
+        raise ValueError(
+            "history_outer_iterations belongs under optimization.solver.rom"
+        )
 
+    if not legacy_rom_path:
+        obsolete = {
+            "formulation", "sensitivity_source", "rank_forward",
+            "rank_adjoint", "rank_enriched", "rank_total_max"
+        }
+        present_obsolete = sorted(obsolete.intersection(rom_cfg))
+        if present_obsolete:
+            raise ValueError(
+                "obsolete ROM fields " + ", ".join(present_obsolete) +
+                "; use basis.forward, basis.adjoint and "
+                "state_recovery.n_modes"
+            )
+        basis_cfg = rom_cfg.get("basis")
+        if not isinstance(basis_cfg, dict) or \
+                "forward" not in basis_cfg or "adjoint" not in basis_cfg:
+            raise ValueError(
+                "optimization.solver.rom requires basis.forward and "
+                "basis.adjoint; supported pairs are (forward,forward), "
+                "(forward,adjoint), (forward,enriched) and (enriched,enriched)"
+            )
+        basis_forward = str(basis_cfg["forward"]).strip().lower()
+        basis_adjoint = str(basis_cfg["adjoint"]).strip().lower()
+        formulation, sensitivity_source = derive_rom_basis_pair(
+            basis_forward, basis_adjoint
+        )
+        legacy_rank_forward = legacy_rank_adjoint = legacy_rank_enriched = 0
+    else:
+        basis_cfg = rom_cfg.get("basis")
+        if basis_cfg is not None and "formulation" in rom_cfg:
+            raise ValueError(
+                "legacy top-level rom cannot contain both formulation and basis"
+            )
+        if basis_cfg is not None:
+            if not isinstance(basis_cfg, dict) or \
+                    "forward" not in basis_cfg or "adjoint" not in basis_cfg:
+                raise ValueError(
+                    "legacy ROM basis selection requires basis.forward and "
+                    "basis.adjoint"
+                )
+            basis_forward = str(basis_cfg["forward"]).strip().lower()
+            basis_adjoint = str(basis_cfg["adjoint"]).strip().lower()
+            formulation, sensitivity_source = derive_rom_basis_pair(
+                basis_forward, basis_adjoint
+            )
+        else:
+            aliases = {
+                "galerkin": "forward_galerkin",
+                "petrov_galerkin": "separate_pod",
+                "forward_constrained_enriched": "separate_pod",
+                "enriched_adjoint_galerkin": "forward_enriched_adjoint",
+            }
+            legacy_formulation = str(
+                rom_cfg.get(
+                    "formulation",
+                    "enriched_galerkin"
+                    if as_bool(state_recovery.get("stream_adjoint"))
+                    else "forward_galerkin",
+                )
+            ).strip().lower()
+            formulation = aliases.get(legacy_formulation, legacy_formulation)
+            legacy_pairs = {
+                "forward_galerkin": ("forward", "forward"),
+                "separate_pod": ("forward", "adjoint"),
+                "forward_enriched_adjoint": ("forward", "enriched"),
+                "enriched_galerkin": ("enriched", "enriched"),
+            }
+            if formulation not in legacy_pairs:
+                raise ValueError("unsupported legacy ROM formulation: " + legacy_formulation)
+            basis_forward, basis_adjoint = legacy_pairs[formulation]
+            sensitivity_source = (
+                "projected_adjoint"
+                if formulation in ("separate_pod", "forward_enriched_adjoint")
+                else "exact_galerkin"
+            )
+            stated_source = str(rom_cfg.get("sensitivity_source", sensitivity_source)).strip().lower()
+            stated_source = {"exact": "exact_galerkin", "projected": "projected_adjoint"}.get(
+                stated_source, stated_source
+            )
+            if stated_source != sensitivity_source:
+                raise ValueError(
+                    f"legacy {formulation} requires sensitivity_source={sensitivity_source}"
+                )
+
+        legacy_total = rom_cfg.get("rank_total_max", state_recovery.get("rank_total_max", 0))
+        legacy_rank_forward = int(
+            rom_cfg.get("rank_forward", state_recovery.get("rank_forward", legacy_total or 0))
+        )
+        legacy_rank_adjoint = int(
+            rom_cfg.get("rank_adjoint", state_recovery.get("rank_adjoint", legacy_rank_forward))
+        )
+        legacy_rank_enriched = int(
+            rom_cfg.get("rank_enriched", legacy_total or 0)
+        )
+        if legacy_rank_adjoint == 0:
+            legacy_rank_adjoint = legacy_rank_forward
+        if legacy_rank_enriched == 0:
+            legacy_rank_enriched = legacy_rank_forward + legacy_rank_adjoint
     cfg = PODConfig(
         batch_size=int(state_recovery["batch_size"]),
         keep_modes=int(state_recovery["n_modes"]),
@@ -322,13 +442,12 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
         ),
         gammat_field_scale=float(state_recovery.get("gammat_field_scale", 1.0)),
         turbulent_schmidt=float(state_recovery.get("turbulent_schmidt", 0.7)),
-        stream_adjoint=as_bool(state_recovery.get("stream_adjoint", rom_cfg.get("enabled", False))),
+        stream_adjoint=as_bool(state_recovery.get("stream_adjoint", rom_cfg.get("stream_adjoint", False))),
         adjoint_i_stream=max(1, int(state_recovery.get("adjoint_i_stream", i_stream))),
-        history_outer_iterations=max(1, int(state_recovery.get("history_outer_iterations", rom_cfg.get("history_outer_iterations", 3)))),
-        rank_forward=(int(rank_forward_value) if rank_forward_value is not None else None),
-        rank_adjoint=(int(rank_adjoint_value) if rank_adjoint_value is not None else None),
-        rank_total_max=(int(state_recovery.get("rank_total_max", rom_cfg.get("rank_total_max"))) if state_recovery.get("rank_total_max", rom_cfg.get("rank_total_max")) is not None else None),
-        scalar_metric_weight=float(state_recovery.get("scalar_metric_weight", rom_cfg.get("scalar_metric_weight", 1.0))),
+        history_outer_iterations=max(1, int(rom_cfg.get("history_outer_iterations", 3))),
+        basis_forward=basis_forward,
+        basis_adjoint=basis_adjoint,
+        scalar_metric_weight=float(rom_cfg.get("scalar_metric_weight", 1.0)),
         admissibility_projection=str(
             rom_cfg.get(
                 "admissibility_projection",
@@ -337,7 +456,11 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
                 ),
             )
         ).lower(),
-        formulation=str(rom_cfg.get("formulation", "galerkin")).strip().lower(),
+        formulation=formulation,
+        sensitivity_source=sensitivity_source,
+        legacy_rank_forward=legacy_rank_forward,
+        legacy_rank_adjoint=legacy_rank_adjoint,
+        legacy_rank_enriched=legacy_rank_enriched,
     )
     if cfg.input_mode not in ("instantaneous", "windowed_statistics"):
         raise ValueError("input_mode must be instantaneous or windowed_statistics")
@@ -355,35 +478,20 @@ def load_pod_config(case_path: str) -> tuple[dict, PODConfig]:
         raise ValueError("turbulent_schmidt must be positive")
     if cfg.scalar_metric_weight <= 0.0:
         raise ValueError("scalar_metric_weight must be positive")
-    if cfg.formulation not in (
-        "galerkin", "petrov_galerkin", "forward_constrained_enriched",
-        "enriched_adjoint_galerkin"
-    ):
+    if cfg.basis_adjoint != "forward" and not cfg.stream_adjoint:
         raise ValueError(
-            "rom.formulation must be galerkin, petrov_galerkin, or "
-            "forward_constrained_enriched, or enriched_adjoint_galerkin"
-        )
-    if cfg.formulation in (
-        "petrov_galerkin", "forward_constrained_enriched", "enriched_adjoint_galerkin"
-    ) \
-            and not cfg.stream_adjoint:
-        raise ValueError(
-            f"{cfg.formulation} requires state_recovery.stream_adjoint=true"
+            f"basis.adjoint={cfg.basis_adjoint} requires "
+            "state_recovery.stream_adjoint=true"
         )
     if cfg.input_mode == "windowed_statistics" and cfg.window_duration <= 0.0:
         raise ValueError("window_duration must be positive for windowed_statistics")
     for name, value in (
-        ("rank_forward", cfg.rank_forward),
-        ("rank_adjoint", cfg.rank_adjoint),
-        ("rank_total_max", cfg.rank_total_max),
+        ("legacy_rank_forward", cfg.legacy_rank_forward),
+        ("legacy_rank_adjoint", cfg.legacy_rank_adjoint),
+        ("legacy_rank_enriched", cfg.legacy_rank_enriched),
     ):
-        if value is not None and value <= 0:
-            raise ValueError(f"{name} must be positive when configured")
-        if name != "rank_total_max" and value is not None and value > cfg.keep_modes:
-            raise ValueError(
-                f"{name}={value} exceeds state_recovery.n_modes={cfg.keep_modes}; "
-                "increase n_modes so the requested compact factor is available"
-            )
+        if value < 0:
+            raise ValueError(f"{name} must be nonnegative in legacy cases")
     return case, cfg
 
 
@@ -544,10 +652,12 @@ def make_admissibility_projector(mesh: Mesh, bm: np.ndarray, cfg: PODConfig):
     after basis transfer.
     """
 
-    if cfg.admissibility_projection != "velocity_inlet_xmin":
+    if cfg.admissibility_projection not in (
+        "velocity_inlet_xmin", "direct_pod", "none"
+    ):
         raise RuntimeError(
             "unsupported ROM admissibility_projection; expected "
-            "velocity_inlet_xmin"
+            "velocity_inlet_xmin, direct_pod or none"
         )
 
     def project(vector: np.ndarray) -> np.ndarray:
@@ -642,8 +752,9 @@ def write_time_coefficients(
     comm: MPI.Comm,
     data: np.ndarray,
     header: str,
-    rotate_existing: bool,
+    rotate_existing: bool = False,
     file_name: str = "pod_time_coeffs.csv",
+    latest_alias: str | None = None,
 ) -> None:
     if comm.Get_rank() != 0:
         return
@@ -660,6 +771,12 @@ def write_time_coefficients(
         header=header,
         comments="",
     )
+    if latest_alias is not None:
+        target = os.path.abspath(file_name)
+        alias = os.path.abspath(latest_alias)
+        if os.path.lexists(alias):
+            os.unlink(alias)
+        os.symlink(os.path.relpath(target, os.path.dirname(alias)), alias)
 
 
 def singular_value_header(keep_modes: int) -> str:
@@ -701,8 +818,9 @@ def write_singular_values(
     pod: POD,
     keep_modes: int,
     iteration: int,
-    rotate_existing: bool,
+    rotate_existing: bool = False,
     file_name: str = "pod_singular_values.csv",
+    latest_alias: str | None = None,
 ) -> None:
     if comm.Get_rank() != 0:
         return
@@ -728,6 +846,12 @@ def write_singular_values(
             delimiter=",",
             fmt=fmt,
         )
+    if latest_alias is not None:
+        target = os.path.abspath(file_name)
+        alias = os.path.abspath(latest_alias)
+        if os.path.lexists(alias):
+            os.unlink(alias)
+        os.symlink(os.path.relpath(target, os.path.dirname(alias)), alias)
 
 
 def report_energy_capture(
