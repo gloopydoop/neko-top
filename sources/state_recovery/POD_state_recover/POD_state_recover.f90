@@ -96,6 +96,12 @@ module simulation_POD_state_recover
      logical :: include_scalar = .false.
      logical :: include_nut = .false.
      logical :: include_gammat = .false.
+     ! ROM-only design-dependent POD capability.  The mapped Brinkman field
+     ! is sent once, immediately before the first streamed snapshot of each
+     ! lifecycle; it is not part of the POD state vector.
+     logical :: adaptive_basis_transform = .false.
+     logical :: adaptive_design_pending = .false.
+     real(kind=rp) :: adaptive_basis_transform_tau = 1.0_rp
      real(kind=rp) :: forward_lift(3) = 0.0_rp
      type(rom_lift_t) :: rom_lift
      character(len=16) :: dtype = "double"
@@ -201,6 +207,7 @@ contains
     logical :: fit_scalar_diffusivity
     character(len=:), allocatable :: scalar_closure
     real(kind=rp), allocatable :: forward_lift(:)
+    character(len=:), allocatable :: basis_transform
 
     call json_get(params, "i_stream", i_stream)
     call json_get(params, "n_modes", n_modes)
@@ -212,6 +219,14 @@ contains
          trim(lower_string(scalar_closure)) .ne. 'none'
     call json_get_or_default(params, "debug", debug, .false.)
     call json_get_or_default(params, "stream_adjoint", stream_adjoint, .false.)
+    call json_get_or_default(neko_case%params, &
+         "optimization.solver.rom.basis_transform", basis_transform, "none")
+    call json_get_or_default(neko_case%params, &
+         "optimization.solver.rom.basis_transform_tau", &
+         this%adaptive_basis_transform_tau, 1.0_rp)
+    this%adaptive_basis_transform = trim(lower_string(basis_transform)) /= "none"
+    if (this%adaptive_basis_transform_tau < 0.0_rp) call neko_error( &
+         "state_recovery ROM basis_transform_tau must be nonnegative")
     if ('forward_lift' .in. params) then
        call json_get_or_lookup(params, 'forward_lift', forward_lift)
        if (size(forward_lift) .ne. 3) then
@@ -288,8 +303,12 @@ contains
          mode_output_format, mode_file_name, recon_output_precision, &
          recon_output_format, recon_file_name, fit_eddy_viscosity, &
          fit_scalar_diffusivity)
+    ! init_from_components resets optional runtime state; restore the ROM-only
+    ! capability parsed from the complete case JSON.
+    this%adaptive_basis_transform = trim(lower_string(basis_transform)) /= "none"
     this%stream_adjoint = stream_adjoint
     this%adjoint_i_stream = max(1, adjoint_i_stream)
+    this%adaptive_design_pending = this%adaptive_basis_transform
   end subroutine POD_state_recover_init_from_json
 
 
@@ -370,6 +389,8 @@ contains
     this%include_nut = .false.
     if (present(fit_eddy_viscosity)) this%include_nut = fit_eddy_viscosity
     this%include_gammat = .false.
+    this%adaptive_basis_transform = .false.
+    this%adaptive_design_pending = .false.
     if (present(fit_scalar_diffusivity)) this%include_gammat = fit_scalar_diffusivity
     this%n_flds = 3 + merge(1, 0, this%include_scalar) + &
          merge(1, 0, this%include_nut) + merge(1, 0, this%include_gammat)
@@ -583,6 +604,7 @@ contains
     this%include_gammat = .false.
     this%pod_tstep = 0
     this%adjoint_tstep = 0
+    this%adaptive_design_pending = this%adaptive_basis_transform
     this%mode_output_precision = sp
     this%mode_output_format = 'fld'
     this%mode_file_name = 'POD_modes'
@@ -615,6 +637,10 @@ contains
     this%adj_running_sent = .false.
     this%pod_tstep = 0
     this%adjoint_tstep = 0
+    ! Each subsequent FOM/ROM lifecycle begins with a fresh mapped design
+    ! message.  Python clears adaptive_chi after ADJ_DONE and expects this
+    ! field before the next forward snapshot batch.
+    this%adaptive_design_pending = this%adaptive_basis_transform
 
     call this%set_n_timesteps(0)
 
@@ -692,6 +718,24 @@ contains
        call this%ctrl%send(MODE_FORWARD, PHASE_FWD_RUNNING, &
             int(this%pod_tstep, int32), &
             real(neko_case%time%t - neko_case%time%start_time, real64))
+    end if
+
+    if (this%adaptive_basis_transform .and. this%adaptive_design_pending) then
+       ! The design is created after simulation%init, so this field cannot be
+       ! sent during the initial mesh/IC handshake.  At the first forward
+       ! snapshot it is mapped and stationary for the entire lifecycle.
+       block
+          type(field_t), pointer :: chi
+          integer :: chi_n
+          chi => neko_registry%get_field('brinkman_amplitude')
+          chi_n = chi%dof%size()
+          if (NEKO_BCKND_DEVICE .eq. 1) then
+             call device_memcpy(chi%x, chi%x_d, chi_n, DEVICE_TO_HOST, sync=.true.)
+          end if
+          call this%dstream%stream(chi%x)
+          this%adaptive_design_pending = .false.
+          nullify(chi)
+       end block
     end if
 
     call POD_state_recover_stream_fields(this, neko_case)

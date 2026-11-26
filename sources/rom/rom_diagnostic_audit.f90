@@ -7,6 +7,7 @@
 module rom_diagnostic_audit
   use rom_problem, only: rom_problem_t
   use design, only: design_t
+  use brinkman_design, only: brinkman_design_t
   use mma, only: mma_t
   use num_types, only: rp
   use vector, only: vector_t
@@ -242,6 +243,8 @@ contains
             'outer_iteration,direction,epsilon,feasible,objective_plus,'// &
             'objective_minus,fd_derivative,exact_dot_direction,'// &
             'projected_dot_direction,fd_minus_exact,fd_minus_projected,'// &
+            'exact_localB_dot_direction,projected_localB_dot_direction,'// &
+            'fd_minus_exact_localB,fd_minus_projected_localB,'// &
             'direction_file,base_design_file'
        close(this%fd_unit)
        this%fd_unit = -1
@@ -496,13 +499,15 @@ contains
     type(vector_t) :: density_probe, exact_density_probe
     type(vector_t) :: projected_density_probe
     type(vector_t) :: exact_gradient_probe, projected_gradient_probe
+    type(vector_t) :: exact_localB_gradient, projected_localB_gradient
     real(kind=rp) :: eps_max, local_eps, norm_d, eps, obj_plus, obj_minus
     real(kind=rp) :: baseline, fd_value, exact_dot, projected_dot
+    real(kind=rp) :: exact_localB_dot, projected_localB_dot
     real(kind=rp) :: eps_list(3)
     real(kind=rp), allocatable :: state(:)
     integer :: direction, level, i, unit, ios
     logical :: feasible
-    character(len=32) :: direction_name
+    character(len=32) :: direction_name, exact_density_source
     character(len=512) :: direction_file, base_design_file
 
     if (.not. this%enabled) return
@@ -520,6 +525,11 @@ contains
     call projected_density_probe%init(x_reference%size())
     call exact_gradient_probe%init(x_reference%size())
     call projected_gradient_probe%init(x_reference%size())
+    call exact_localB_gradient%init(x_reference%size())
+    call projected_localB_gradient%init(x_reference%size())
+
+    exact_density_source = 'exact_galerkin'
+    if (rom%experimental_algebraic) exact_density_source = 'exact_algebraic'
 
     do direction = 1, 2
        ! The reference design is a 0/1 corner.  Use the midpoint of the first
@@ -532,14 +542,32 @@ contains
        call rom%compute(design, baseline, final_state=state)
        if (allocated(state)) deallocate(state)
        call rom%compute_sensitivity(density_probe)
-       call rom%compute_density(exact_density_probe, 'exact_galerkin')
+       call rom%compute_density(exact_density_probe, trim(exact_density_source))
        call rom%compute_density(projected_density_probe, 'projected_adjoint')
        call rom%project_density(design, exact_density_probe, exact_gradient_probe)
        call rom%project_density(design, projected_density_probe, projected_gradient_probe)
+       call design%map_backward(exact_density_probe)
+       select type (des => design)
+       type is (brinkman_design_t)
+          call des%get_sensitivity(exact_localB_gradient)
+          call des%convert_to_directional_derivative(exact_localB_gradient)
+       class default
+          call neko_error('ROM local-B diagnostic requires a Brinkman design')
+       end select
+       call design%map_backward(projected_density_probe)
+       select type (des => design)
+       type is (brinkman_design_t)
+          call des%get_sensitivity(projected_localB_gradient)
+          call des%convert_to_directional_derivative(projected_localB_gradient)
+       class default
+          call neko_error('ROM local-B diagnostic requires a Brinkman design')
+       end select
        if (NEKO_BCKND_DEVICE .eq. 1) then
           call xbase%copy_from(DEVICE_TO_HOST, sync=.true.)
           call exact_gradient_probe%copy_from(DEVICE_TO_HOST, sync=.true.)
           call projected_gradient_probe%copy_from(DEVICE_TO_HOST, sync=.true.)
+          call exact_localB_gradient%copy_from(DEVICE_TO_HOST, sync=.true.)
+          call projected_localB_gradient%copy_from(DEVICE_TO_HOST, sync=.true.)
        end if
        if (direction == 1) then
           direction_name = 'mma_update'
@@ -601,14 +629,18 @@ contains
              fd_value = (obj_plus-obj_minus)/(2.0_rp*eps)
              exact_dot = vector_glsc2(exact_gradient_probe, d)
              projected_dot = vector_glsc2(projected_gradient_probe, d)
+             exact_localB_dot = vector_glsc2(exact_localB_gradient, d)
+             projected_localB_dot = vector_glsc2(projected_localB_gradient, d)
              if (pe_rank == 0) then
                 open(newunit=unit, file=trim(this%directory)//'/directional_fd.csv', &
                      status='old', position='append', action='write', iostat=ios)
                 if (ios /= 0) call neko_error('could not append ROM audit FD CSV')
                 write(unit, '(*(G0,:,","))') outer, trim(direction_name), eps, feasible, &
                      obj_plus, obj_minus, fd_value, exact_dot, projected_dot, &
-                     fd_value-exact_dot, fd_value-projected_dot, trim(direction_file), &
-                     trim(base_design_file)
+                     fd_value-exact_dot, fd_value-projected_dot, &
+                     exact_localB_dot, projected_localB_dot, &
+                     fd_value-exact_localB_dot, fd_value-projected_localB_dot, &
+                     trim(direction_file), trim(base_design_file)
                 close(unit)
              end if
              call design%update_design(xbase)
@@ -621,7 +653,8 @@ contains
                status='old', position='append', action='write', iostat=ios)
           if (ios /= 0) call neko_error('could not append ROM audit FD CSV')
           write(unit, '(*(G0,:,","))') outer, trim(direction_name), 0.0_rp, .false., &
-               0.0_rp, 0.0_rp, 0.0_rp, 0.0_rp, 0.0_rp, 0.0_rp, 0.0_rp, 'none', 'none'
+               0.0_rp, 0.0_rp, 0.0_rp, 0.0_rp, 0.0_rp, 0.0_rp, 0.0_rp, &
+               0.0_rp, 0.0_rp, 0.0_rp, 0.0_rp, 'none', 'none'
           close(unit)
        end if
        call design%update_design(xbase)
@@ -632,7 +665,8 @@ contains
     call d%free(); call xplus%free(); call xminus%free(); call xbase%free()
     call density_probe%free(); call exact_density_probe%free(); &
          call projected_density_probe%free(); call exact_gradient_probe%free(); &
-         call projected_gradient_probe%free()
+         call projected_gradient_probe%free(); call exact_localB_gradient%free(); &
+         call projected_localB_gradient%free()
   end subroutine rom_audit_finite_difference
 
   !> Gather a vector from all ROM ranks and write a raw float64 file on rank 0.

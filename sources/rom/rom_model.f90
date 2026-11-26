@@ -9,9 +9,29 @@ module rom_model
   use vector, only: vector_t
   use matrix, only: matrix_t
   use scratch_registry, only: neko_scratch_registry
+  use comm, only: pe_rank
+  use utils, only: mkdir, neko_error
   use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
   implicit none
   private
+
+  !> Optional pre-integration export metadata for one candidate BDF1 system.
+  !! `directory` is the final, candidate-specific output directory.
+  type, public :: rom_bdf1_export_context_t
+     character(len=1024) :: directory = ''
+     character(len=128) :: design_id = ''
+     character(len=32) :: basis_forward = ''
+     character(len=32) :: basis_adjoint = ''
+     integer :: outer_iteration = -1
+     integer :: inner_iteration = -1
+     integer :: evaluation_index = -1
+     integer :: trial_basis_rank = -1
+     integer :: test_basis_rank = -1
+     integer :: forward_basis_rank = -1
+     integer :: adjoint_basis_rank = -1
+     integer :: enriched_basis_rank = -1
+     real(kind=rp) :: time_start = 0.0_rp
+  end type rom_bdf1_export_context_t
 
   type, public :: rom_model_t
      integer :: n_state = 0
@@ -19,6 +39,10 @@ module rom_model
      type(vector_t) :: constant
      type(matrix_t) :: linear
      type(matrix_t) :: implicit_linear
+     type(matrix_t) :: bdf1_lu
+     integer, allocatable :: bdf1_pivots(:)
+     real(kind=rp) :: bdf1_factor_dt = -1.0_rp
+     logical :: bdf1_factor_valid = .false.
      ! The third-order tensor is represented as one matrix per residual row.
      type(matrix_t), allocatable :: quadratic(:)
    contains
@@ -26,6 +50,7 @@ module rom_model
      procedure, public :: free => rom_model_free
      procedure, public :: rhs => rom_model_rhs
      procedure, public :: jacobian_state => rom_model_jacobian_state
+     procedure, public :: jacobian_residual_state => rom_model_jacobian_residual_state
      procedure, public :: forward_euler => rom_model_forward_euler
      procedure, public :: forward_bdf1 => rom_model_forward_bdf1
      procedure, public :: discrete_adjoint => rom_model_discrete_adjoint
@@ -33,6 +58,8 @@ module rom_model
      procedure, public :: init_linearized_adjoint => rom_model_init_linearized_adjoint
      procedure, public :: discrete_adjoint_bdf1_timevarying => &
           rom_model_discrete_adjoint_bdf1_timevarying
+     procedure, public :: discrete_adjoint_bdf1_tensor => &
+          rom_model_discrete_adjoint_bdf1_tensor
      procedure, public :: solve_mass => rom_model_solve_mass
      procedure, public :: solve_mass_transpose => rom_model_solve_mass_transpose
      procedure, public :: solve_step_transpose => rom_model_solve_step_transpose
@@ -127,6 +154,10 @@ contains
     call this%constant%free()
     call this%linear%free()
     call this%implicit_linear%free()
+    call this%bdf1_lu%free()
+    if (allocated(this%bdf1_pivots)) deallocate(this%bdf1_pivots)
+    this%bdf1_factor_dt = -1.0_rp
+    this%bdf1_factor_valid = .false.
     if (allocated(this%quadratic)) then
        do i = 1, size(this%quadratic)
           call this%quadratic(i)%free()
@@ -166,26 +197,36 @@ contains
     type(matrix_t), intent(inout) :: jacobian
     type(matrix_t), pointer :: residual_jac
     integer :: residual_jac_index
-    integer :: i, j, k
-
     if (state%size() /= this%n_state) error stop 'ROM Jacobian state size mismatch'
     if (any(jacobian%get_dims() /= [this%n_state, this%n_state])) &
          call jacobian%init(this%n_state, this%n_state)
     call neko_scratch_registry%request_matrix(residual_jac, residual_jac_index, &
          this%n_state, this%n_state, .true.)
-    residual_jac%x = this%linear%x
-    do i = 1, this%n_state
-       do j = 1, this%n_state
-          do k = 1, this%n_state
-             residual_jac%x(i,j) = residual_jac%x(i,j) + &
-                  (this%quadratic(i)%x(j,k) + this%quadratic(i)%x(k,j)) * state%x(k)
-          end do
-       end do
-    end do
+    call this%jacobian_residual_state(state, residual_jac)
     call rom_solve_matrix(this%mass, residual_jac, jacobian)
     call neko_scratch_registry%relinquish_matrix(residual_jac_index)
     nullify(residual_jac)
   end subroutine rom_model_jacobian_state
+
+  !> Assemble the Jacobian of the weak explicit residual, before mass inversion.
+  subroutine rom_model_jacobian_residual_state(this, state, jacobian)
+    class(rom_model_t), intent(in) :: this
+    type(vector_t), intent(in) :: state
+    type(matrix_t), intent(inout) :: jacobian
+    integer :: i, j, k
+    if (state%size() /= this%n_state) error stop 'ROM residual Jacobian state size mismatch'
+    if (any(jacobian%get_dims() /= [this%n_state, this%n_state])) &
+         call jacobian%init(this%n_state, this%n_state)
+    jacobian%x = this%linear%x
+    do i = 1, this%n_state
+       do j = 1, this%n_state
+          do k = 1, this%n_state
+             jacobian%x(i,j) = jacobian%x(i,j) + &
+                  (this%quadratic(i)%x(j,k) + this%quadratic(i)%x(k,j)) * state%x(k)
+          end do
+       end do
+    end do
+  end subroutine rom_model_jacobian_residual_state
 
   !> Integrate the reduced model with explicit forward Euler steps.
   subroutine rom_model_forward_euler(this, initial_state, dt, states)
@@ -217,45 +258,28 @@ contains
   !! reduced BDF1 Helmholtz solve.  The solved matrix is
   !! `mass - dt*implicit_linear`.
   !> Integrate the reduced model with the supported BDF1 scheme.
-  subroutine rom_model_forward_bdf1(this, initial_state, dt, states)
-    class(rom_model_t), intent(in) :: this
+  subroutine rom_model_forward_bdf1(this, initial_state, dt, states, export_context)
+    class(rom_model_t), intent(inout) :: this
     type(vector_t), intent(in) :: initial_state
     real(kind=rp), intent(in) :: dt
     type(matrix_t), intent(inout) :: states
+    type(rom_bdf1_export_context_t), intent(in), optional :: export_context
     type(vector_t), pointer :: state, residual, rhs
-    type(matrix_t), pointer :: step_matrix, step_inverse, identity_rhs
-    integer :: state_index, residual_index, rhs_index, step_matrix_index
-    integer :: step_inverse_index, identity_rhs_index
-    integer :: n_steps, step, i
+    integer :: state_index, residual_index, rhs_index
+    integer :: n_steps, step
 
     n_steps = states%get_ncols() - 1
     if (states%get_nrows() /= this%n_state .or. initial_state%size() /= this%n_state) &
          error stop 'ROM BDF1 trajectory size mismatch'
+    ! Persist the exact reduced map before factorisation or time stepping.  A
+    ! later singular solve, non-finite residual, or growing state therefore
+    ! leaves the candidate operators and identifiers available for diagnosis.
+    if (present(export_context)) &
+         call rom_model_export_bdf1_system(this, initial_state, dt, n_steps, export_context)
     call neko_scratch_registry%request_vector(state, state_index, this%n_state, .true.)
     call neko_scratch_registry%request_vector(residual, residual_index, this%n_state, .true.)
     call neko_scratch_registry%request_vector(rhs, rhs_index, this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(step_matrix, step_matrix_index, &
-         this%n_state, this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(step_inverse, step_inverse_index, &
-         this%n_state, this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(identity_rhs, identity_rhs_index, &
-         this%n_state, this%n_state, .true.)
-    step_matrix%x = this%mass%x - dt * this%implicit_linear%x
-    if (any(.not. ieee_is_finite(step_matrix%x))) then
-       write(*,'(A)') 'ROM BDF1 failure: non-finite implicit step matrix'
-       error stop 'non-finite ROM BDF1 step matrix'
-    end if
-    identity_rhs%x = 0.0_rp
-    do i = 1, this%n_state
-       identity_rhs%x(i,i) = 1.0_rp
-    end do
-    ! The BDF1 matrix is fixed throughout this trajectory.  Solve for its
-    ! inverse once, rather than refactorising it at every ROM substep.
-    call rom_solve_matrix(step_matrix, identity_rhs, step_inverse)
-    if (any(.not. ieee_is_finite(step_inverse%x))) then
-       write(*,'(A)') 'ROM BDF1 failure: non-finite inverse step matrix'
-       error stop 'non-finite ROM BDF1 inverse step matrix'
-    end if
+    call rom_model_prepare_bdf1_factor(this, dt)
     states%x(:,1) = initial_state%x
     if (any(.not. ieee_is_finite(states%x(:,1)))) then
        write(*,'(A)') 'ROM BDF1 failure: non-finite initial reduced state'
@@ -274,7 +298,7 @@ contains
           write(*,'(A,I0)') 'ROM BDF1 failure: non-finite right-hand side at step ', step
           error stop 'non-finite ROM BDF1 right-hand side'
        end if
-       state%x = matmul(step_inverse%x, rhs%x)
+       call rom_lu_solve(this%bdf1_lu, this%bdf1_pivots, rhs, state)
        if (any(.not. ieee_is_finite(state%x))) then
           write(*,'(A,I0)') 'ROM BDF1 failure: non-finite state at step ', step
           error stop 'non-finite ROM BDF1 state'
@@ -282,11 +306,121 @@ contains
        states%x(:,step+1) = state%x
     end do
     call neko_scratch_registry%relinquish_vector([state_index, residual_index, rhs_index])
-    call neko_scratch_registry%relinquish_matrix([step_matrix_index, &
-         step_inverse_index, identity_rhs_index])
-    nullify(state); nullify(residual); nullify(rhs); nullify(step_matrix)
-    nullify(step_inverse); nullify(identity_rhs)
+    nullify(state); nullify(residual); nullify(rhs)
   end subroutine rom_model_forward_bdf1
+
+  !> Export one candidate reduced system using the standalone ROM reader's
+  !! `metadata.json`, `H.csv`, `b.csv`, `linear_explicit.csv`,
+  !! `linear_implicit.csv`, `Q.csv`, and `a0.csv` contract.
+  subroutine rom_model_export_bdf1_system(this, initial_state, dt, n_steps, context)
+    class(rom_model_t), intent(in) :: this
+    type(vector_t), intent(in) :: initial_state
+    real(kind=rp), intent(in) :: dt
+    integer, intent(in) :: n_steps
+    type(rom_bdf1_export_context_t), intent(in) :: context
+    integer :: unit, ios, i, j, k
+    character(len=1024) :: filename
+
+    if (pe_rank /= 0) return
+    if (len_trim(context%directory) == 0) &
+         call neko_error('ROM BDF1 export context has an empty directory')
+    if (initial_state%size() /= this%n_state .or. n_steps < 0) &
+         call neko_error('ROM BDF1 export context has inconsistent state dimensions')
+    call mkdir(trim(context%directory))
+
+    filename = trim(context%directory)//'/H.csv'
+    call rom_model_write_matrix_csv(trim(filename), this%mass%x)
+    filename = trim(context%directory)//'/b.csv'
+    call rom_model_write_vector_csv(trim(filename), this%constant%x)
+    filename = trim(context%directory)//'/linear_explicit.csv'
+    call rom_model_write_matrix_csv(trim(filename), this%linear%x)
+    filename = trim(context%directory)//'/linear_implicit.csv'
+    call rom_model_write_matrix_csv(trim(filename), this%implicit_linear%x)
+    filename = trim(context%directory)//'/a0.csv'
+    call rom_model_write_vector_csv(trim(filename), initial_state%x)
+
+    filename = trim(context%directory)//'/Q.csv'
+    open(newunit=unit, file=trim(filename), status='replace', action='write', iostat=ios)
+    if (ios /= 0) call neko_error('could not open ROM BDF1 quadratic export')
+    write(unit, '(A)') 'i,j,k,value'
+    do i = 1, this%n_state
+       do j = 1, this%n_state
+          do k = 1, this%n_state
+             if (this%quadratic(i)%x(j,k) == 0.0_rp) cycle
+             write(unit, '(I0,",",I0,",",I0,",",ES27.16E3)') &
+                  i, j, k, this%quadratic(i)%x(j,k)
+          end do
+       end do
+    end do
+    close(unit)
+
+    filename = trim(context%directory)//'/metadata.json'
+    open(newunit=unit, file=trim(filename), status='replace', action='write', iostat=ios)
+    if (ios /= 0) call neko_error('could not open ROM BDF1 export metadata')
+    write(unit, '(A)') '{'
+    write(unit, '(A,I0,A)') '  "n_state": ', this%n_state, ','
+    write(unit, '(A,I0,A)') '  "trial_basis_rank": ', context%trial_basis_rank, ','
+    write(unit, '(A,I0,A)') '  "test_basis_rank": ', context%test_basis_rank, ','
+    write(unit, '(A,I0,A)') '  "forward_basis_rank": ', context%forward_basis_rank, ','
+    write(unit, '(A,I0,A)') '  "adjoint_basis_rank": ', context%adjoint_basis_rank, ','
+    write(unit, '(A,I0,A)') '  "enriched_basis_rank": ', context%enriched_basis_rank, ','
+    write(unit, '(A,I0,A)') '  "outer_iteration": ', context%outer_iteration, ','
+    write(unit, '(A,I0,A)') '  "inner_iteration": ', context%inner_iteration, ','
+    write(unit, '(A,I0,A)') '  "evaluation_index": ', context%evaluation_index, ','
+    write(unit, '(A,A,A)') '  "design_id": "', trim(context%design_id), '",'
+    write(unit, '(A,A,A)') '  "basis_forward": "', trim(context%basis_forward), '",'
+    write(unit, '(A,A,A)') '  "basis_adjoint": "', trim(context%basis_adjoint), '",'
+    write(unit, '(A)') '  "export_stage": "pre_forward_bdf1",'
+    write(unit, '(A,ES27.16E3,A)') '  "time_start": ', context%time_start, ','
+    write(unit, '(A,ES27.16E3,A)') '  "dt": ', dt, ','
+    write(unit, '(A,I0,A)') '  "n_steps": ', n_steps, ','
+    write(unit, '(A,ES27.16E3,A)') '  "time_end": ', &
+         context%time_start + real(n_steps, rp) * dt, ','
+    write(unit, '(A)') '  "basis_layout": "reduced coefficient space",'
+    write(unit, '(A)') '  "q_indexing": "Q[i,j,k] = sum_jk coefficient for residual i",'
+    write(unit, '(A)') '  "b_definition": "constant residual vector",'
+    write(unit, '(A)') '  "linear_explicit_definition": "linear residual matrix",'
+    write(unit, '(A)') '  "linear_implicit_definition": "implicit BDF1 residual matrix",'
+    write(unit, '(A)') '  "files": {'
+    write(unit, '(A)') '    "H": "H.csv", "b": "b.csv",'
+    write(unit, '(A)') '    "linear_explicit": "linear_explicit.csv",'
+    write(unit, '(A)') '    "linear_implicit": "linear_implicit.csv",'
+    write(unit, '(A)') '    "Q": "Q.csv", "a0": "a0.csv"'
+    write(unit, '(A)') '  }'
+    write(unit, '(A)') '}'
+    flush(unit)
+    close(unit)
+  end subroutine rom_model_export_bdf1_system
+
+  !> Write dense reduced rows using an explicit three-digit exponent.
+  subroutine rom_model_write_matrix_csv(filename, values)
+    character(len=*), intent(in) :: filename
+    real(kind=rp), intent(in) :: values(:, :)
+    integer :: unit, ios, i, j
+    open(newunit=unit, file=trim(filename), status='replace', action='write', iostat=ios)
+    if (ios /= 0) call neko_error('could not open ROM BDF1 matrix export')
+    do i = 1, size(values,1)
+       do j = 1, size(values,2)
+          if (j > 1) write(unit, '(A)', advance='no') ','
+          write(unit, '(ES27.16E3)', advance='no') values(i,j)
+       end do
+       write(unit, '(A)') ''
+    end do
+    close(unit)
+  end subroutine rom_model_write_matrix_csv
+
+  !> Write a reduced vector in the reader-compatible one-column CSV form.
+  subroutine rom_model_write_vector_csv(filename, values)
+    character(len=*), intent(in) :: filename
+    real(kind=rp), intent(in) :: values(:)
+    integer :: unit, ios, i
+    open(newunit=unit, file=trim(filename), status='replace', action='write', iostat=ios)
+    if (ios /= 0) call neko_error('could not open ROM BDF1 vector export')
+    do i = 1, size(values)
+       write(unit, '(ES27.16E3)') values(i)
+    end do
+    close(unit)
+  end subroutine rom_model_write_vector_csv
 
   !> Discrete adjoint of the explicit Euler map used above.
   !> Integrate the discrete adjoint of the explicit reduced model backward.
@@ -348,19 +482,19 @@ contains
   !> Discrete adjoint of the first-order Neko Pn/Pn BDF1 map.
   !> Integrate the BDF1 discrete adjoint backward through the trajectory.
   subroutine rom_model_discrete_adjoint_bdf1(this, states, dt, &
-       running_state_gradient, terminal_state_gradient, adjoint)
-    class(rom_model_t), intent(in) :: this
+       running_state_gradient, terminal_state_gradient, adjoint, lambda_history)
+    class(rom_model_t), intent(inout) :: this
     type(matrix_t), intent(in) :: states, running_state_gradient
     real(kind=rp), intent(in) :: dt
     type(vector_t), intent(in) :: terminal_state_gradient
     type(matrix_t), intent(inout) :: adjoint
+    type(matrix_t), intent(inout), optional :: lambda_history
     type(vector_t), pointer :: state, running, terminal, next_adjoint, current_adjoint
-    type(matrix_t), pointer :: jacobian, map_jacobian, step_matrix, rhs_matrix
-    type(matrix_t), pointer :: step_inverse, identity_rhs
+    type(vector_t), pointer :: lambda, mass_adjoint
+    type(matrix_t), pointer :: residual_jacobian
     integer :: state_index, running_index, terminal_index, next_index, current_index
-    integer :: jacobian_index, map_index, step_index, rhs_index
-    integer :: step_inverse_index, identity_rhs_index
-    integer :: n_steps, step, i
+    integer :: lambda_index, mass_adjoint_index, jacobian_index
+    integer :: n_steps, step
 
     n_steps = states%get_ncols() - 1
     if (states%get_nrows() /= this%n_state .or. &
@@ -371,42 +505,35 @@ contains
     end if
     if (any(adjoint%get_dims() /= [this%n_state, n_steps + 1])) &
          call adjoint%init(this%n_state, n_steps + 1)
+    if (present(lambda_history)) then
+       if (any(lambda_history%get_dims() /= [this%n_state, n_steps])) &
+            call lambda_history%init(this%n_state, n_steps)
+    end if
     call neko_scratch_registry%request_vector(state, state_index, this%n_state, .true.)
     call neko_scratch_registry%request_vector(running, running_index, this%n_state, .true.)
     call neko_scratch_registry%request_vector(terminal, terminal_index, this%n_state, .true.)
     call neko_scratch_registry%request_vector(next_adjoint, next_index, this%n_state, .true.)
     call neko_scratch_registry%request_vector(current_adjoint, current_index, this%n_state, .true.)
+    call neko_scratch_registry%request_vector(lambda, lambda_index, this%n_state, .true.)
+    call neko_scratch_registry%request_vector(mass_adjoint, mass_adjoint_index, &
+         this%n_state, .true.)
     terminal%x = terminal_state_gradient%x
     adjoint%x(:,n_steps+1) = terminal%x
     if (any(.not. ieee_is_finite(adjoint%x(:,n_steps+1)))) then
        error stop 'non-finite ROM BDF1 adjoint terminal state'
     end if
-    call neko_scratch_registry%request_matrix(jacobian, jacobian_index, &
+    call neko_scratch_registry%request_matrix(residual_jacobian, jacobian_index, &
          this%n_state, this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(map_jacobian, map_index, &
-         this%n_state, this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(step_matrix, step_index, &
-         this%n_state, this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(step_inverse, step_inverse_index, &
-         this%n_state, this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(identity_rhs, identity_rhs_index, &
-         this%n_state, this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(rhs_matrix, rhs_index, &
-         this%n_state, this%n_state, .true.)
-    step_matrix%x = this%mass%x - dt * this%implicit_linear%x
-    identity_rhs%x = 0.0_rp
-    do i = 1, this%n_state
-       identity_rhs%x(i,i) = 1.0_rp
-    end do
-    call rom_solve_matrix(step_matrix, identity_rhs, step_inverse)
     do step = n_steps, 1, -1
        state%x = states%x(:,step)
        next_adjoint%x = adjoint%x(:,step+1)
        running%x = running_state_gradient%x(:,step)
-       call this%jacobian_state(state, jacobian)
-       rhs_matrix%x = this%mass%x + dt * matmul(this%mass%x, jacobian%x)
-       map_jacobian%x = matmul(step_inverse%x, rhs_matrix%x)
-       current_adjoint%x = matmul(transpose(map_jacobian%x), next_adjoint%x) + dt * running%x
+       call this%jacobian_residual_state(state, residual_jacobian)
+       call this%solve_step_transpose(dt, next_adjoint, lambda)
+       if (present(lambda_history)) lambda_history%x(:,step) = lambda%x
+       mass_adjoint%x = matmul(transpose(this%mass%x), lambda%x)
+       current_adjoint%x = mass_adjoint%x + dt * &
+            matmul(transpose(residual_jacobian%x), lambda%x) + dt * running%x
        if (any(.not. ieee_is_finite(current_adjoint%x))) then
           error stop 'non-finite ROM BDF1 adjoint state'
        end if
@@ -414,12 +541,11 @@ contains
     end do
     call neko_scratch_registry%relinquish_vector([state_index, running_index, &
          terminal_index, next_index, current_index])
-    call neko_scratch_registry%relinquish_matrix([jacobian_index, map_index, &
-         step_index, rhs_index, step_inverse_index, identity_rhs_index])
+    call neko_scratch_registry%relinquish_vector([lambda_index, mass_adjoint_index])
+    call neko_scratch_registry%relinquish_matrix(jacobian_index)
     nullify(state); nullify(running); nullify(terminal); nullify(next_adjoint)
-    nullify(current_adjoint); nullify(jacobian); nullify(map_jacobian)
-    nullify(step_matrix); nullify(rhs_matrix); nullify(step_inverse)
-    nullify(identity_rhs)
+    nullify(current_adjoint); nullify(lambda); nullify(mass_adjoint)
+    nullify(residual_jacobian)
   end subroutine rom_model_discrete_adjoint_bdf1
 
   !> Integrate an enriched adjoint with a time-dependent projected Jacobian.
@@ -436,19 +562,15 @@ contains
   !! and the adjoint basis to have different dimensions.
   subroutine rom_model_discrete_adjoint_bdf1_timevarying(this, dt, &
        running_state_gradient, terminal_state_gradient, time_jacobian, adjoint)
-    class(rom_model_t), intent(in) :: this
+    class(rom_model_t), intent(inout) :: this
     real(kind=rp), intent(in) :: dt
     type(matrix_t), intent(in) :: running_state_gradient
     type(vector_t), intent(in) :: terminal_state_gradient
     type(matrix_t), intent(in) :: time_jacobian(:)
     type(matrix_t), intent(inout) :: adjoint
-    type(vector_t), pointer :: running, next_adjoint, current_adjoint
-    type(matrix_t), pointer :: step_matrix, rhs_matrix, map_jacobian
-    type(matrix_t), pointer :: step_inverse, identity_rhs
-    integer :: running_index, next_index, current_index
-    integer :: step_index, rhs_index, map_index
-    integer :: step_inverse_index, identity_rhs_index
-    integer :: n_steps, step, i
+    type(vector_t), pointer :: running, next_adjoint, current_adjoint, lambda
+    integer :: running_index, next_index, current_index, lambda_index
+    integer :: n_steps, step
 
     n_steps = running_state_gradient%get_ncols()
     if (running_state_gradient%get_nrows() /= this%n_state .or. &
@@ -465,23 +587,7 @@ contains
          this%n_state, .true.)
     call neko_scratch_registry%request_vector(current_adjoint, current_index, &
          this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(step_matrix, step_index, &
-         this%n_state, this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(step_inverse, step_inverse_index, &
-         this%n_state, this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(identity_rhs, identity_rhs_index, &
-         this%n_state, this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(rhs_matrix, rhs_index, &
-         this%n_state, this%n_state, .true.)
-    call neko_scratch_registry%request_matrix(map_jacobian, map_index, &
-         this%n_state, this%n_state, .true.)
-
-    step_matrix%x = this%mass%x - dt * this%implicit_linear%x
-    identity_rhs%x = 0.0_rp
-    do i = 1, this%n_state
-       identity_rhs%x(i,i) = 1.0_rp
-    end do
-    call rom_solve_matrix(step_matrix, identity_rhs, step_inverse)
+    call neko_scratch_registry%request_vector(lambda, lambda_index, this%n_state, .true.)
     adjoint%x(:,n_steps+1) = terminal_state_gradient%x
     if (any(.not. ieee_is_finite(adjoint%x(:,n_steps+1)))) then
        write(*,'(A)') 'ROM time-varying adjoint failure: non-finite terminal gradient'
@@ -490,14 +596,9 @@ contains
     do step = n_steps, 1, -1
        next_adjoint%x = adjoint%x(:,step+1)
        running%x = running_state_gradient%x(:,step)
-       rhs_matrix%x = this%mass%x + dt * time_jacobian(step)%x
-       if (any(.not. ieee_is_finite(rhs_matrix%x))) then
-          write(*,'(A,I0)') 'ROM time-varying adjoint failure: non-finite map at step ', step
-          error stop 'non-finite ROM time-varying adjoint map'
-       end if
-       map_jacobian%x = matmul(step_inverse%x, rhs_matrix%x)
-       current_adjoint%x = matmul(transpose(map_jacobian%x), next_adjoint%x) + &
-            dt * running%x
+       call this%solve_step_transpose(dt, next_adjoint, lambda)
+       current_adjoint%x = matmul(transpose(this%mass%x), lambda%x) + &
+            dt * matmul(transpose(time_jacobian(step)%x), lambda%x) + dt * running%x
        if (any(.not. ieee_is_finite(current_adjoint%x))) then
           write(*,'(A,I0)') 'ROM time-varying adjoint failure: non-finite state at step ', step
           error stop 'non-finite ROM time-varying adjoint state'
@@ -507,12 +608,83 @@ contains
 
     call neko_scratch_registry%relinquish_vector([running_index, next_index, &
          current_index])
-    call neko_scratch_registry%relinquish_matrix([step_index, rhs_index, map_index, &
-         step_inverse_index, identity_rhs_index])
+    call neko_scratch_registry%relinquish_vector(lambda_index)
     nullify(running); nullify(next_adjoint); nullify(current_adjoint)
-    nullify(step_matrix); nullify(rhs_matrix); nullify(map_jacobian)
-    nullify(step_inverse); nullify(identity_rhs)
+    nullify(lambda)
   end subroutine rom_model_discrete_adjoint_bdf1_timevarying
+
+  !> Integrate a BDF1 discrete adjoint using a preassembled affine Jacobian
+  !! tensor without retaining one dense Jacobian per time step.
+  !!
+  !! `linearized_tensor(k)` is the reduced matrix C_k in
+  !! J_n = fixed_linear + sum_k a_(n,k) C_k.  The forward coefficients are
+  !! read from `states(:,n)`. If requested, `residual_multipliers(:,n)` stores
+  !! lambda_n = (H-dt*L_i)^(-T) p_(n+1) for subsequent spatial correlations.
+  subroutine rom_model_discrete_adjoint_bdf1_tensor(this, states, dt, &
+       running_state_gradient, terminal_state_gradient, fixed_linear, &
+       linearized_tensor, adjoint, residual_multipliers)
+    class(rom_model_t), intent(inout) :: this
+    type(matrix_t), intent(in) :: states, running_state_gradient, fixed_linear
+    real(kind=rp), intent(in) :: dt
+    type(vector_t), intent(in) :: terminal_state_gradient
+    type(matrix_t), intent(in) :: linearized_tensor(:)
+    type(matrix_t), intent(inout) :: adjoint
+    type(matrix_t), intent(inout), optional :: residual_multipliers
+    type(vector_t), pointer :: running, next_adjoint, current_adjoint, lambda
+    integer :: running_index, next_index, current_index, lambda_index
+    integer :: n_steps, n_forward, step, k, e
+
+    n_steps = running_state_gradient%get_ncols()
+    e = this%n_state
+    n_forward = states%get_nrows()
+    if (states%get_ncols() /= n_steps + 1 .or. &
+         running_state_gradient%get_nrows() /= e .or. &
+         terminal_state_gradient%size() /= e .or. &
+         fixed_linear%get_nrows() /= e .or. fixed_linear%get_ncols() /= e .or. &
+         size(linearized_tensor) /= n_forward) &
+         error stop 'ROM tensor adjoint state size mismatch'
+    do k = 1, n_forward
+       if (linearized_tensor(k)%get_nrows() /= e .or. &
+            linearized_tensor(k)%get_ncols() /= e) &
+            error stop 'ROM tensor adjoint Jacobian shape mismatch'
+    end do
+    if (any(adjoint%get_dims() /= [e, n_steps + 1])) &
+         call adjoint%init(e, n_steps + 1)
+    if (present(residual_multipliers)) then
+       if (any(residual_multipliers%get_dims() /= [e, n_steps])) &
+            call residual_multipliers%init(e, n_steps)
+       residual_multipliers%x = 0.0_rp
+    end if
+
+    call neko_scratch_registry%request_vector(running, running_index, e, .true.)
+    call neko_scratch_registry%request_vector(next_adjoint, next_index, e, .true.)
+    call neko_scratch_registry%request_vector(current_adjoint, current_index, e, .true.)
+    call neko_scratch_registry%request_vector(lambda, lambda_index, e, .true.)
+    adjoint%x(:,n_steps+1) = terminal_state_gradient%x
+    if (any(.not. ieee_is_finite(adjoint%x(:,n_steps+1)))) &
+         error stop 'non-finite ROM tensor-adjoint terminal state'
+
+    do step = n_steps, 1, -1
+       next_adjoint%x = adjoint%x(:,step+1)
+       running%x = running_state_gradient%x(:,step)
+       call this%solve_step_transpose(dt, next_adjoint, lambda)
+       current_adjoint%x = matmul(transpose(this%mass%x), lambda%x) + &
+            dt * matmul(transpose(fixed_linear%x), lambda%x) + dt * running%x
+       do k = 1, n_forward
+          current_adjoint%x = current_adjoint%x + dt * states%x(k,step) * &
+               matmul(transpose(linearized_tensor(k)%x), lambda%x)
+       end do
+       if (any(.not. ieee_is_finite(current_adjoint%x))) &
+            error stop 'non-finite ROM tensor-adjoint state'
+       adjoint%x(:,step) = current_adjoint%x
+       if (present(residual_multipliers)) &
+            residual_multipliers%x(:,step) = lambda%x
+    end do
+
+    call neko_scratch_registry%relinquish_vector([running_index, next_index, &
+         current_index, lambda_index])
+    nullify(running); nullify(next_adjoint); nullify(current_adjoint); nullify(lambda)
+  end subroutine rom_model_discrete_adjoint_bdf1_tensor
 
   !> Solve the transpose reduced mass system.
   subroutine rom_model_solve_mass_transpose(this, rhs, solution)
@@ -532,19 +704,121 @@ contains
 
   !> Solve one transpose implicit BDF1 step matrix.
   subroutine rom_model_solve_step_transpose(this, dt, rhs, solution)
-    class(rom_model_t), intent(in) :: this
+    class(rom_model_t), intent(inout) :: this
     real(kind=rp), intent(in) :: dt
     type(vector_t), intent(in) :: rhs
     type(vector_t), intent(inout) :: solution
-    type(matrix_t), pointer :: step_matrix
-    integer :: step_matrix_index
-    call neko_scratch_registry%request_matrix(step_matrix, step_matrix_index, &
-         this%n_state, this%n_state, .true.)
-    step_matrix%x = this%mass%x - dt * this%implicit_linear%x
-    call rom_solve_transpose(step_matrix, rhs, solution)
-    call neko_scratch_registry%relinquish_matrix(step_matrix_index)
-    nullify(step_matrix)
+    call rom_model_prepare_bdf1_factor(this, dt)
+    call rom_lu_solve_transpose(this%bdf1_lu, this%bdf1_pivots, rhs, solution)
   end subroutine rom_model_solve_step_transpose
+
+  !> Build and cache the BDF1 LU factors for the current reduced operators.
+  subroutine rom_model_prepare_bdf1_factor(this, dt)
+    class(rom_model_t), intent(inout) :: this
+    real(kind=rp), intent(in) :: dt
+    if (this%bdf1_factor_valid .and. this%bdf1_factor_dt == dt) return
+    call this%bdf1_lu%init(this%n_state, this%n_state)
+    this%bdf1_lu%x = this%mass%x - dt * this%implicit_linear%x
+    if (any(.not. ieee_is_finite(this%bdf1_lu%x))) then
+       error stop 'non-finite ROM BDF1 step matrix'
+    end if
+    call rom_lu_factorize(this%bdf1_lu, this%bdf1_pivots)
+    this%bdf1_factor_dt = dt
+    this%bdf1_factor_valid = .true.
+  end subroutine rom_model_prepare_bdf1_factor
+
+  !> In-place partial-pivot LU factorization, P*B = L*U.
+  subroutine rom_lu_factorize(factors, pivots)
+    type(matrix_t), intent(inout) :: factors
+    integer, allocatable, intent(inout) :: pivots(:)
+    integer :: n, i, j, pivot
+    real(kind=rp) :: largest, factor
+    n = factors%get_nrows()
+    if (n < 1 .or. factors%get_ncols() /= n) error stop 'ROM LU shape mismatch'
+    if (allocated(pivots)) deallocate(pivots)
+    allocate(pivots(n))
+    do i = 1, n
+       pivot = i
+       largest = abs(factors%x(i,i))
+       do j = i + 1, n
+          if (abs(factors%x(j,i)) > largest) then
+             largest = abs(factors%x(j,i))
+             pivot = j
+          end if
+       end do
+       if (largest <= epsilon(1.0_rp)) error stop 'singular ROM BDF1 step matrix'
+       pivots(i) = pivot
+       if (pivot /= i) call swap_rows(factors, i, pivot)
+       do j = i + 1, n
+          factor = factors%x(j,i) / factors%x(i,i)
+          factors%x(j,i) = factor
+          factors%x(j,i+1:n) = factors%x(j,i+1:n) - factor * factors%x(i,i+1:n)
+       end do
+    end do
+  end subroutine rom_lu_factorize
+
+  !> Solve B*x=rhs from cached P*B=L*U factors.
+  subroutine rom_lu_solve(factors, pivots, rhs, solution)
+    type(matrix_t), intent(in) :: factors
+    integer, intent(in) :: pivots(:)
+    type(vector_t), intent(in) :: rhs
+    type(vector_t), intent(inout) :: solution
+    real(kind=rp), allocatable :: work(:)
+    real(kind=rp) :: tmp
+    integer :: n, i, j
+    n = rhs%size()
+    if (factors%get_nrows() /= n .or. size(pivots) /= n) error stop 'ROM LU solve shape mismatch'
+    if (solution%size() /= n) call solution%init(n)
+    allocate(work(n)); work = rhs%x
+    do i = 1, n
+       if (pivots(i) /= i) then
+          tmp = work(i); work(i) = work(pivots(i)); work(pivots(i)) = tmp
+       end if
+    end do
+    do i = 1, n
+       do j = i + 1, n
+          work(j) = work(j) - factors%x(j,i) * work(i)
+       end do
+    end do
+    do i = n, 1, -1
+       if (i < n) work(i) = work(i) - sum(factors%x(i,i+1:n) * work(i+1:n))
+       work(i) = work(i) / factors%x(i,i)
+    end do
+    solution%x = work
+    deallocate(work)
+  end subroutine rom_lu_solve
+
+  !> Solve B^T*x=rhs from cached P*B=L*U factors.
+  subroutine rom_lu_solve_transpose(factors, pivots, rhs, solution)
+    type(matrix_t), intent(in) :: factors
+    integer, intent(in) :: pivots(:)
+    type(vector_t), intent(in) :: rhs
+    type(vector_t), intent(inout) :: solution
+    real(kind=rp), allocatable :: work(:)
+    real(kind=rp) :: tmp
+    integer :: n, i, j
+    n = rhs%size()
+    if (factors%get_nrows() /= n .or. size(pivots) /= n) error stop 'ROM transpose LU shape mismatch'
+    if (solution%size() /= n) call solution%init(n)
+    allocate(work(n)); work = rhs%x
+    ! U^T*y=rhs.
+    do i = 1, n
+       if (i > 1) work(i) = work(i) - sum(factors%x(1:i-1,i) * work(1:i-1))
+       work(i) = work(i) / factors%x(i,i)
+    end do
+    ! L^T*z=y (unit diagonal).
+    do i = n, 1, -1
+       if (i < n) work(i) = work(i) - sum(factors%x(i+1:n,i) * work(i+1:n))
+    end do
+    ! Undo the row permutations in reverse order to apply P^T.
+    do i = n, 1, -1
+       if (pivots(i) /= i) then
+          tmp = work(i); work(i) = work(pivots(i)); work(pivots(i)) = tmp
+       end if
+    end do
+    solution%x = work
+    deallocate(work)
+  end subroutine rom_lu_solve_transpose
 
   !> Evaluate only the explicit portion of the reduced residual.
   subroutine rom_model_explicit_residual(this, state, residual)

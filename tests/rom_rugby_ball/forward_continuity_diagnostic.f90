@@ -1,12 +1,13 @@
 program rom_forward_continuity_diagnostic
   use neko, only: neko_init, neko_finalize
   use neko_top, only: neko_top_register_types
+  use user, only: user_setup
   use simulation_m, only: simulation_t
   use fluid_pnpn, only: fluid_pnpn_t
   use file, only: file_t
   use fld_file_data, only: fld_file_data_t
   use field, only: field_t
-  use field_math, only: field_col3, field_rzero
+  use field_math, only: field_col3, field_rzero, field_copy, field_add2s2
   use gather_scatter, only: GS_OP_ADD
   use math, only: col2, glsc3
   use operators, only: div, ortho
@@ -15,6 +16,7 @@ program rom_forward_continuity_diagnostic
   use num_types, only: rp
   use comm, only: pe_rank
   use utils, only: neko_error
+  use rom_lift, only: rom_lift_t
   use, intrinsic :: iso_c_binding, only: c_ptr, C_NULL_PTR
   implicit none
 
@@ -25,21 +27,23 @@ program rom_forward_continuity_diagnostic
   type(json_file) :: parameters
   type(field_t) :: u, v, w, p, p_res, u_zero, v_zero, w_zero
   type(field_t) :: f_x, f_y, f_z, divergence
-  real(kind=rp) :: lift(3) = [1.0_rp, 0.0_rp, 0.0_rp]
+  type(rom_lift_t) :: rom_lift
+  real(kind=rp) :: lift_difference, velocity_mass_norm
   real(kind=rp) :: physical_residual, homogeneous_residual
   real(kind=rp) :: physical_divergence, homogeneous_divergence
   integer :: argc, n, snapshot, n_snapshots, n_modes, mode, unit
   character(len=1024) :: case_file, snapshots_path, modes_path, output_file
-  logical :: found
+  logical :: found, modes_present
   type(c_ptr) :: event
 
   argc = command_argument_count()
   if (argc < 3) call neko_error( &
-       'Usage: forward_continuity_diagnostic CASE SNAPSHOTS.fld MODES.fld '&
+       'Usage: forward_continuity_diagnostic CASE SNAPSHOTS.fld MODES.fld|none '&
        //'[n_snapshots] [CSV]')
   call get_command_argument(1, case_file)
   call get_command_argument(2, snapshots_path)
   call get_command_argument(3, modes_path)
+  modes_present = trim(modes_path) /= 'none'
   n_snapshots = 17
   if (argc >= 4) then
      call get_command_argument(4, output_file)
@@ -52,6 +56,7 @@ program rom_forward_continuity_diagnostic
   call neko_top_register_types()
   parameters = json_read_file(trim(case_file))
   call parameters%update('unsteady', .false., found)
+  call user_setup(simulation%neko_case%user)
   call simulation%init(parameters)
   select type (fluid_in => simulation%fluid)
   type is (fluid_pnpn_t)
@@ -61,6 +66,9 @@ program rom_forward_continuity_diagnostic
   end select
 
   n = fluid%u%dof%size()
+  call rom_lift%init(simulation%neko_case)
+  if (.not. rom_lift%enabled) call neko_error( &
+       'Forward continuity diagnostic requires the active ROM lift')
   call u%init(fluid%dm_Xh, 'continuity_u')
   call v%init(fluid%dm_Xh, 'continuity_v')
   call w%init(fluid%dm_Xh, 'continuity_w')
@@ -74,21 +82,36 @@ program rom_forward_continuity_diagnostic
   call f_z%init(fluid%dm_Xh, 'continuity_f_z')
   call divergence%init(fluid%dm_Xh, 'continuity_divergence')
   call field_rzero(u_zero); call field_rzero(v_zero); call field_rzero(w_zero)
+  call field_copy(u, rom_lift%velocity(1))
+  call field_copy(v, rom_lift%velocity(2))
+  call field_copy(w, rom_lift%velocity(3))
   event = C_NULL_PTR
 
   call data%init()
-  call modes_file%init(trim(modes_path))
-  call modes_file%set_counter(0)
-  call modes_file%read(data)
-  if (data%n_scalars < 3 .or. mod(data%n_scalars, 3) /= 0) then
-     call neko_error('Mode file must contain 3*N velocity fields')
+  if (modes_present) then
+     call modes_file%init(trim(modes_path))
+     call modes_file%set_counter(0)
+     call modes_file%read(data)
+     if (data%n_scalars < 3 .or. mod(data%n_scalars, 3) /= 0) then
+        call neko_error('Mode file must contain 3*N velocity fields')
+     end if
+     n_modes = data%n_scalars / 3
   end if
-  n_modes = data%n_scalars / 3
 
   if (pe_rank == 0) then
      open(newunit=unit, file=trim(output_file), status='replace', action='write')
-     write(unit, '(A)') 'kind,index,weak_residual,strong_divergence'
+    write(unit, '(A)') 'kind,index,weak_residual,strong_divergence,' // &
+         'velocity_mass_norm,weak_relative,strong_relative,relative_lift_difference'
   end if
+  call field_copy(u, rom_lift%reference(1))
+  call field_copy(v, rom_lift%reference(2))
+  call field_copy(w, rom_lift%reference(3))
+  lift_difference = relative_lift_error(u, v, w)
+  call measure_fields('lift_reference', -2, u, v, w, lift_difference)
+  call field_copy(u, rom_lift%velocity(1))
+  call field_copy(v, rom_lift%velocity(2))
+  call field_copy(w, rom_lift%velocity(3))
+  call measure_fields('boundary_lift', -1, u, v, w)
 
   call snapshot_file%init(trim(snapshots_path))
   do snapshot = 0, n_snapshots - 1
@@ -98,28 +121,35 @@ program rom_forward_continuity_diagnostic
      call snapshot_file%read(data)
      if (data%n_scalars < 3) call neko_error('Snapshot file has fewer than 3 fields')
      call load_fields(fluid, data, u, v, w, n)
-     call measure_fields('snapshot_physical', snapshot, u, v, w)
-     u%x = u%x - lift(1); v%x = v%x - lift(2); w%x = w%x - lift(3)
+     lift_difference = relative_lift_error(u, v, w)
+     call measure_fields('snapshot_physical', snapshot, u, v, w, lift_difference)
+     call field_add2s2(u, rom_lift%velocity(1), -1.0_rp, n)
+     call field_add2s2(v, rom_lift%velocity(2), -1.0_rp, n)
+     call field_add2s2(w, rom_lift%velocity(3), -1.0_rp, n)
      call measure_fields('snapshot_homogeneous', snapshot, u, v, w)
      call data%free()
   end do
 
-  call data%free()
-  call data%init()
-  call modes_file%set_counter(0)
-  call modes_file%read(data)
-  do mode = 0, n_modes - 1
-     call load_fields_at(fluid, data, u, v, w, n, 3 * mode)
-     call fluid%bcs_vel_projector%apply(u%x, v%x, w%x, n)
-     call measure_fields('pod_mode_restricted', mode, u, v, w)
-  end do
+  if (modes_present) then
+     call data%free()
+     call data%init()
+     call modes_file%set_counter(0)
+     call modes_file%read(data)
+     do mode = 0, n_modes - 1
+        call load_fields_at(fluid, data, u, v, w, n, 3 * mode)
+        call fluid%bcs_vel_projector%apply(u%x, v%x, w%x, n)
+        call measure_fields('pod_mode_restricted', mode, u, v, w)
+     end do
+  end if
 
   if (pe_rank == 0) close(unit)
-  call snapshot_file%free(); call modes_file%free()
+  call snapshot_file%free()
+  if (modes_present) call modes_file%free()
   call data%free()
   call u%free(); call v%free(); call w%free(); call p%free(); call p_res%free()
   call u_zero%free(); call v_zero%free(); call w_zero%free()
   call f_x%free(); call f_y%free(); call f_z%free(); call divergence%free()
+  call rom_lift%free()
   call simulation%free()
   call neko_finalize()
 
@@ -150,10 +180,14 @@ contains
   end subroutine load_fields_at
 
   !> Record strong and weak continuity metrics for one field triple.
-  subroutine measure_fields(kind, index, u, v, w)
+  subroutine measure_fields(kind, index, u, v, w, relative_lift_difference)
     character(len=*), intent(in) :: kind
     integer, intent(in) :: index
     type(field_t), intent(inout) :: u, v, w
+    real(kind=rp), intent(in), optional :: relative_lift_difference
+    real(kind=rp) :: lift_error, weak_norm, strong_norm
+    lift_error = -1.0_rp
+    if (present(relative_lift_difference)) lift_error = relative_lift_difference
     call field_col3(f_x, u, fluid%rho)
     call field_col3(f_y, v, fluid%rho)
     call field_col3(f_z, w, fluid%rho)
@@ -175,8 +209,36 @@ contains
     call div(divergence%x, u%x, v%x, w%x, fluid%c_Xh)
     homogeneous_divergence = sqrt(max(0.0_rp, glsc3(divergence%x, &
          fluid%c_Xh%B, divergence%x, n)))
-    if (pe_rank == 0) write(unit, '(A,A,I0,2(",",ES24.16))') trim(kind), &
-         ',', index, homogeneous_residual, homogeneous_divergence
+    velocity_mass_norm = sqrt(max(0.0_rp, &
+         glsc3(u%x, fluid%c_Xh%B, u%x, n) + &
+         glsc3(v%x, fluid%c_Xh%B, v%x, n) + &
+         glsc3(w%x, fluid%c_Xh%B, w%x, n)))
+    weak_norm = homogeneous_residual / max(velocity_mass_norm, tiny(1.0_rp))
+    strong_norm = homogeneous_divergence / max(velocity_mass_norm, tiny(1.0_rp))
+    if (pe_rank == 0) write(unit, '(A,A,I0,6(",",ES24.16))') trim(kind), &
+         ',', index, homogeneous_residual, homogeneous_divergence, &
+         velocity_mass_norm, weak_norm, strong_norm, lift_error
   end subroutine measure_fields
+
+  !> Relative coupled velocity-mass distance from the actual BC-applied ROM lift.
+  function relative_lift_error(u, v, w) result(value)
+    type(field_t), intent(in) :: u, v, w
+    real(kind=rp) :: value, numerator, denominator
+    numerator = sqrt(max(0.0_rp, &
+         glsc3(u%x-rom_lift%velocity(1)%x, fluid%c_Xh%B, &
+              u%x-rom_lift%velocity(1)%x, n) + &
+         glsc3(v%x-rom_lift%velocity(2)%x, fluid%c_Xh%B, &
+              v%x-rom_lift%velocity(2)%x, n) + &
+         glsc3(w%x-rom_lift%velocity(3)%x, fluid%c_Xh%B, &
+              w%x-rom_lift%velocity(3)%x, n)))
+    denominator = sqrt(max(0.0_rp, &
+         glsc3(rom_lift%velocity(1)%x, fluid%c_Xh%B, &
+              rom_lift%velocity(1)%x, n) + &
+         glsc3(rom_lift%velocity(2)%x, fluid%c_Xh%B, &
+              rom_lift%velocity(2)%x, n) + &
+         glsc3(rom_lift%velocity(3)%x, fluid%c_Xh%B, &
+              rom_lift%velocity(3)%x, n)))
+    value = numerator / max(denominator, tiny(1.0_rp))
+  end function relative_lift_error
 
 end program rom_forward_continuity_diagnostic

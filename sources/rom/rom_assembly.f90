@@ -5,17 +5,28 @@
 !! pointwise products and weighted contractions, so the same host/device path
 !! is used as in the rest of Neko-TOP.
 module rom_assembly
-  use num_types, only: rp
+  use num_types, only: rp, xp
+  use neko_config, only: NEKO_BCKND_DEVICE
+  use comm, only: NEKO_COMM, MPI_EXTRA_PRECISION
+  use mpi_f08, only: MPI_Allreduce, MPI_IN_PLACE, MPI_SUM, MPI_Wtime
   use vector, only: vector_t
   use matrix, only: matrix_t
-  use vector_math, only: vector_col3, vector_add2, vector_cmult, vector_cmult2, &
+  use vector_math, only: vector_col3, vector_add2, vector_add2s2, vector_cmult, vector_cmult2, &
        vector_glsc2, vector_glsc3
   use scratch_registry, only: neko_scratch_registry
   implicit none
   private
 
+  integer(kind=8), save :: rom_collective_calls = 0_8
+  integer(kind=8), save :: rom_collective_elements = 0_8
+  integer(kind=8), save :: rom_device_collective_calls = 0_8
+  integer(kind=8), save :: rom_device_collective_elements = 0_8
+  real(kind=rp), save :: rom_host_collective_seconds = 0.0_rp
+  real(kind=rp), save :: rom_device_collective_seconds = 0.0_rp
+
   public :: rom_assemble_mass
   public :: rom_assemble_mass_coupled
+  public :: rom_assemble_scalar_mass
   public :: rom_assemble_cross_mass
   public :: rom_assemble_brinkman
   public :: rom_assemble_brinkman_petrov
@@ -27,10 +38,211 @@ module rom_assembly
   public :: rom_assemble_convection_petrov
   public :: rom_add_linearized_convection
   public :: rom_add_linearized_scalar_advection
+  public :: rom_assemble_linearized_convection_tensor
   public :: rom_assemble_scalar_transport
   public :: rom_assemble_scalar_transport_petrov
+  public :: rom_assemble_scalar_diffusion_petrov
+  public :: rom_glsc2_local
+  public :: rom_glsc3_local
+  public :: rom_reduce_buffer
+  public :: rom_reset_collective_counters
+  public :: rom_get_collective_counters
 
 contains
+
+  !> A local contraction for the host backend. Device contractions retain
+  !! vector_glsc3, whose backend implementation already performs the global
+  !! reduction. Host results are reduced after each complete reduced operator
+  !! has been assembled, avoiding one collective per reduced coefficient.
+  function rom_glsc3_local(a, b, c) result(value)
+    type(vector_t), intent(in) :: a, b, c
+    real(kind=rp) :: value
+    real(kind=xp) :: local_value
+    real(kind=rp) :: timer_start
+    integer :: i
+
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       timer_start = real(MPI_Wtime(),rp)
+       value = vector_glsc3(a, b, c)
+       rom_device_collective_seconds = rom_device_collective_seconds + &
+            real(MPI_Wtime(),rp) - timer_start
+       rom_device_collective_calls = rom_device_collective_calls + 1_8
+       rom_device_collective_elements = rom_device_collective_elements + 1_8
+       return
+    end if
+    local_value = 0.0_xp
+    do i = 1, a%size()
+       local_value = local_value + real(a%x(i),xp) * real(b%x(i),xp) * real(c%x(i),xp)
+    end do
+    value = real(local_value,rp)
+  end function rom_glsc3_local
+
+  !> Local weighted contraction. The device fallback is globally reduced by
+  !! Neko's vector backend; host contractions are genuinely rank-local.
+  function rom_glsc2_local(a, b) result(value)
+    type(vector_t), intent(in) :: a, b
+    real(kind=rp) :: value
+    real(kind=xp) :: local_value
+    real(kind=rp) :: timer_start
+    integer :: i
+
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       timer_start = real(MPI_Wtime(),rp)
+       value = vector_glsc2(a, b)
+       rom_device_collective_seconds = rom_device_collective_seconds + &
+            real(MPI_Wtime(),rp) - timer_start
+       rom_device_collective_calls = rom_device_collective_calls + 1_8
+       rom_device_collective_elements = rom_device_collective_elements + 1_8
+       return
+    end if
+    local_value = 0.0_xp
+    do i = 1, a%size()
+       local_value = local_value + real(a%x(i),xp) * real(b%x(i),xp)
+    end do
+    value = real(local_value,rp)
+  end function rom_glsc2_local
+
+  !> Reduce a complete local real buffer in one collective.
+  !! Device callers use globally reduced vector contractions and must not
+  !! call an additional MPI reduction on their host mirrors.
+  subroutine rom_reduce_buffer(values)
+    real(kind=rp), intent(inout) :: values(:)
+    real(kind=xp), allocatable :: buffer(:)
+    integer :: i, ierr
+    real(kind=rp) :: timer_start
+
+    if (NEKO_BCKND_DEVICE .eq. 1 .or. size(values) == 0) return
+    allocate(buffer(size(values)))
+    do i = 1, size(values)
+       buffer(i) = real(values(i),xp)
+    end do
+    timer_start = real(MPI_Wtime(),rp)
+    call MPI_Allreduce(MPI_IN_PLACE, buffer, size(buffer), MPI_EXTRA_PRECISION, &
+         MPI_SUM, NEKO_COMM, ierr)
+    rom_host_collective_seconds = rom_host_collective_seconds + &
+         real(MPI_Wtime(),rp) - timer_start
+    rom_collective_calls = rom_collective_calls + 1_8
+    rom_collective_elements = rom_collective_elements + int(size(buffer),8)
+    do i = 1, size(values)
+       values(i) = real(buffer(i),rp)
+    end do
+    deallocate(buffer)
+  end subroutine rom_reduce_buffer
+
+  !> Reset/read assembly communication counters. Host counts record packed
+  !! MPI_Allreduce calls and xp buffer sizes. Device counts separately record
+  !! backend-global scalar vector_glsc contractions and xp result sizes; their
+  !! elapsed time includes the device contraction/synchronization path.
+  subroutine rom_reset_collective_counters()
+    rom_collective_calls = 0_8
+    rom_collective_elements = 0_8
+    rom_device_collective_calls = 0_8
+    rom_device_collective_elements = 0_8
+    rom_host_collective_seconds = 0.0_rp
+    rom_device_collective_seconds = 0.0_rp
+  end subroutine rom_reset_collective_counters
+
+  subroutine rom_get_collective_counters(calls, elements, bytes, device_calls, &
+       device_elements, device_bytes, host_seconds, device_seconds)
+    integer(kind=8), intent(out) :: calls, elements, bytes
+    integer(kind=8), intent(out), optional :: device_calls, device_elements, device_bytes
+    real(kind=rp), intent(out), optional :: host_seconds, device_seconds
+    calls = rom_collective_calls
+    elements = rom_collective_elements
+    bytes = rom_collective_elements * int(storage_size(0.0_xp)/8,8)
+    if (present(device_calls)) device_calls = rom_device_collective_calls
+    if (present(device_elements)) device_elements = rom_device_collective_elements
+    if (present(device_bytes)) device_bytes = &
+         rom_device_collective_elements * int(storage_size(0.0_xp)/8,8)
+    if (present(host_seconds)) host_seconds = rom_host_collective_seconds
+    if (present(device_seconds)) device_seconds = rom_device_collective_seconds
+  end subroutine rom_get_collective_counters
+
+  !> Sum one locally assembled matrix and vector over the Neko communicator.
+  !! Call only on the host backend: device vector_glsc3 values are already
+  !! globally reduced and the device host mirrors may be stale.
+  subroutine rom_reduce_matrix_vector(matrix, vector)
+    type(matrix_t), intent(inout) :: matrix
+    type(vector_t), intent(inout) :: vector
+    call rom_reduce_matrix_array(matrix, vector%x)
+  end subroutine rom_reduce_matrix_vector
+
+  !> Sum one locally assembled matrix and real vector buffer.
+  subroutine rom_reduce_matrix_array(matrix, values)
+    type(matrix_t), intent(inout) :: matrix
+    real(kind=rp), intent(inout) :: values(:)
+    real(kind=rp), allocatable :: buffer(:)
+    integer :: i, n_matrix, nrows
+
+    if (NEKO_BCKND_DEVICE .eq. 1) return
+    n_matrix = size(matrix%x)
+    nrows = matrix%get_nrows()
+    allocate(buffer(n_matrix + size(values)))
+    do i = 1, n_matrix
+       buffer(i) = matrix%x(mod(i-1,nrows)+1,(i-1)/nrows+1)
+    end do
+    do i = 1, size(values)
+       buffer(n_matrix+i) = values(i)
+    end do
+    call rom_reduce_buffer(buffer)
+    do i = 1, n_matrix
+       matrix%x(mod(i-1,nrows)+1,(i-1)/nrows+1) = buffer(i)
+    end do
+    do i = 1, size(values)
+       values(i) = buffer(n_matrix+i)
+    end do
+    deallocate(buffer)
+  end subroutine rom_reduce_matrix_array
+
+  !> Sum a locally assembled matrix over the Neko communicator.
+  subroutine rom_reduce_matrix(matrix)
+    type(matrix_t), intent(inout) :: matrix
+    real(kind=rp), allocatable :: buffer(:)
+    integer :: i, nrows
+    if (NEKO_BCKND_DEVICE .eq. 1) return
+    allocate(buffer(size(matrix%x)))
+    nrows = matrix%get_nrows()
+    do i = 1, size(matrix%x)
+       buffer(i) = matrix%x(mod(i-1,nrows)+1,(i-1)/nrows+1)
+    end do
+    call rom_reduce_buffer(buffer)
+    do i = 1, size(matrix%x)
+       matrix%x(mod(i-1,nrows)+1,(i-1)/nrows+1) = buffer(i)
+    end do
+    deallocate(buffer)
+  end subroutine rom_reduce_matrix
+
+  !> Sum a locally assembled tensor represented by reduced matrices.
+  subroutine rom_reduce_matrix_tensor(tensor)
+    type(matrix_t), intent(inout) :: tensor(:)
+    real(kind=rp), allocatable :: buffer(:)
+    integer :: i, j, k, n_matrix, nrows
+
+    if (NEKO_BCKND_DEVICE .eq. 1) return
+    n_matrix = 0
+    do i = 1, size(tensor)
+       n_matrix = n_matrix + size(tensor(i)%x)
+    end do
+    allocate(buffer(n_matrix))
+    n_matrix = 0
+    do i = 1, size(tensor)
+       nrows = tensor(i)%get_nrows()
+       do j = 1, size(tensor(i)%x)
+          n_matrix = n_matrix + 1
+          buffer(n_matrix) = tensor(i)%x(mod(j-1,nrows)+1,(j-1)/nrows+1)
+       end do
+    end do
+    call rom_reduce_buffer(buffer)
+    n_matrix = 0
+    do i = 1, size(tensor)
+       nrows = tensor(i)%get_nrows()
+       do j = 1, size(tensor(i)%x)
+          n_matrix = n_matrix + 1
+          tensor(i)%x(mod(j-1,nrows)+1,(j-1)/nrows+1) = buffer(n_matrix)
+       end do
+    end do
+    deallocate(buffer)
+  end subroutine rom_reduce_matrix_tensor
 
   !> Assemble the SEM mass matrix in the reduced velocity basis.
   subroutine rom_assemble_mass(weights, modes, mass)
@@ -71,7 +283,7 @@ contains
     do i = 1, r_test
        do j = 1, r_trial
           do field = 1, size(trial_modes, 1)
-             mass%x(i,j) = mass%x(i,j) + vector_glsc3( &
+             mass%x(i,j) = mass%x(i,j) + rom_glsc3_local( &
                   test_modes(field,i), weights, trial_modes(field,j))
           end do
        end do
@@ -84,11 +296,12 @@ contains
        if (present(scalar_weight)) weight = scalar_weight
        do i = 1, r_test
           do j = 1, r_trial
-             mass%x(i,j) = mass%x(i,j) + weight * vector_glsc3( &
+             mass%x(i,j) = mass%x(i,j) + weight * rom_glsc3_local( &
                   scalar_test_modes(i), weights, scalar_trial_modes(j))
           end do
        end do
     end if
+    call rom_reduce_matrix(mass)
   end subroutine rom_assemble_cross_mass
 
   !> Assemble the coupled velocity/scalar SEM mass matrix.
@@ -111,6 +324,42 @@ contains
     if (.not. present(scalar_modes)) return
     if (size(scalar_modes) /= r) error stop 'ROM scalar mass shape mismatch'
   end subroutine rom_assemble_mass_coupled
+
+  !> Assemble a coupled-metric scalar mass block independently of velocity.
+  !! Keeping this block separate lets an adaptive velocity basis refresh its
+  !! mass contribution without repeating the invariant scalar contractions.
+  subroutine rom_assemble_scalar_mass(weights, scalar_weight, trial_scalar_modes, &
+       test_scalar_modes, mass)
+    type(vector_t), intent(in) :: weights
+    real(kind=rp), intent(in) :: scalar_weight
+    type(vector_t), intent(in) :: trial_scalar_modes(:), test_scalar_modes(:)
+    type(matrix_t), intent(inout) :: mass
+    real(kind=rp), allocatable :: local(:)
+    integer :: n, nt, nr, i, j
+
+    n = weights%size(); nt = size(test_scalar_modes); nr = size(trial_scalar_modes)
+    if (n < 1 .or. nt < 1 .or. nr < 1 .or. scalar_weight <= 0.0_rp) &
+         error stop 'ROM scalar mass shape/metric mismatch'
+    if (any([(test_scalar_modes(i)%size(), i=1,nt)] /= n) .or. &
+         any([(trial_scalar_modes(j)%size(), j=1,nr)] /= n)) &
+         error stop 'ROM scalar mass vector size mismatch'
+
+    allocate(local(nt*nr)); local = 0.0_rp
+    do j = 1, nr
+       do i = 1, nt
+          local((j-1)*nt+i) = scalar_weight * &
+               rom_glsc3_local(test_scalar_modes(i), weights, trial_scalar_modes(j))
+       end do
+    end do
+    call rom_reduce_buffer(local)
+    call mass%init(nt,nr)
+    do j = 1, nr
+       do i = 1, nt
+          mass%x(i,j) = local((j-1)*nt+i)
+       end do
+    end do
+    deallocate(local)
+  end subroutine rom_assemble_scalar_mass
 
   !> Assemble the reduced Brinkman operator and its lift contribution.
   subroutine rom_assemble_brinkman(weights, chi, velocity_modes, lift_velocity, &
@@ -152,15 +401,16 @@ contains
     do i = 1, n_test
        do j = 1, n_trial
           do component = 1, 3
-             brinkman%x(i,j) = brinkman%x(i,j) + vector_glsc3( &
+             brinkman%x(i,j) = brinkman%x(i,j) + rom_glsc3_local( &
                   test_velocity_modes(component,i), effective, trial_velocity_modes(component,j))
           end do
        end do
        do component = 1, 3
-          lift_vector%x(i) = lift_vector%x(i) + vector_glsc3( &
+          lift_vector%x(i) = lift_vector%x(i) + rom_glsc3_local( &
                test_velocity_modes(component,i), effective, lift_velocity(component))
        end do
     end do
+    call rom_reduce_matrix_vector(brinkman, lift_vector)
     call neko_scratch_registry%relinquish_vector(effective_index); nullify(effective)
   end subroutine rom_assemble_brinkman_petrov
 
@@ -226,7 +476,7 @@ contains
                      lift_gradients(component,direction))
                 call vector_add2(pointwise, product)
              end do
-             linear%x(i,j) = linear%x(i,j) - vector_glsc3( &
+             linear%x(i,j) = linear%x(i,j) - rom_glsc3_local( &
                   test_velocity_modes(component,i), weights, pointwise)
           end do
        end do
@@ -239,10 +489,11 @@ contains
                   lift_gradients(component,direction))
              call vector_add2(pointwise, product)
           end do
-          constant%x(i) = constant%x(i) - vector_glsc3( &
+          constant%x(i) = constant%x(i) - rom_glsc3_local( &
                test_velocity_modes(component,i), weights, pointwise)
        end do
     end do
+    call rom_reduce_matrix_vector(linear, constant)
     call neko_scratch_registry%relinquish_vector([pointwise_index, product_index])
     nullify(pointwise); nullify(product)
   end subroutine rom_assemble_lift_convection_petrov
@@ -273,6 +524,7 @@ contains
     type(matrix_t), intent(inout) :: implicit_linear
     type(vector_t), intent(in), optional :: lift_gradients(:, :)
     type(vector_t), intent(inout), optional :: lift_constant
+    real(kind=rp), allocatable :: lift_delta(:)
     integer :: n, r, i, j, component, direction
 
     n = weights%size(); r = size(trial_gradients,2)
@@ -288,12 +540,16 @@ contains
     end if
     call implicit_linear%init(r, r)
     implicit_linear%x = 0.0_rp
+    if (present(lift_gradients)) then
+       allocate(lift_delta(r))
+       lift_delta = 0.0_rp
+    end if
     do i = 1, r
        if (present(lift_gradients)) then
           do component = 1, 3
              do direction = 1, 3
-                lift_constant%x(i) = lift_constant%x(i) - viscosity_over_density * &
-                     vector_glsc3(test_gradients(component,i,direction), weights, &
+                lift_delta(i) = lift_delta(i) - viscosity_over_density * &
+                     rom_glsc3_local(test_gradients(component,i,direction), weights, &
                      lift_gradients(component,direction))
              end do
           end do
@@ -302,13 +558,20 @@ contains
           do component = 1, 3
              do direction = 1, 3
                 implicit_linear%x(i,j) = implicit_linear%x(i,j) - &
-                     viscosity_over_density * vector_glsc3( &
+                     viscosity_over_density * rom_glsc3_local( &
                      test_gradients(component,i,direction), weights, &
                      trial_gradients(component,j,direction))
              end do
           end do
        end do
     end do
+    if (present(lift_gradients)) then
+       call rom_reduce_matrix_array(implicit_linear, lift_delta)
+       lift_constant%x = lift_constant%x + lift_delta
+       deallocate(lift_delta)
+    else
+       call rom_reduce_matrix(implicit_linear)
+    end if
   end subroutine rom_assemble_diffusion_petrov
 
   !> Assemble the quadratic convective residual tensor.
@@ -345,23 +608,24 @@ contains
     call neko_scratch_registry%request_vector(product, product_index, n, .true.)
     ! The velocity-only ROM has three transported fields.  Additional scalar
     ! fields are intentionally unsupported by rom_problem's configuration gate.
-    do test_mode = 1, r
-       do advect_mode = 1, r
-          do state_mode = 1, r
-             do field = 1, 3
-                pointwise = 0.0_rp
-                do component = 1, 3
-                   call vector_col3(product, trial_modes(component,advect_mode), &
-                        trial_gradients(field,state_mode,component))
-                   call vector_add2(pointwise, product)
-                end do
+    do advect_mode = 1, r
+       do state_mode = 1, r
+          do field = 1, 3
+             pointwise = 0.0_rp
+             do component = 1, 3
+                call vector_col3(product, trial_modes(component,advect_mode), &
+                     trial_gradients(field,state_mode,component))
+                call vector_add2(pointwise, product)
+             end do
+             do test_mode = 1, r
                 quadratic(test_mode)%x(advect_mode,state_mode) = &
                      quadratic(test_mode)%x(advect_mode,state_mode) + &
-                     vector_glsc3(test_modes(field,test_mode), weights, pointwise)
+                     rom_glsc3_local(test_modes(field,test_mode), weights, pointwise)
              end do
           end do
        end do
     end do
+    call rom_reduce_matrix_tensor(quadratic)
     call neko_scratch_registry%relinquish_vector([pointwise_index, product_index])
     nullify(pointwise); nullify(product)
   end subroutine rom_assemble_convection_petrov
@@ -381,6 +645,7 @@ contains
     real(kind=rp), intent(in) :: coefficients(:)
     type(matrix_t), intent(inout) :: linearized
     type(vector_t), pointer :: pointwise, product
+    real(kind=rp), allocatable :: local(:)
     integer :: pointwise_index, product_index
     integer :: n, rf, re, i, j, k, field, direction
 
@@ -399,25 +664,33 @@ contains
 
     call neko_scratch_registry%request_vector(pointwise, pointwise_index, n, .true.)
     call neko_scratch_registry%request_vector(product, product_index, n, .true.)
-    do i = 1, re
-       do j = 1, re
+    allocate(local(re*re)); local = 0.0_rp
+    do j = 1, re
+       do field = 1, 3
+          pointwise = 0.0_rp
           do k = 1, rf
-             do field = 1, 3
-                pointwise = 0.0_rp
-                do direction = 1, 3
-                   call vector_col3(product, perturb_modes(direction,j), &
-                        forward_gradients(field,k,direction))
-                   call vector_add2(pointwise, product)
-                   call vector_col3(product, forward_modes(direction,k), &
-                        perturb_gradients(field,j,direction))
-                   call vector_add2(pointwise, product)
-                end do
-                linearized%x(i,j) = linearized%x(i,j) - coefficients(k) * &
-                     vector_glsc3(test_modes(field,i), weights, pointwise)
+             do direction = 1, 3
+                call vector_col3(product, perturb_modes(direction,j), &
+                     forward_gradients(field,k,direction))
+                call vector_add2s2(pointwise, product, coefficients(k))
+                call vector_col3(product, forward_modes(direction,k), &
+                     perturb_gradients(field,j,direction))
+                call vector_add2s2(pointwise, product, coefficients(k))
              end do
+          end do
+          do i = 1, re
+             local((j-1)*re+i) = local((j-1)*re+i) - &
+                  rom_glsc3_local(test_modes(field,i), weights, pointwise)
           end do
        end do
     end do
+    call rom_reduce_buffer(local)
+    do j = 1, re
+       do i = 1, re
+          linearized%x(i,j) = linearized%x(i,j) + local((j-1)*re+i)
+       end do
+    end do
+    deallocate(local)
     call neko_scratch_registry%relinquish_vector([pointwise_index, product_index])
     nullify(pointwise); nullify(product)
   end subroutine rom_add_linearized_convection
@@ -439,6 +712,7 @@ contains
     real(kind=rp), intent(in) :: coefficients(:)
     type(matrix_t), intent(inout) :: linearized
     type(vector_t), pointer :: pointwise, product
+    real(kind=rp), allocatable :: local(:)
     integer :: pointwise_index, product_index
     integer :: n, rf, re, i, j, k, direction
 
@@ -454,26 +728,159 @@ contains
 
     call neko_scratch_registry%request_vector(pointwise, pointwise_index, n, .true.)
     call neko_scratch_registry%request_vector(product, product_index, n, .true.)
-    do i = 1, re
-       do j = 1, re
-          do k = 1, rf
-             pointwise = 0.0_rp
-             do direction = 1, 3
-                call vector_col3(product, perturb_velocity_modes(direction,j), &
-                     forward_scalar_gradients(k,direction))
-                call vector_add2(pointwise, product)
-                call vector_col3(product, forward_velocity_modes(direction,k), &
-                     perturb_scalar_gradients(j,direction))
-                call vector_add2(pointwise, product)
-             end do
-             linearized%x(i,j) = linearized%x(i,j) - scalar_weight * coefficients(k) * &
-                  vector_glsc3(test_scalar_modes(i), weights, pointwise)
+    allocate(local(re*re)); local = 0.0_rp
+    do j = 1, re
+       pointwise = 0.0_rp
+       do k = 1, rf
+          do direction = 1, 3
+             call vector_col3(product, perturb_velocity_modes(direction,j), &
+                  forward_scalar_gradients(k,direction))
+             call vector_add2s2(pointwise, product, coefficients(k))
+             call vector_col3(product, forward_velocity_modes(direction,k), &
+                  perturb_scalar_gradients(j,direction))
+             call vector_add2s2(pointwise, product, coefficients(k))
           end do
        end do
+       do i = 1, re
+          local((j-1)*re+i) = -scalar_weight * &
+               rom_glsc3_local(test_scalar_modes(i), weights, pointwise)
+       end do
     end do
+    call rom_reduce_buffer(local)
+    do j = 1, re
+       do i = 1, re
+          linearized%x(i,j) = linearized%x(i,j) + local((j-1)*re+i)
+       end do
+    end do
+    deallocate(local)
     call neko_scratch_registry%relinquish_vector([pointwise_index, product_index])
     nullify(pointwise); nullify(product)
   end subroutine rom_add_linearized_scalar_advection
+
+  !> Assemble the independently projected velocity/scalar convection Jacobian
+  !! tensor C(:,:,k) about a forward trajectory mode k. The pair fields are
+  !! formed once for each (adjoint perturbation j, forward mode k), then
+  !! projected against every adjoint test mode. The tensor is reduced as one
+  !! packed local operator on the host backend.
+  !!
+  !! The returned dynamic contribution is
+  !! C_ijk = -<w_i,(v_k.grad)w_j+(w_j.grad)v_k>
+  !!         -gamma<zeta_i,v_k.grad(zeta_j)+w_j.grad(psi_k)>.
+  !! Lift-linearised terms belong to the fixed adjoint linear operator and
+  !! remain there; this tensor contains only terms proportional to a_k.
+  subroutine rom_assemble_linearized_convection_tensor(weights, &
+       forward_velocity_modes, forward_velocity_gradients, &
+       forward_scalar_modes, forward_scalar_gradients, &
+       adjoint_velocity_modes, adjoint_velocity_gradients, &
+       adjoint_scalar_modes, adjoint_scalar_gradients, scalar_weight, tensor)
+    type(vector_t), intent(in) :: weights
+    type(vector_t), intent(in) :: forward_velocity_modes(:, :)
+    type(vector_t), intent(in) :: forward_velocity_gradients(:, :, :)
+    type(vector_t), intent(in), optional :: forward_scalar_modes(:)
+    type(vector_t), intent(in), optional :: forward_scalar_gradients(:, :)
+    type(vector_t), intent(in) :: adjoint_velocity_modes(:, :)
+    type(vector_t), intent(in) :: adjoint_velocity_gradients(:, :, :)
+    type(vector_t), intent(in), optional :: adjoint_scalar_modes(:)
+    type(vector_t), intent(in), optional :: adjoint_scalar_gradients(:, :)
+    real(kind=rp), intent(in) :: scalar_weight
+    type(matrix_t), intent(inout) :: tensor(:)
+    type(vector_t), allocatable :: velocity_pair(:)
+    type(vector_t), pointer :: scalar_pair, product
+    integer :: scalar_pair_index, product_index
+    integer :: n, r, e, i, j, k, d, component
+    logical :: has_scalar
+
+    n = weights%size()
+    r = size(forward_velocity_modes,2)
+    e = size(adjoint_velocity_modes,2)
+    if (r < 1 .or. e < 1 .or. size(forward_velocity_modes,1) /= 3 .or. &
+         size(adjoint_velocity_modes,1) /= 3 .or. &
+         size(forward_velocity_gradients,1) /= 3 .or. &
+         size(forward_velocity_gradients,2) /= r .or. &
+         size(forward_velocity_gradients,3) /= 3 .or. &
+         size(adjoint_velocity_gradients,1) /= 3 .or. &
+         size(adjoint_velocity_gradients,2) /= e .or. &
+         size(adjoint_velocity_gradients,3) /= 3 .or. size(tensor) /= r) &
+         error stop 'ROM projected convection tensor shape mismatch'
+    has_scalar = present(forward_scalar_modes) .or. present(forward_scalar_gradients) .or. &
+         present(adjoint_scalar_modes) .or. present(adjoint_scalar_gradients)
+    if (has_scalar) then
+       if (.not. present(forward_scalar_modes) .or. &
+            .not. present(forward_scalar_gradients) .or. &
+            .not. present(adjoint_scalar_modes) .or. &
+            .not. present(adjoint_scalar_gradients)) &
+            error stop 'ROM projected scalar convection tensor arguments are incomplete'
+       if (size(forward_scalar_modes) /= r .or. &
+            size(forward_scalar_gradients,1) /= r .or. &
+            size(forward_scalar_gradients,2) /= 3 .or. &
+            size(adjoint_scalar_modes) /= e .or. &
+            size(adjoint_scalar_gradients,1) /= e .or. &
+            size(adjoint_scalar_gradients,2) /= 3 .or. scalar_weight <= 0.0_rp) &
+            error stop 'ROM projected scalar convection tensor shape mismatch'
+    end if
+    do k = 1, r
+       if (tensor(k)%get_nrows() /= e .or. tensor(k)%get_ncols() /= e) &
+            error stop 'ROM projected convection tensor output shape mismatch'
+       tensor(k)%x = 0.0_rp
+    end do
+
+    allocate(velocity_pair(3))
+    do component = 1, 3
+       call velocity_pair(component)%init(n)
+    end do
+    nullify(scalar_pair)
+    if (has_scalar) &
+         call neko_scratch_registry%request_vector(scalar_pair, scalar_pair_index, n, .true.)
+    call neko_scratch_registry%request_vector(product, product_index, n, .true.)
+
+    do k = 1, r
+       do j = 1, e
+          do component = 1, 3
+             velocity_pair(component) = 0.0_rp
+          end do
+          if (has_scalar) scalar_pair = 0.0_rp
+          do d = 1, 3
+             do component = 1, 3
+                call vector_col3(product, adjoint_velocity_modes(d,j), &
+                     forward_velocity_gradients(component,k,d))
+                call vector_add2(velocity_pair(component), product)
+                call vector_col3(product, forward_velocity_modes(d,k), &
+                     adjoint_velocity_gradients(component,j,d))
+                call vector_add2(velocity_pair(component), product)
+             end do
+             if (has_scalar) then
+                call vector_col3(product, adjoint_velocity_modes(d,j), &
+                     forward_scalar_gradients(k,d))
+                call vector_add2(scalar_pair, product)
+                call vector_col3(product, forward_velocity_modes(d,k), &
+                     adjoint_scalar_gradients(j,d))
+                call vector_add2(scalar_pair, product)
+             end if
+          end do
+          do i = 1, e
+             do component = 1, 3
+                tensor(k)%x(i,j) = tensor(k)%x(i,j) - rom_glsc3_local( &
+                     adjoint_velocity_modes(component,i), weights, &
+                     velocity_pair(component))
+             end do
+             if (has_scalar) tensor(k)%x(i,j) = tensor(k)%x(i,j) - scalar_weight * &
+                  rom_glsc3_local(adjoint_scalar_modes(i), weights, scalar_pair)
+          end do
+       end do
+    end do
+    call rom_reduce_matrix_tensor(tensor)
+
+    if (has_scalar) then
+       call neko_scratch_registry%relinquish_vector(scalar_pair_index)
+       nullify(scalar_pair)
+    end if
+    call neko_scratch_registry%relinquish_vector(product_index)
+    nullify(product)
+    do component = 1, 3
+       call velocity_pair(component)%free()
+    end do
+    deallocate(velocity_pair)
+  end subroutine rom_assemble_linearized_convection_tensor
 
   !> Assemble scalar advection and diffusion in the common ROM basis.
   !!
@@ -506,13 +913,78 @@ contains
          implicit_linear)
   end subroutine rom_assemble_scalar_transport
 
+  !> Assemble the design-independent scalar diffusion matrix and lift vector.
+  !! Diffusivity is a nodal field, so this retains Neko's variable-property
+  !! SEM quadrature rather than replacing it with a uniform coefficient.
+  !! Both outputs use the negative weak-residual sign of the ROM operators.
+  subroutine rom_assemble_scalar_diffusion_petrov(weights, scalar_weight, &
+       diffusivity, test_gradients, trial_gradients, lift_gradient, &
+       implicit_linear, lift_constant)
+    type(vector_t), intent(in) :: weights, diffusivity
+    real(kind=rp), intent(in) :: scalar_weight
+    type(vector_t), intent(in) :: test_gradients(:, :), trial_gradients(:, :)
+    type(vector_t), intent(in) :: lift_gradient(:)
+    type(matrix_t), intent(inout) :: implicit_linear
+    type(vector_t), intent(inout) :: lift_constant
+    type(vector_t), pointer :: effective
+    real(kind=rp), allocatable :: local(:)
+    integer :: effective_index
+    integer :: n, nt, nr, i, j, d, matrix_size
+
+    n = weights%size(); nt = size(test_gradients,1); nr = size(trial_gradients,1)
+    if (n < 1 .or. diffusivity%size() /= n .or. nt < 1 .or. nr < 1 .or. &
+         size(test_gradients,2) /= 3 .or. size(trial_gradients,2) /= 3 .or. &
+         size(lift_gradient) /= 3 .or. scalar_weight <= 0.0_rp) &
+         error stop 'ROM scalar diffusion shape/metric mismatch'
+    if (any([(test_gradients(i,1)%size(), i=1,nt)] /= n) .or. &
+         any([(trial_gradients(j,1)%size(), j=1,nr)] /= n) .or. &
+         any([(lift_gradient(d)%size(), d=1,3)] /= n)) &
+         error stop 'ROM scalar diffusion vector size mismatch'
+
+    matrix_size = nt*nr
+    allocate(local(matrix_size+nt)); local = 0.0_rp
+    call neko_scratch_registry%request_vector(effective, effective_index, n, .true.)
+    call vector_col3(effective, weights, diffusivity)
+    call vector_cmult(effective, scalar_weight)
+    do j = 1, nr
+       do i = 1, nt
+          do d = 1, 3
+             local((j-1)*nt+i) = local((j-1)*nt+i) - &
+                  rom_glsc3_local(test_gradients(i,d), effective, trial_gradients(j,d))
+          end do
+       end do
+    end do
+    do i = 1, nt
+       do d = 1, 3
+          local(matrix_size+i) = local(matrix_size+i) - &
+               rom_glsc3_local(test_gradients(i,d), effective, lift_gradient(d))
+       end do
+    end do
+    call rom_reduce_buffer(local)
+
+    call implicit_linear%init(nt,nr)
+    call lift_constant%init(nt)
+    do j = 1, nr
+       do i = 1, nt
+          implicit_linear%x(i,j) = local((j-1)*nt+i)
+       end do
+    end do
+    do i = 1, nt
+       lift_constant%x(i) = local(matrix_size+i)
+    end do
+    call neko_scratch_registry%relinquish_vector(effective_index)
+    nullify(effective)
+    deallocate(local)
+  end subroutine rom_assemble_scalar_diffusion_petrov
+
   !> Assemble scalar transport with trial velocity/scalar states and test
   !! scalar modes.  The scalar equation shares the Petrov test index with the
   !! coupled reduced state.
   subroutine rom_assemble_scalar_transport_petrov(weights, scalar_weight, &
        trial_velocity_modes, trial_scalar_modes, trial_velocity_gradients, &
        trial_scalar_gradients, test_scalar_modes, test_scalar_gradients, lift_velocity, scalar_lift, &
-       lift_scalar_gradient, diffusivity, linear, constant, quadratic, implicit_linear)
+       lift_scalar_gradient, diffusivity, linear, constant, quadratic, implicit_linear, &
+       include_diffusion)
     type(vector_t), intent(in) :: weights
     real(kind=rp), intent(in) :: scalar_weight
     type(vector_t), intent(in) :: trial_velocity_modes(:, :), trial_scalar_modes(:)
@@ -524,10 +996,14 @@ contains
     type(vector_t), intent(in) :: diffusivity
     type(matrix_t), intent(inout) :: linear, implicit_linear
     type(vector_t), intent(inout) :: constant
-    type(matrix_t), intent(inout) :: quadratic(:)
+    type(matrix_t), intent(inout), optional :: quadratic(:)
+    logical, intent(in), optional :: include_diffusion
     type(vector_t), pointer :: effective, pointwise, product
+    real(kind=rp), allocatable :: local_operators(:)
     integer :: effective_index, pointwise_index, product_index
-    integer :: n, r, i, j, k, direction
+    integer :: n, r, i, j, k, direction, q_count
+    integer :: linear_offset, q_offset, implicit_offset
+    logical :: add_diffusion
 
     n = weights%size(); r = size(trial_scalar_modes)
     if (size(trial_velocity_modes,1) /= 3 .or. size(trial_velocity_modes,2) /= r .or. &
@@ -541,16 +1017,30 @@ contains
        error stop 'ROM scalar transport shape mismatch'
     end if
     if (linear%get_nrows() /= r .or. linear%get_ncols() /= r .or. &
-         implicit_linear%get_nrows() /= r .or. implicit_linear%get_ncols() /= r .or. &
-         size(quadratic) /= r .or. any([(quadratic(i)%get_nrows(), i=1,r)] /= r) .or. &
-         any([(quadratic(i)%get_ncols(), i=1,r)] /= r)) then
+         implicit_linear%get_nrows() /= r .or. implicit_linear%get_ncols() /= r) then
        error stop 'ROM scalar transport operator shape mismatch'
     end if
+    if (present(quadratic)) then
+       if (size(quadratic) /= r) error stop 'ROM scalar transport quadratic shape mismatch'
+       if (any([(quadratic(i)%get_nrows(), i=1,r)] /= r) .or. &
+            any([(quadratic(i)%get_ncols(), i=1,r)] /= r)) &
+            error stop 'ROM scalar transport quadratic shape mismatch'
+    end if
+    add_diffusion = .true.
+    if (present(include_diffusion)) add_diffusion = include_diffusion
     call neko_scratch_registry%request_vector(effective, effective_index, n, .true.)
     call neko_scratch_registry%request_vector(pointwise, pointwise_index, n, .true.)
     call neko_scratch_registry%request_vector(product, product_index, n, .true.)
     effective = weights
     call vector_cmult(effective, scalar_weight)
+
+    q_count = 0
+    if (present(quadratic)) q_count = r*r*r
+    linear_offset = r
+    q_offset = linear_offset + r*r
+    implicit_offset = q_offset + q_count
+    allocate(local_operators(implicit_offset + r*r))
+    local_operators = 0.0_rp
 
     ! The outputs are small host-owned reduced coefficients.  This routine
     ! accumulates the scalar block into the velocity operators assembled by
@@ -560,32 +1050,33 @@ contains
     ! grad(phi_L); using grad(phi_i) here would silently turn a constant
     ! residual into a state-dependent term and is not the Galerkin expansion
     ! of u.grad(phi).
+    pointwise = 0.0_rp
+    do direction = 1, 3
+       call vector_col3(product, lift_velocity(direction), &
+            lift_scalar_gradient(direction))
+       call vector_add2(pointwise, product)
+    end do
     do i = 1, r
+       local_operators(i) = -rom_glsc3_local(test_scalar_modes(i), effective, pointwise)
+    end do
+    do j = 1, r
        pointwise = 0.0_rp
        do direction = 1, 3
-          call vector_col3(product, lift_velocity(direction), &
+          call vector_col3(product, trial_velocity_modes(direction,j), &
                lift_scalar_gradient(direction))
           call vector_add2(pointwise, product)
+          call vector_col3(product, lift_velocity(direction), &
+               trial_scalar_gradients(j,direction))
+          call vector_add2(pointwise, product)
        end do
-       constant%x(i) = constant%x(i) - vector_glsc3( &
-            test_scalar_modes(i), effective, pointwise)
-       do j = 1, r
-          pointwise = 0.0_rp
-          do direction = 1, 3
-             call vector_col3(product, trial_velocity_modes(direction,j), &
-                  lift_scalar_gradient(direction))
-             call vector_add2(pointwise, product)
-             call vector_col3(product, lift_velocity(direction), &
-                  trial_scalar_gradients(j,direction))
-             call vector_add2(pointwise, product)
-          end do
-          linear%x(i,j) = linear%x(i,j) - vector_glsc3( &
-               test_scalar_modes(i), effective, pointwise)
+       do i = 1, r
+          local_operators(linear_offset + (j-1)*r + i) = &
+               -rom_glsc3_local(test_scalar_modes(i), effective, pointwise)
        end do
     end do
 
     ! Nonlinear scalar advection u_j.grad(phi_k).
-    do i = 1, r
+    if (present(quadratic)) then
        do j = 1, r
           do k = 1, r
              pointwise = 0.0_rp
@@ -594,36 +1085,66 @@ contains
                      trial_scalar_gradients(k,direction))
                 call vector_add2(pointwise, product)
              end do
-             quadratic(i)%x(j,k) = quadratic(i)%x(j,k) - &
-                  vector_glsc3(test_scalar_modes(i), effective, pointwise)
+             do i = 1, r
+                local_operators(q_offset + (k-1)*r*r + (j-1)*r + i) = &
+                     -rom_glsc3_local(test_scalar_modes(i), effective, pointwise)
+             end do
           end do
        end do
-    end do
+    end if
 
     ! Scalar diffusion is implicit in the BDF1 map, exactly as the velocity
     ! diffusion assembled by rom_assemble_diffusion.
-    call vector_col3(effective, weights, diffusivity)
-    call vector_cmult(effective, scalar_weight)
-    do i = 1, r
+    if (add_diffusion) then
+       call vector_col3(effective, weights, diffusivity)
+       call vector_cmult(effective, scalar_weight)
        do j = 1, r
-          do direction = 1, 3
-             implicit_linear%x(i,j) = implicit_linear%x(i,j) - &
-                  vector_glsc3(test_scalar_gradients(i,direction), effective, &
-                  trial_scalar_gradients(j,direction))
+          do i = 1, r
+             do direction = 1, 3
+                local_operators(implicit_offset + (j-1)*r + i) = &
+                     local_operators(implicit_offset + (j-1)*r + i) - &
+                     rom_glsc3_local(test_scalar_gradients(i,direction), effective, &
+                     trial_scalar_gradients(j,direction))
+             end do
           end do
        end do
-       do direction = 1, 3
-          ! The lift diffusion is a state-independent residual term.  It
-          ! belongs in the explicit constant vector; fixed_implicit is
-          ! reserved for the homogeneous scalar fluctuation.
-          constant%x(i) = constant%x(i) - &
-               vector_glsc3(test_scalar_gradients(i,direction), effective, &
-               lift_scalar_gradient(direction))
+       do i = 1, r
+          do direction = 1, 3
+             ! The lift diffusion is a state-independent residual term.  It
+             ! belongs in the explicit constant vector; fixed_implicit is
+             ! reserved for the homogeneous scalar fluctuation.
+             local_operators(i) = local_operators(i) - &
+                  rom_glsc3_local(test_scalar_gradients(i,direction), effective, &
+                  lift_scalar_gradient(direction))
+          end do
+       end do
+    end if
+    call rom_reduce_buffer(local_operators)
+    do i = 1, r
+       constant%x(i) = constant%x(i) + local_operators(i)
+    end do
+    do j = 1, r
+       do i = 1, r
+          linear%x(i,j) = linear%x(i,j) + &
+               local_operators(linear_offset + (j-1)*r + i)
+          implicit_linear%x(i,j) = implicit_linear%x(i,j) + &
+               local_operators(implicit_offset + (j-1)*r + i)
        end do
     end do
+    if (present(quadratic)) then
+       do k = 1, r
+          do j = 1, r
+             do i = 1, r
+                quadratic(i)%x(j,k) = quadratic(i)%x(j,k) + &
+                     local_operators(q_offset + (k-1)*r*r + (j-1)*r + i)
+             end do
+          end do
+       end do
+    end if
     call neko_scratch_registry%relinquish_vector([effective_index, pointwise_index, &
          product_index])
     nullify(effective); nullify(pointwise); nullify(product)
+    deallocate(local_operators)
   end subroutine rom_assemble_scalar_transport_petrov
 
 end module rom_assembly

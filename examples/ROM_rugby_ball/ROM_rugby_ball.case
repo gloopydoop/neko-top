@@ -110,40 +110,12 @@
         "n_modes": 4,
         "stream_adjoint": true,
         "adjoint_i_stream": 50,
-        "history_outer_iterations": 3,
-        "rank_forward": 4,
-        "rank_adjoint": 4,
-        "rank_total_max": 8,
         "scalar_metric_weight": 1.0,
         "i_stream": 50,
         "dtype": "double",
         "output_reconstruction": false,
         "write_modes": false,
         "adjoint_output_file_name": "adjoint_POD_modes",
-    },
-    "rom": {
-        "enabled": true,
-        "inner_iterations": 10,
-        "history_outer_iterations": 3,
-        "rank_forward": 4,
-        "rank_adjoint": 4,
-        "rank_total_max": 8,
-        "scalar_metric_weight": 1.0,
-        "validate_full_order": false,
-        "admissibility_projection": "velocity_inlet_xmin",
-        "time_scheme": "bdf1",
-        "pressure_treatment": "solenoidal_galerkin",
-        "projection_outer_iterations": 1,
-        "projection_pressure_absolute_tolerance": 1.0e-10,
-        "projection_pressure_relative_tolerance": 0.0,
-        "projection_pressure_max_iterations": 80,
-        "projection_diagnostics_file": "rom_projection_diagnostics.csv",
-        "strict_admissibility": false,
-        "write_trajectory_fields": false,
-        "trajectory_output_interval": 0.5,
-        "lift": {
-            "source": "initial_velocity"
-        }
     },
     "optimization": {
         "design": {
@@ -174,6 +146,31 @@
             "type": "rom_mma",
             "max_iterations": 10,
             "tolerance": 1.0e-12,
+            "rom": {
+                "enabled": true,
+                "basis": {
+                    "forward": "forward",
+                    "adjoint": "forward"
+                },
+                "inner_iterations": 10,
+                "history_outer_iterations": 3,
+                "scalar_metric_weight": 1.0,
+                "validate_full_order": false,
+                "admissibility_projection": "velocity_inlet_xmin",
+                "time_scheme": "bdf1",
+                "pressure_treatment": "solenoidal_galerkin",
+                "projection_outer_iterations": 1,
+                "projection_pressure_absolute_tolerance": 1.0e-10,
+                "projection_pressure_relative_tolerance": 0.0,
+                "projection_pressure_max_iterations": 80,
+                "projection_diagnostics_file": "rom_projection_diagnostics.csv",
+                "strict_admissibility": false,
+                "write_trajectory_fields": false,
+                "trajectory_output_interval": 0.5,
+                "lift": {
+                    "source": "initial_velocity"
+                }
+            },
             "mma": {
                 "scale": 1.0,
                 "move_limit": 0.10,

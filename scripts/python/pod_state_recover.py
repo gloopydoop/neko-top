@@ -54,6 +54,7 @@ from recycled_pod_tools import (
     factors_from_pod,
     recycle_distributed,
 )
+from pod_rank_mode_diagnostics import append_family_mode_diagnostics
 
 
 def source_revision() -> str:
@@ -99,6 +100,38 @@ def prepare_outer_output_directory(comm: MPI.Comm, outer: int) -> str:
     return path
 
 
+def append_pod_rank_provenance(
+    comm: MPI.Comm,
+    outer_dir: str,
+    outer_iteration: int,
+    family: str,
+    requested_rank: int | None,
+    actual_pod_rank: int | None,
+    historical_candidate_rank: int | None,
+    recycled_rank: int | None,
+    rank_cap: int | None,
+    status: str = "available",
+) -> None:
+    """Append per-family rank provenance without changing basis streaming."""
+
+    if comm.Get_rank() != 0:
+        return
+    record = {
+        "outer_iteration": int(outer_iteration),
+        "family": family,
+        "status": status,
+        "requested_pod_rank": requested_rank,
+        "actual_pod_rank": actual_pod_rank,
+        "historical_candidate_rank": historical_candidate_rank,
+        "recycled_rank": recycled_rank,
+        "recycling_rank_cap": rank_cap,
+    }
+    path = os.path.join(outer_dir, "pod_rank_provenance.jsonl")
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+
+
 def update_latest_alias(comm: MPI.Comm, target: str, alias: str) -> None:
     """Maintain an explicit root-level symlink to the newest permanent file."""
 
@@ -133,6 +166,9 @@ def write_basis_metadata(
         "basis_adjoint": cfg.basis_adjoint,
         "formulation": cfg.formulation,
         "sensitivity_source": cfg.sensitivity_source,
+        "basis_transform": cfg.basis_transform,
+        "differentiate_basis": cfg.differentiate_basis,
+        "basis_transform_tau": float(cfg.basis_transform_tau),
         "history_outer_iterations_requested": cfg.history_outer_iterations,
         "history_outer_iterations_included": history_length,
         "forward_history_iterations": [
@@ -151,6 +187,7 @@ def write_basis_metadata(
             "singular_values": "forward_pod_singular_values.csv",
             "modes": "forward_pod_modes",
         },
+        "forward_recycling_mode_directory": "forward_pod_modes",
         "forward_pod_contributors": [
             {
                 "pod_iteration": int(item.iteration),
@@ -336,9 +373,32 @@ def build_forward_only_basis(
         weight * np.asarray(bm, dtype=np.float64).reshape(-1)
         for weight in local_field_weights
     ])
-    rank_cap = cfg.legacy_rank_forward if cfg.legacy_rank_forward > 0 else None
+    rank_cap = None
     recycled_forward = recycle_distributed(
         comm, forward_history, local_mass, rank_cap
+    )
+    append_pod_rank_provenance(
+        comm,
+        outer_dir,
+        pod_iteration,
+        "forward",
+        cfg.keep_modes,
+        available_modes(pod, cfg.keep_modes),
+        sum(item.modes.shape[1] for item in forward_history),
+        int(recycled_forward.modes.shape[1]),
+        rank_cap,
+    )
+    append_pod_rank_provenance(
+        comm,
+        outer_dir,
+        pod_iteration,
+        "adjoint",
+        None,
+        None,
+        0,
+        0,
+        None,
+        status="not_requested",
     )
     common_basis, basis_diag = common_basis_distributed(
         comm,
@@ -347,6 +407,14 @@ def build_forward_only_basis(
         local_mass,
         rank_cap,
         adjoint_projector=make_admissibility_projector(mesh, bm, cfg),
+    )
+    append_family_mode_diagnostics(
+        comm,
+        outer_dir,
+        pod_iteration,
+        "forward",
+        recycled_forward.rank_diagnostics,
+        basis_diag,
     )
     if comm.Get_rank() == 0:
         print(
@@ -377,6 +445,9 @@ def build_forward_only_basis(
                     "adjoint_enrichment": False,
                     "basis_forward": cfg.basis_forward,
                     "basis_adjoint": cfg.basis_adjoint,
+                    "basis_transform": cfg.basis_transform,
+                    "differentiate_basis": cfg.differentiate_basis,
+                    "basis_transform_tau": float(cfg.basis_transform_tau),
                     "formulation": cfg.formulation,
                     "sensitivity_source": cfg.sensitivity_source,
                     "streamed_forward_rank": int(common_basis.modes.shape[1]),
@@ -422,11 +493,13 @@ def main() -> None:
 
     ds, mesh, coef, pod, ioh, initial_fields = init_runtime(comm, cfg)
     bm = coef.B
+    received_reference_design = False
     times = []
     energy = EnergyState()
-    add_snapshot(
-        comm, pod, ioh, bm, initial_fields, 0.0, times, energy,
-    )
+    # The ordinary POD is always populated.  It is the independent
+    # full-order-adjoint reconstruction basis and must not change when the
+    # ROM-only transformed stream is enabled.
+    add_snapshot(comm, pod, ioh, bm, initial_fields, 0.0, times, energy)
     window_stats = None
     if cfg.input_mode == "windowed_statistics":
         # The initial condition is not a statistical sample.  Window means are
@@ -442,6 +515,8 @@ def main() -> None:
         )
     mode_output_index = 0
     adjoint_mode_output_index = 0
+    forward_pod_rank = None
+    adjoint_pod_rank = None
     pod_iteration = 0
     singular_value_history_new = True
     adjoint_pod = None
@@ -480,13 +555,18 @@ def main() -> None:
                 break
 
             if mode == MODE_FORWARD and phase == PHASE_FWD_RUNNING:
-                fields = recv_fields(ds, cfg.n_input_fields, cfg.dtype)
+                if cfg.basis_transform != "none" and not received_reference_design:
+                    # The first control event is the explicit mapped-design
+                    # handoff sent by Fortran immediately before this batch.
+                    # Keep it for provenance only: all forward POD snapshots
+                    # and recycled factors remain ordinary physical fields.
+                    _ = recv_field(ds, cfg.dtype)
+                    received_reference_design = True
+                raw_fields = recv_fields(ds, cfg.n_input_fields, cfg.dtype)
                 if window_stats is None:
-                    add_snapshot(
-                        comm, pod, ioh, bm, fields, tcur, times, energy,
-                    )
+                    add_snapshot(comm, pod, ioh, bm, raw_fields, tcur, times, energy)
                 else:
-                    window_stats.add(fields, tcur)
+                    window_stats.add(raw_fields, tcur)
                 continue
 
             if mode == MODE_FORWARD and phase == PHASE_FWD_DONE:
@@ -666,6 +746,7 @@ def main() -> None:
                 coeffs, header, n_avail = build_time_coefficients(
                     comm, pod, cfg, times
                 )
+                forward_pod_rank = int(n_avail)
                 forward_output_cfg = replace(
                     cfg,
                     mode_output_file_name=os.path.join(
@@ -734,9 +815,10 @@ def main() -> None:
                     flush_buffer(comm, adjoint_pod, adjoint_ioh)
                     adjoint_pod.scale_modes(comm, bm1sqrt=adjoint_ioh.bm1sqrt, op="div")
                     adjoint_pod.rotate_local_modes_to_global(comm)
-                    adjoint_coeffs, adjoint_header, _ = build_time_coefficients(
+                    adjoint_coeffs, adjoint_header, adjoint_pod_rank = build_time_coefficients(
                         comm, adjoint_pod, adjoint_cfg, adjoint_times
                     )
+                    adjoint_pod_rank = int(adjoint_pod_rank)
                     outer_dir = outer_output_directory(pod_iteration)
                     adjoint_output_cfg = replace(
                         adjoint_cfg,
@@ -788,7 +870,11 @@ def main() -> None:
                     append_factor_history(
                         forward_history,
                         factors_from_pod(
-                        pod, ioh, bm, cfg.n_input_fields, pod_iteration,
+                            pod,
+                            ioh,
+                            bm,
+                            cfg.n_input_fields,
+                            pod_iteration,
                             cfg.scalar_metric_weight,
                         ),
                         cfg.history_outer_iterations,
@@ -818,19 +904,51 @@ def main() -> None:
                     # V_a blocks.  The Fortran handoff constructs V_E when the
                     # selected formulation requests it; Python never projects
                     # V_a into V_f or silently replaces it by a complement.
-                    forward_cap = (
-                        cfg.legacy_rank_forward
-                        if cfg.legacy_rank_forward > 0 else None
-                    )
-                    adjoint_cap = (
-                        cfg.legacy_rank_adjoint
-                        if cfg.legacy_rank_adjoint > 0 else None
-                    )
+                    forward_cap = None
+                    adjoint_cap = None
                     recycled_forward = recycle_distributed(
                         comm, forward_history, local_mass, forward_cap
                     )
                     recycled_adjoint = recycle_distributed(
                         comm, adjoint_history, local_mass, adjoint_cap
+                    )
+                    append_family_mode_diagnostics(
+                        comm,
+                        outer_dir,
+                        pod_iteration,
+                        "forward",
+                        recycled_forward.rank_diagnostics,
+                        None,
+                    )
+                    append_family_mode_diagnostics(
+                        comm,
+                        outer_dir,
+                        pod_iteration,
+                        "adjoint",
+                        recycled_adjoint.rank_diagnostics,
+                        None,
+                    )
+                    append_pod_rank_provenance(
+                        comm,
+                        outer_dir,
+                        pod_iteration,
+                        "forward",
+                        cfg.keep_modes,
+                        forward_pod_rank,
+                        forward_candidate_modes,
+                        int(recycled_forward.modes.shape[1]),
+                        forward_cap,
+                    )
+                    append_pod_rank_provenance(
+                        comm,
+                        outer_dir,
+                        pod_iteration,
+                        "adjoint",
+                        adjoint_cfg.keep_modes,
+                        adjoint_pod_rank,
+                        adjoint_candidate_modes,
+                        int(recycled_adjoint.modes.shape[1]),
+                        adjoint_cap,
                     )
                     if recycled_forward.modes.shape[1] < 1:
                         raise RuntimeError("ROM recycling produced no forward modes")
@@ -879,6 +997,9 @@ def main() -> None:
                                     "basis_adjoint": cfg.basis_adjoint,
                                     "formulation": cfg.formulation,
                                     "sensitivity_source": cfg.sensitivity_source,
+                                    "basis_transform": cfg.basis_transform,
+                                    "differentiate_basis": cfg.differentiate_basis,
+                                    "basis_transform_tau": float(cfg.basis_transform_tau),
                                     "streamed_forward_rank": int(recycled_forward.modes.shape[1]),
                                     "streamed_adjoint_rank": int(recycled_adjoint.modes.shape[1]),
                                     "streamed_enriched_candidate_rank": (
@@ -920,9 +1041,7 @@ def main() -> None:
                 times = []
                 energy = EnergyState()
                 if window_stats is None:
-                    add_snapshot(
-                        comm, pod, ioh, bm, initial_fields, 0.0, times, energy,
-                    )
+                    add_snapshot(comm, pod, ioh, bm, initial_fields, 0.0, times, energy)
                 else:
                     window_stats = WindowStatistics(
                         cfg.window_duration,
@@ -930,6 +1049,8 @@ def main() -> None:
                         cfg.dtype,
                         cfg.keep_partial_window,
                     )
+                if cfg.basis_transform != "none":
+                    received_reference_design = False
                 continue
 
             time.sleep(0.001)

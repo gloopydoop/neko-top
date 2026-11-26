@@ -1,12 +1,13 @@
 program rom_projection_algebra_diagnostic
   use neko, only: neko_init, neko_finalize
   use neko_top, only: neko_top_register_types
+  use user, only: user_setup
   use simulation_m, only: simulation_t
   use json_module, only: json_file
   use json_utils_ext, only: json_read_file
   use fluid_pnpn, only: fluid_pnpn_t
   use field, only: field_t
-  use field_math, only: field_add2s2, field_col3, field_rzero
+  use field_math, only: field_add2s2, field_col3, field_rzero, field_copy
   use operators, only: grad, div, ortho
   use gather_scatter, only: GS_OP_ADD
   use math, only: col2, glsc3
@@ -16,6 +17,7 @@ program rom_projection_algebra_diagnostic
   use logger, only: neko_log
   use utils, only: neko_error
   use rom_projection_operator, only: rom_projection_ax_t
+  use rom_basis_handoff, only: rom_project_velocity_column
   use rom_basis_orthogonalization, only: rom_mass_orthonormalize
   use, intrinsic :: iso_c_binding, only: c_ptr, C_NULL_PTR
 
@@ -53,6 +55,11 @@ program rom_projection_algebra_diagnostic
   real(kind=rp) :: mixed_bc_before, mixed_bc_after
   real(kind=rp) :: mixed_mass_before, mixed_mass_after
   real(kind=rp) :: mixed_mass_change, mixed_weak_normalized
+  real(kind=rp) :: native_column_weak, native_column_strong
+  real(kind=rp) :: native_column_bc, native_column_mass
+  real(kind=rp) :: native_column_linear_residual
+  integer :: native_column_iterations
+  logical :: native_column_converged
   real(kind=rp) :: mixed_preservation_error, mixed_idempotence
   real(kind=rp) :: correction_orthogonality, basis_gram_error
   real(kind=rp) :: mixed_rhs_norm, mixed_schur_residual, mixed_schur_relative
@@ -64,10 +71,16 @@ program rom_projection_algebra_diagnostic
   real(kind=rp) :: rhs_compatibility, adjoint_lhs, adjoint_rhs
   real(kind=rp) :: adjoint_relative_error, probe_dot_ij, probe_dot_ji
   integer, parameter :: n_probe = 5
+  integer, parameter :: n_pressure_cases = 6
+  integer, parameter :: pressure_case_max(n_pressure_cases) = [50, 100, 200, 400, 800, 1600]
   real(kind=rp), allocatable :: pressure_probes(:, :), schur_probes(:, :)
   real(kind=rp), allocatable :: native_probes(:, :), probe_s_norm(:)
   real(kind=rp), allocatable :: probe_a_norm(:), probe_s_a_relative(:)
   real(kind=rp), allocatable :: probe_s_quadratic(:), probe_a_quadratic(:)
+  real(kind=rp) :: pressure_case_linear(n_pressure_cases)
+  real(kind=rp) :: pressure_case_weak(n_pressure_cases)
+  integer :: pressure_case_iterations(n_pressure_cases)
+  logical :: pressure_case_converged(n_pressure_cases)
   real(kind=rp), allocatable :: mass_weights(:), mixed_basis(:, :)
   real(kind=rp), allocatable :: basis_norm(:), basis_cross(:)
   integer, allocatable :: mixed_final_index(:)
@@ -92,6 +105,7 @@ program rom_projection_algebra_diagnostic
   call neko_top_register_types()
   parameters = json_read_file(trim(case_file))
   call parameters%update('unsteady', .false., found)
+  call user_setup(simulation%neko_case%user)
   call simulation%init(parameters)
 
   select type (fluid_in => simulation%fluid)
@@ -169,6 +183,49 @@ program rom_projection_algebra_diagnostic
 
   call assemble_weak_continuity(fluid, p_work, p_rhs, u, v, w, u_zero, &
        v_zero, w_zero, f_x, f_y, f_z, c_before, n, weak_before, event)
+
+  ! Exercise the ROM candidate-column wrapper itself.  Its pressure solve uses
+  ! Neko's native Ax_prs; the following legacy algebra block remains below as
+  ! an independent comparison of the older constrained Schur construction.
+  saved_abs_tol = fluid%ksp_prs%abs_tol
+  saved_rel_tol = fluid%ksp_prs%rel_tol
+  saved_max_iter = fluid%ksp_prs%max_iter
+  ! Use a diagnostic linear tolerance below the production value so that the
+  ! 50/100/200 caps distinguish Krylov truncation from the final continuity
+  ! residual.  The wrapper and this test restore the production settings.
+  fluid%ksp_prs%abs_tol = 1.0e-12_rp
+  fluid%ksp_prs%rel_tol = 0.0_rp
+  do i = 1, n_pressure_cases
+     ! Hold the incoming manufactured field fixed while varying only the
+     ! candidate projection Krylov cap.  The wrapper restores each setting;
+  ! assign the next cap explicitly before the next independent trial.
+     fluid%ksp_prs%max_iter = pressure_case_max(i)
+     call field_copy(sol_u, u); call field_copy(sol_v, v); call field_copy(sol_w, w)
+     call rom_project_velocity_column(fluid, sol_u, sol_v, sol_w, &
+          native_column_weak, linear_residual = native_column_linear_residual, &
+          iterations = native_column_iterations, converged = native_column_converged)
+     pressure_case_weak(i) = native_column_weak
+     pressure_case_linear(i) = native_column_linear_residual
+     pressure_case_iterations(i) = native_column_iterations
+     pressure_case_converged(i) = native_column_converged
+  end do
+  fluid%ksp_prs%abs_tol = saved_abs_tol
+  fluid%ksp_prs%rel_tol = saved_rel_tol
+  fluid%ksp_prs%max_iter = saved_max_iter
+  ! Keep the 200-iteration trial as the representative final-column result.
+  native_column_weak = pressure_case_weak(n_pressure_cases)
+  native_column_linear_residual = pressure_case_linear(n_pressure_cases)
+  native_column_iterations = pressure_case_iterations(n_pressure_cases)
+  native_column_converged = pressure_case_converged(n_pressure_cases)
+  call assemble_weak_continuity(fluid, p_work, p_rhs, sol_u, sol_v, sol_w, &
+       u_zero, v_zero, w_zero, f_x, f_y, f_z, c_after, n, &
+       native_column_weak, event)
+  call rom_bc_residual(fluid, sol_u, sol_v, sol_w, bc_u, bc_v, bc_w, n, &
+       native_column_bc)
+  call rom_strong_divergence(fluid, sol_u, sol_v, sol_w, divergence, n, &
+       native_column_strong)
+  native_column_mass = rom_mass_norm(fluid, sol_u, sol_v, sol_w, n)
+
   call projection_ax%init(fluid, q_op, p_work, p_op, grad_x, grad_y, grad_z, &
        f_x, f_y, f_z, u_zero, v_zero, w_zero)
 
@@ -520,6 +577,40 @@ program rom_projection_algebra_diagnostic
      write(unit, '(A,",",ES24.16)') 'pressure_ksp_start', ksp_result%res_start
      write(unit, '(A,",",ES24.16)') 'pressure_ksp_final', ksp_result%res_final
      write(unit, '(A,",",ES24.16)') 'correction_mass_norm', correction_norm
+     write(unit, '(A,",",ES24.16)') 'native_rom_column_weak_continuity', &
+          native_column_weak
+     write(unit, '(A,",",ES24.16)') 'native_rom_column_strong_divergence', &
+          native_column_strong
+     write(unit, '(A,",",ES24.16)') 'native_rom_column_bc_residual', &
+          native_column_bc
+     write(unit, '(A,",",ES24.16)') 'native_rom_column_mass_norm', &
+          native_column_mass
+     write(unit, '(A,",",ES24.16)') 'native_rom_column_linear_residual', &
+          native_column_linear_residual
+     write(unit, '(A,",",I0)') 'native_rom_column_iterations', &
+          native_column_iterations
+     write(unit, '(A,",",L1)') 'native_rom_column_converged', &
+          native_column_converged
+     do i = 1, n_pressure_cases
+        write(unit, '(A,I0,A,",",ES24.16)') &
+             'projection_cap_', pressure_case_max(i), '_linear_residual', &
+             pressure_case_linear(i)
+        write(unit, '(A,I0,A,",",ES24.16)') &
+             'projection_cap_', pressure_case_max(i), '_final_weak_residual', &
+             pressure_case_weak(i)
+        write(unit, '(A,I0,A,",",I0)') &
+             'projection_cap_', pressure_case_max(i), '_iterations', &
+             pressure_case_iterations(i)
+        write(unit, '(A,I0,A,",",L1)') &
+             'projection_cap_', pressure_case_max(i), '_converged', &
+             pressure_case_converged(i)
+     end do
+     write(unit, '(A,",",ES24.16)') 'native_rom_column_linear_residual', &
+          native_column_linear_residual
+     write(unit, '(A,",",I0)') 'native_rom_column_iterations', &
+          native_column_iterations
+     write(unit, '(A,",",L1)') 'native_rom_column_converged', &
+          native_column_converged
      write(unit, '(A,",",ES24.16)') 'mixed_weak_continuity_before', mixed_weak_before
      write(unit, '(A,",",ES24.16)') 'mixed_weak_continuity_after', mixed_weak_after
      write(unit, '(A,",",ES24.16)') 'mixed_weak_continuity_after_normalized', &
@@ -588,6 +679,13 @@ program rom_projection_algebra_diagnostic
           pressure_residual, ' / ', pressure_relative
      write(*, '(A,I0,A,L1)') 'pressure iterations/converged = ', &
           ksp_result%iter, ' / ', ksp_result%converged
+     do i = 1, n_pressure_cases
+        write(*, '(A,I0,A,ES12.4,A,ES12.4,A,I0,A,L1)') &
+             'projection cap ', pressure_case_max(i), &
+             ' linear/final weak/iterations/converged = ', pressure_case_linear(i), &
+             ' / ', pressure_case_weak(i), ' / ', pressure_case_iterations(i), &
+             ' / ', pressure_case_converged(i)
+     end do
      write(*, '(A,A)') 'CSV evidence: ', trim(diagnostics_file)
      write(*, '(A,ES12.4,A,ES12.4,A,ES12.4)') &
           'mixed weak continuity before/after/normalised = ', mixed_weak_before, ' / ', &
@@ -606,6 +704,13 @@ program rom_projection_algebra_diagnostic
      write(*, '(A,ES12.4)') 'mixed correction M-orthogonality = ', &
           correction_orthogonality
      write(*, '(A,ES12.4)') 'mixed final-basis Gram error = ', basis_gram_error
+     write(*, '(A,ES12.4,A,ES12.4,A,ES12.4,A,ES12.4)') &
+          'native ROM column weak/strong/BC/mass = ', native_column_weak, ' / ', &
+          native_column_strong, ' / ', native_column_bc, ' / ', native_column_mass
+     write(*, '(A,ES12.4,A,I0,A,L1)') &
+          'native ROM column pressure linear residual/iterations/converged = ', &
+          native_column_linear_residual, ' / ', native_column_iterations, ' / ', &
+          native_column_converged
      write(*, '(A,ES12.4,A,ES12.4)') 'Schur/native probe symmetry maxima = ', &
           schur_symmetry_max, ' / ', native_symmetry_max
      write(*, '(A,ES12.4,A,ES12.4)') 'Schur/native minimum quadratic forms = ', &

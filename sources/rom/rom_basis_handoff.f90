@@ -33,6 +33,9 @@ module rom_basis_handoff
 
   public :: rom_receive_basis, rom_receive_petrov_bases, rom_project_basis, &
        rom_project_test_basis, rom_direct_pod_basis, rom_restrict_scalar_basis, &
+       rom_project_velocity_column, &
+       rom_project_velocity_cotangent, &
+       rom_divergence_norm, rom_bc_residual_norm, rom_weak_continuity_norm, &
        rom_orthonormalize_projected_device, &
        rom_orthonormalize_projected_coupled_device
 
@@ -333,7 +336,7 @@ contains
     select type (adjoint_fluid => simulation%adjoint_case%fluid_adj)
     type is (adjoint_fluid_pnpn_t)
        call rom_project_basis(simulation, basis, n_modes, n_fields, &
-            adjoint_fluid%bcs_vel_projector)
+            adjoint_fluid%bcs_vel_projector, 'adjoint')
     class default
        call neko_error('Petrov test-basis projection requires adjoint_fluid_pnpn')
     end select
@@ -353,25 +356,30 @@ contains
   !! `strict_admissibility` is enabled and those residuals exceed the
   !! configured tolerance.  With strict mode disabled it emits an explicit
   !! engineering-approximation warning.
-  subroutine rom_project_basis(simulation, basis, n_modes, n_fields, velocity_projector)
+  subroutine rom_project_basis(simulation, basis, n_modes, n_fields, &
+       velocity_projector, basis_family)
     type(simulation_t), intent(inout) :: simulation
     real(kind=rp), allocatable, intent(inout) :: basis(:, :)
     integer, intent(inout) :: n_modes
     integer, intent(in), optional :: n_fields
     class(vector_bc_projector_t), target, intent(inout), optional :: velocity_projector
+    character(len=*), intent(in), optional :: basis_family
     character(len=:), allocatable :: projection
+    character(len=16) :: family
     type(json_file) :: rom_parameters
 
+    family = 'forward'
+    if (present(basis_family)) family = trim(basis_family)
     call rom_get_parameters(simulation, rom_parameters)
     call json_get_or_default(rom_parameters, 'admissibility_projection', &
          projection, 'pressure')
     select case (trim(projection))
     case ('direct_pod', 'direct', 'none')
        call rom_direct_pod_basis(simulation, basis, n_modes, n_fields, &
-            velocity_projector)
+            velocity_projector, family)
     case ('pressure', 'legacy', 'velocity_inlet_xmin')
        call rom_project_basis_pressure(simulation, basis, n_modes, n_fields, &
-            velocity_projector)
+            velocity_projector, family)
     case default
        call neko_error('ROM admissibility_projection must be direct_pod or pressure')
     end select
@@ -387,12 +395,13 @@ contains
   !! performed on this path.  Coupled velocity--scalar columns are kept in
   !! their original ordering and are orthonormalised together afterwards.
   subroutine rom_direct_pod_basis(simulation, basis, n_modes, n_fields, &
-       velocity_projector)
+       velocity_projector, basis_family)
     type(simulation_t), intent(inout) :: simulation
     real(kind=rp), allocatable, intent(inout) :: basis(:, :)
     integer, intent(inout) :: n_modes
     integer, intent(in), optional :: n_fields
     class(vector_bc_projector_t), target, intent(inout), optional :: velocity_projector
+    character(len=*), intent(in), optional :: basis_family
     type(field_t), pointer :: u_work, v_work, w_work, divergence
     type(field_t), pointer :: bc_u, bc_v, bc_w
     type(field_t), pointer :: p_work, p_rhs, f_x, f_y, f_z
@@ -412,10 +421,12 @@ contains
     logical :: strict_admissibility, failed, orthonormal, diagnostic_open
     logical :: modified
     character(len=:), allocatable :: diagnostics_file
+    character(len=16) :: family
     type(json_file) :: rom_parameters
     type(c_ptr) :: event
     type(fluid_pnpn_t), pointer :: fluid
 
+    nullify(fluid)
     select type (fluid_class => simulation%fluid)
     type is (fluid_pnpn_t)
        fluid => fluid_class
@@ -429,7 +440,15 @@ contains
          'direct_pod ROM basis must contain three velocity fields or one scalar too')
     if (n_modes < 1) call neko_error('direct_pod ROM basis contains no modes')
 
+    family = 'forward'
+    if (present(basis_family)) family = trim(basis_family)
     n = fluid%u%dof%size()
+    call rom_record_rank_stage(simulation%current_design_iteration, family, &
+         'requested_block_rank', -1, &
+         'unknown', -1, 'request_count_not_carried_by_state_recovery_header')
+    call rom_record_rank_stage(simulation%current_design_iteration, family, &
+         'received_rank', n_modes, &
+         'measured', 0, 'rank_read_from_state_recovery_header')
     if (size(basis, 1) /= fields*n .or. size(basis, 2) /= n_modes) then
        call neko_error('direct_pod ROM basis shape is inconsistent with the dof map')
     end if
@@ -443,6 +462,7 @@ contains
          strict_admissibility, .false.)
     call json_get_or_default(rom_parameters, 'projection_diagnostics_file', &
          diagnostics_file, 'rom_direct_pod_diagnostics.csv')
+    call rom_basis_family_filename(diagnostics_file, family)
     call rom_basis_diagnostics_path(simulation, diagnostics_file)
     call json_get_or_default(rom_parameters, 'scalar_metric_weight', &
          scalar_weight, 1.0_rp)
@@ -556,6 +576,14 @@ contains
        close(diagnostic_unit)
     end if
 
+    call rom_record_rank_stage(simulation%current_design_iteration, family, &
+         'post_boundary_restriction_rank', &
+         n_modes, 'measured', 0, 'no_column_deletion; boundary_modified_count=' // &
+         rom_integer_string(count(boundary_modified)))
+    call rom_record_rank_stage(simulation%current_design_iteration, family, &
+         'post_continuity_treatment_rank', &
+         -1, 'not_applicable', -1, 'direct_pod_path_does_not_project_continuity')
+
     call neko_scratch_registry%relinquish_field([u_index, v_index, w_index, &
          divergence_index, bc_u_index, bc_v_index, bc_w_index, p_work_index, &
          p_rhs_index, f_x_index, f_y_index, f_z_index, u_zero_index, &
@@ -564,6 +592,12 @@ contains
     nullify(p_work, p_rhs, f_x, f_y, f_z, u_zero, v_zero, w_zero)
 
     if (strict_admissibility .and. failed) then
+       call rom_record_rank_stage(simulation%current_design_iteration, family, &
+            'post_linear_dependence_rank', &
+            -1, 'not_reached', -1, 'continuity_bc_gate_aborted_before_orthogonalization')
+       call rom_record_rank_stage(simulation%current_design_iteration, family, &
+            'final_retained_rank', -1, &
+            'not_reached', -1, 'continuity_bc_gate_aborted_before_orthogonalization')
        if (fields == 4) deallocate(scalar_basis)
        deallocate(projected, mass, strong_before, weak_before, bc_before, &
             strong_after, weak_after, bc_after, boundary_modified)
@@ -589,13 +623,24 @@ contains
             admissibility_tolerance, accepted, final_mode_index, mass_norm_final, &
             mass_cross_final, orthonormal)
     end if
+    call rom_record_rank_stage(simulation%current_design_iteration, family, &
+         'post_linear_dependence_rank', &
+         accepted, 'measured', n_modes - accepted, &
+         'rejected_modes_have_two_pass_mgs_residual_norm_below_threshold')
     if (.not. orthonormal .or. accepted < 1) then
+       call rom_record_rank_stage(simulation%current_design_iteration, family, &
+            'final_retained_rank', -1, &
+            'not_reached', -1, 'orthonormalization_gate_failed')
        if (fields == 4) deallocate(scalar_basis)
        deallocate(projected, mass, strong_before, weak_before, bc_before, &
             strong_after, weak_after, bc_after, boundary_modified)
        call neko_error('direct_pod ROM basis is not mass-orthonormal')
     end if
 
+    call rom_record_rank_stage(simulation%current_design_iteration, family, &
+         'final_retained_rank', accepted, &
+         'measured', n_modes - accepted, &
+         'final_rank_is_post_two_pass_mass_orthonormalization')
     n_modes = accepted
     if (fields == 4) then
        deallocate(basis)
@@ -614,18 +659,23 @@ contains
   end subroutine rom_direct_pod_basis
 
   !> Read projection settings and enforce the ROM basis admissibility policy.
-  subroutine rom_project_basis_pressure(simulation, basis, n_modes, n_fields, velocity_projector)
+  subroutine rom_project_basis_pressure(simulation, basis, n_modes, n_fields, &
+       velocity_projector, basis_family)
     type(simulation_t), intent(inout) :: simulation
     real(kind=rp), allocatable, intent(inout) :: basis(:, :)
     integer, intent(inout) :: n_modes
     integer, intent(in), optional :: n_fields
     class(vector_bc_projector_t), target, intent(inout), optional :: velocity_projector
+    character(len=*), intent(in), optional :: basis_family
     real(kind=rp), allocatable :: velocity_basis(:, :), scalar_basis(:, :)
     integer, allocatable :: kept_indices(:)
     real(kind=rp) :: scalar_weight
     integer :: fields, old_modes, n
+    character(len=16) :: family
     type(json_file) :: rom_parameters
 
+    family = 'forward'
+    if (present(basis_family)) family = trim(basis_family)
     fields = 3
     if (present(n_fields)) fields = n_fields
     if (fields /= 3 .and. fields /= 4) then
@@ -648,7 +698,7 @@ contains
        ! scalar columns still have exactly the same mode ordering.
        call rom_restrict_scalar_basis(simulation, scalar_basis, old_modes)
        call rom_project_basis_velocity(simulation, velocity_basis, n_modes, &
-            kept_indices, scalar_basis, scalar_weight, velocity_projector)
+            kept_indices, scalar_basis, scalar_weight, velocity_projector, family)
        if (n_modes < 1) call neko_error('coupled projection removed every ROM mode')
        deallocate(basis)
        allocate(basis(4*n,n_modes))
@@ -659,12 +709,12 @@ contains
        return
     end if
     call rom_project_basis_velocity(simulation, basis, n_modes, &
-         velocity_projector = velocity_projector)
+         velocity_projector = velocity_projector, basis_family = family)
   end subroutine rom_project_basis_pressure
 
   !> Apply the velocity-only admissibility handoff used by the common basis.
   subroutine rom_project_basis_velocity(simulation, basis, n_modes, kept_indices, &
-       scalar_basis, scalar_weight, velocity_projector)
+       scalar_basis, scalar_weight, velocity_projector, basis_family)
     type(simulation_t), intent(inout) :: simulation
     real(kind=rp), allocatable, intent(inout) :: basis(:, :)
     integer, intent(inout) :: n_modes
@@ -672,14 +722,18 @@ contains
     real(kind=rp), allocatable, intent(inout), optional :: scalar_basis(:, :)
     real(kind=rp), intent(in), optional :: scalar_weight
     class(vector_bc_projector_t), target, intent(inout), optional :: velocity_projector
+    character(len=*), intent(in), optional :: basis_family
     real(kind=rp) :: pressure_abs_tol, pressure_rel_tol
     integer :: pressure_max_iter, projection_outer_iterations
     real(kind=rp) :: admissibility_tolerance
     logical :: strict_admissibility
     character(len=:), allocatable :: diagnostics_file
+    character(len=16) :: family
     type(json_file) :: rom_parameters
 
     call rom_get_parameters(simulation, rom_parameters)
+    family = 'forward'
+    if (present(basis_family)) family = trim(basis_family)
     call json_get_or_default(rom_parameters, &
          'projection_pressure_absolute_tolerance', pressure_abs_tol, &
          1.0e-10_rp)
@@ -696,6 +750,7 @@ contains
     call json_get_or_default(rom_parameters, &
          'projection_diagnostics_file', diagnostics_file, &
          'rom_projection_diagnostics.csv')
+    call rom_basis_family_filename(diagnostics_file, family)
     call rom_basis_diagnostics_path(simulation, diagnostics_file)
     call json_get_or_default(rom_parameters, 'strict_admissibility', &
          strict_admissibility, .false.)
@@ -708,11 +763,203 @@ contains
        call project_rom_basis_pnpn(fluid, basis, n_modes, pressure_abs_tol, &
             pressure_rel_tol, pressure_max_iter, admissibility_tolerance, &
             projection_outer_iterations, diagnostics_file, strict_admissibility, &
-            kept_indices, scalar_basis, scalar_weight, velocity_projector)
+            kept_indices, scalar_basis, scalar_weight, velocity_projector, family, &
+            simulation%current_design_iteration)
     class default
        call neko_error('ROM admissibility projection requires a Pn/Pn fluid')
     end select
   end subroutine rom_project_basis_velocity
+
+  !> Apply one fixed-mesh Neko pressure/BC projection to a velocity column.
+  !!
+  !! This is the linear column operation used by the adaptive ROM candidate
+  !! path.  Unlike rom_project_basis_velocity it does not orthonormalise,
+  !! truncate, or branch on column rank.  The pressure solver settings are
+  !! saved and restored; this routine never changes the production solver
+  !! configuration permanently.  The returned value is the independently
+  !! measured native weak-continuity residual after correction.
+  subroutine rom_project_velocity_column(fluid, u, v, w, residual, &
+       velocity_projector, linear_residual, iterations, converged, &
+       true_relative_residual)
+    type(fluid_pnpn_t), target, intent(inout) :: fluid
+    type(field_t), intent(inout) :: u, v, w
+    real(kind=rp), intent(out) :: residual
+    class(vector_bc_projector_t), target, intent(inout), optional :: velocity_projector
+    real(kind=rp), intent(out), optional :: linear_residual
+    integer, intent(out), optional :: iterations
+    logical, intent(out), optional :: converged
+    real(kind=rp), intent(out), optional :: true_relative_residual
+    type(field_t), pointer :: p_zero, p_res, p_op, q_op, phi, phi_copy, f_x, f_y, f_z
+    type(field_t), pointer :: grad_x, grad_y, grad_z, u_zero, v_zero, w_zero
+    integer :: p_zero_i, p_res_i, p_op_i, q_op_i, phi_i, f_x_i, f_y_i, f_z_i
+    integer :: grad_x_i, grad_y_i, grad_z_i, u_zero_i, v_zero_i, w_zero_i
+    integer :: phi_copy_i
+    integer :: n
+    type(rom_projection_ax_t) :: projection_ax
+    type(ksp_monitor_t) :: ksp_result
+    real(kind=rp) :: saved_abs_tol, saved_rel_tol
+    real(kind=rp) :: rhs_norm
+    integer :: saved_max_iter
+    type(c_ptr) :: event
+
+    n = fluid%u%dof%size()
+    residual = huge(0.0_rp)
+    call neko_scratch_registry%request_field(p_zero, p_zero_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(p_res, p_res_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(p_op, p_op_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(q_op, q_op_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(phi, phi_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(phi_copy, phi_copy_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(f_x, f_x_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(f_y, f_y_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(f_z, f_z_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(grad_x, grad_x_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(grad_y, grad_y_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(grad_z, grad_z_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(u_zero, u_zero_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(v_zero, v_zero_i, fluid%dm_Xh, .true.)
+    call neko_scratch_registry%request_field(w_zero, w_zero_i, fluid%dm_Xh, .true.)
+    call field_rzero(u_zero); call field_rzero(v_zero); call field_rzero(w_zero)
+
+    call rom_apply_velocity_bc(fluid, velocity_projector, u%x, v%x, w%x, n)
+    call field_col3(f_x, u, fluid%rho); call field_col3(f_y, v, fluid%rho)
+    call field_col3(f_z, w, fluid%rho)
+    call rom_col2_B(f_x, fluid, n); call rom_col2_B(f_y, fluid, n)
+    call rom_col2_B(f_z, fluid, n)
+    call field_rzero(p_zero); call field_rzero(phi)
+    event = C_NULL_PTR
+    call fluid%prs_res%compute(p_zero, p_res, u, v, w, u_zero, v_zero, w_zero, &
+         f_x, f_y, f_z, fluid%c_Xh, fluid%gs_Xh, fluid%bc_prs_surface, &
+         fluid%bc_sym_surface, fluid%Ax_prs, 0.0_rp, 1.0_rp, u_zero, &
+         fluid%rho, event)
+    if (.not. fluid%prs_dirichlet) call ortho(p_res%x, fluid%glb_n_points, n)
+    call fluid%gs_Xh%op(p_res%x, n, GS_OP_ADD)
+    call fluid%bcs_prs_projector%apply(p_res%x, n)
+
+    saved_abs_tol = fluid%ksp_prs%abs_tol
+    saved_rel_tol = fluid%ksp_prs%rel_tol
+    saved_max_iter = fluid%ksp_prs%max_iter
+    ! Keep the KSP right-hand side p_res separate from the operator's output
+    ! scratch p_op.  The matrix-free Ax callback is allowed to overwrite its
+    ! bound residual field; aliasing it with the KSP RHS corrupts GMRES's
+    ! fixed right-hand side after the first application.
+    call projection_ax%init(fluid, q_op, p_zero, p_op, grad_x, grad_y, grad_z, &
+         f_x, f_y, f_z, u_zero, v_zero, w_zero, velocity_projector, .true.)
+    ! Solve the constrained Schur operator paired with the actual correction
+    ! map.  Its mismatch with native Ax_prs is retained as an explicit
+    ! scientific diagnostic; substituting Ax_prs would solve a different
+    ! equation and does not enforce the constrained continuity residual.
+    call fluid%pc_prs%update()
+    ksp_result = fluid%ksp_prs%solve(projection_ax, phi, p_res%x, n, &
+         fluid%c_Xh, fluid%bcs_prs_projector, fluid%gs_Xh, &
+         niter=fluid%ksp_prs%max_iter)
+    if (present(linear_residual)) linear_residual = ksp_result%res_final
+    if (present(iterations)) iterations = ksp_result%iter
+    if (present(converged)) converged = ksp_result%converged
+    if (present(true_relative_residual)) then
+       ! Independently reapply the constrained ROM Schur operator. This does
+       ! not reuse the KSP monitor's recursively updated residual estimate.
+       call field_copy(phi_copy, phi)
+       call projection_ax%compute(phi%x, phi_copy%x, fluid%c_Xh, fluid%msh, fluid%Xh)
+       call fluid%gs_Xh%op(phi%x, n, GS_OP_ADD)
+       call fluid%bcs_prs_projector%apply(phi%x, n)
+       call field_sub3(phi, phi, p_res, n)
+       rhs_norm = sqrt(max(0.0_rp, rom_weighted_norm(p_res, fluid%c_Xh%mult, &
+            fluid%c_Xh%mult_d, n)))
+       true_relative_residual = sqrt(max(0.0_rp, rom_weighted_norm(phi, &
+            fluid%c_Xh%mult, fluid%c_Xh%mult_d, n))) / &
+            max(rhs_norm, tiny(1.0_rp))
+       ! The potential is needed below for the velocity correction.
+       call field_copy(phi, phi_copy)
+    end if
+    if (.not. fluid%prs_dirichlet) call ortho(phi%x, fluid%glb_n_points, n)
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call grad(grad_x%x_d, grad_y%x_d, grad_z%x_d, phi%x_d, fluid%c_Xh)
+    else
+       call grad(grad_x%x, grad_y%x, grad_z%x, phi%x, fluid%c_Xh)
+    end if
+    call rom_col2_B(grad_x, fluid, n); call rom_col2_B(grad_y, fluid, n)
+    call rom_col2_B(grad_z, fluid, n)
+    call fluid%gs_Xh%op(grad_x%x, grad_y%x, grad_z%x, n, GS_OP_ADD)
+    call rom_col2_Binv(grad_x, fluid, n); call rom_col2_Binv(grad_y, fluid, n)
+    call rom_col2_Binv(grad_z, fluid, n)
+    call rom_apply_velocity_bc(fluid, velocity_projector, grad_x%x, grad_y%x, &
+         grad_z%x, n)
+    call field_add2s2(u, grad_x, -1.0_rp, n)
+    call field_add2s2(v, grad_y, -1.0_rp, n)
+    call field_add2s2(w, grad_z, -1.0_rp, n)
+    call rom_col2_B(u, fluid, n); call rom_col2_B(v, fluid, n)
+    call rom_col2_B(w, fluid, n)
+    call fluid%gs_Xh%op(u%x, v%x, w%x, n, GS_OP_ADD)
+    call rom_col2_Binv(u, fluid, n); call rom_col2_Binv(v, fluid, n)
+    call rom_col2_Binv(w, fluid, n)
+    call rom_apply_velocity_bc(fluid, velocity_projector, u%x, v%x, w%x, n)
+
+    call field_col3(f_x, u, fluid%rho); call field_col3(f_y, v, fluid%rho)
+    call field_col3(f_z, w, fluid%rho)
+    call rom_col2_B(f_x, fluid, n); call rom_col2_B(f_y, fluid, n)
+    call rom_col2_B(f_z, fluid, n)
+    call field_rzero(p_zero)
+    call fluid%prs_res%compute(p_zero, p_res, u, v, w, u_zero, v_zero, w_zero, &
+         f_x, f_y, f_z, fluid%c_Xh, fluid%gs_Xh, fluid%bc_prs_surface, &
+         fluid%bc_sym_surface, fluid%Ax_prs, 0.0_rp, 1.0_rp, u_zero, &
+         fluid%rho, event)
+    if (.not. fluid%prs_dirichlet) call ortho(p_res%x, fluid%glb_n_points, n)
+    call fluid%gs_Xh%op(p_res%x, n, GS_OP_ADD)
+    call fluid%bcs_prs_projector%apply(p_res%x, n)
+    residual = sqrt(max(0.0_rp, rom_weighted_norm(p_res, fluid%c_Xh%mult, &
+         fluid%c_Xh%mult_d, n)))
+    fluid%ksp_prs%abs_tol = saved_abs_tol
+    fluid%ksp_prs%rel_tol = saved_rel_tol
+    fluid%ksp_prs%max_iter = saved_max_iter
+    call projection_ax%free()
+    call neko_scratch_registry%relinquish_field([p_zero_i, p_res_i, p_op_i, q_op_i, phi_i, phi_copy_i, &
+         f_x_i, f_y_i, f_z_i, grad_x_i, grad_y_i, grad_z_i, u_zero_i, v_zero_i, &
+         w_zero_i])
+    nullify(p_zero, p_res, p_op, q_op, phi, phi_copy, f_x, f_y, f_z, grad_x, grad_y, grad_z)
+    nullify(u_zero, v_zero, w_zero)
+  end subroutine rom_project_velocity_column
+
+  !> Apply the mass-adjoint of the ROM candidate projection to a velocity
+  !! cotangent.
+  !!
+  !! The reduced objective contractions are represented in the SEM Euclidean
+  !! coefficient storage, while the physical mode variation is the
+  !! mass-orthogonal candidate projection.  For the exact projector
+  !!
+  !!   P^T = M_u P M_u^{-1},
+  !!
+  !! so the reverse operation is implemented with the same ROM-local
+  !! projection after the inverse SEM mass and one final SEM mass.  This is
+  !! deliberately separate from Neko's production pressure path.  The caller
+  !! must use a projection solve tight enough for the requested Taylor gate;
+  !! the returned residual is exposed so the adaptive path can fail closed.
+  subroutine rom_project_velocity_cotangent(fluid, gx, gy, gz, residual, &
+       velocity_projector, linear_residual, iterations, converged, &
+       true_relative_residual)
+    type(fluid_pnpn_t), target, intent(inout) :: fluid
+    type(field_t), intent(inout) :: gx, gy, gz
+    real(kind=rp), intent(out) :: residual
+    class(vector_bc_projector_t), target, intent(inout), optional :: velocity_projector
+    real(kind=rp), intent(out), optional :: linear_residual
+    integer, intent(out), optional :: iterations
+    logical, intent(out), optional :: converged
+    real(kind=rp), intent(out), optional :: true_relative_residual
+    integer :: n
+
+    n = fluid%u%dof%size()
+    ! G is stored as an Euclidean cotangent.  Convert it to the input of the
+    ! mass-adjoint projector, apply P, then return to Euclidean storage.
+    call rom_col2_Binv(gx, fluid, n)
+    call rom_col2_Binv(gy, fluid, n)
+    call rom_col2_Binv(gz, fluid, n)
+    call rom_project_velocity_column(fluid, gx, gy, gz, residual, &
+         velocity_projector, linear_residual, iterations, converged, &
+         true_relative_residual)
+    call rom_col2_B(gx, fluid, n)
+    call rom_col2_B(gy, fluid, n)
+    call rom_col2_B(gz, fluid, n)
+  end subroutine rom_project_velocity_cotangent
 
   !> Apply the selected primal or adjoint velocity boundary projector.
   !! The optional projector is supplied only for the adjoint test-basis
@@ -734,7 +981,8 @@ contains
   subroutine project_rom_basis_pnpn(fluid, basis, n_modes, projection_abs_tol, &
        projection_rel_tol, projection_max_iter, admissibility_tolerance, &
        projection_outer_iterations, diagnostics_file, strict_admissibility, &
-       kept_indices, scalar_basis, scalar_weight, velocity_projector)
+       kept_indices, scalar_basis, scalar_weight, velocity_projector, basis_family, &
+       outer_iteration)
     type(fluid_pnpn_t), intent(inout), target :: fluid
     real(kind=rp), allocatable, intent(inout) :: basis(:, :)
     integer, intent(inout) :: n_modes
@@ -748,6 +996,8 @@ contains
     real(kind=rp), allocatable, intent(inout), optional :: scalar_basis(:, :)
     real(kind=rp), intent(in), optional :: scalar_weight
     class(vector_bc_projector_t), target, intent(inout), optional :: velocity_projector
+    character(len=*), intent(in) :: basis_family
+    integer, intent(in) :: outer_iteration
     type(field_t), pointer :: p_work, p_rhs, p_op, q_op, phi, u_work, v_work, w_work
     type(field_t), pointer :: u_zero, v_zero, w_zero, f_x, f_y, f_z
     type(field_t), pointer :: grad_x, grad_y, grad_z
@@ -781,11 +1031,17 @@ contains
     integer :: saved_max_iter
     integer :: n, mode, previous, accepted, kept, diagnostic_unit, projection_pass
     logical :: diagnostic_open, projection_failed, orthonormal
+    integer :: gate_failed_modes
     character(len=512) :: pressure_log
     type(c_ptr) :: event
     real(kind=rp) :: coupled_scalar_weight
 
     if (n_modes < 1) call neko_error('ROM basis contains no modes')
+    call rom_record_rank_stage(outer_iteration, basis_family, &
+         'requested_block_rank', -1, 'unknown', -1, &
+         'request_count_not_carried_by_state_recovery_header')
+    call rom_record_rank_stage(outer_iteration, basis_family, 'received_rank', &
+         n_modes, 'measured', 0, 'rank_read_from_state_recovery_header')
     n = fluid%u%dof%size()
     if (size(basis, 1) /= 3 * n .or. size(basis, 2) /= n_modes) then
        call neko_error('ROM basis shape is inconsistent with the velocity dof map')
@@ -1263,6 +1519,22 @@ contains
        end if
     end do
 
+    call rom_record_rank_stage(outer_iteration, basis_family, &
+         'post_boundary_restriction_rank', n_modes, 'measured', 0, &
+         'no_column_deletion_by_boundary_restriction')
+    gate_failed_modes = count(.not. pressure_converged .or. &
+         weak_divergence_after > admissibility_tolerance .or. &
+         bc_after > admissibility_tolerance)
+    if (projection_failed) then
+       call rom_record_rank_stage(outer_iteration, basis_family, &
+            'post_continuity_treatment_rank', n_modes, 'gate_failed', &
+            gate_failed_modes, 'pressure_or_continuity_or_bc_gate_failed;no_column_deletion')
+    else
+       call rom_record_rank_stage(outer_iteration, basis_family, &
+            'post_continuity_treatment_rank', n_modes, 'measured', 0, &
+            'pressure_continuity_and_bc_gates_passed;no_column_deletion')
+    end if
+
     if (projection_failed) then
        if (diagnostic_open) then
           flush(diagnostic_unit)
@@ -1280,6 +1552,12 @@ contains
        nullify(u_zero, v_zero, w_zero, f_x, f_y, f_z, grad_x, grad_y, grad_z)
        nullify(divergence, bc_u, bc_v, bc_w)
        if (strict_admissibility) then
+          call rom_record_rank_stage(outer_iteration, basis_family, &
+               'post_linear_dependence_rank', -1, 'not_reached', -1, &
+               'strict_admissibility_gate_aborted_before_orthogonalization')
+          call rom_record_rank_stage(outer_iteration, basis_family, &
+               'final_retained_rank', -1, 'not_reached', -1, &
+               'strict_admissibility_gate_aborted_before_orthogonalization')
           deallocate(projected, mass, divergence_before, divergence_bc_input, &
                divergence_after, bc_before, bc_after, mass_norm_before, &
                mass_norm_raw_after, mass_cross_before, mass_cross_raw_after, &
@@ -1307,7 +1585,14 @@ contains
                   admissibility_tolerance, accepted, final_mode_index, mass_norm_final, &
                   mass_cross_final, orthonormal)
           end if
+          call rom_record_rank_stage(outer_iteration, basis_family, &
+               'post_linear_dependence_rank', accepted, 'measured', &
+               n_modes - accepted, &
+               'rejected_modes_have_two_pass_mgs_residual_norm_below_threshold')
           if (.not. orthonormal .or. accepted < 1) then
+             call rom_record_rank_stage(outer_iteration, basis_family, &
+                  'final_retained_rank', -1, 'not_reached', -1, &
+                  'engineering_fallback_orthonormalization_gate_failed')
              deallocate(projected, mass, divergence_before, divergence_bc_input, &
                   divergence_after, bc_before, bc_after, mass_norm_before, &
                   mass_norm_raw_after, mass_cross_before, mass_cross_raw_after, &
@@ -1321,6 +1606,9 @@ contains
           end if
           basis = projected(:, 1:accepted)
           n_modes = accepted
+          call rom_record_rank_stage(outer_iteration, basis_family, &
+               'final_retained_rank', n_modes, 'measured', 0, &
+               'engineering_fallback_retains_mgs_modes_despite_admissibility_gate_failure')
           if (present(kept_indices)) then
              allocate(kept_indices(accepted))
              kept = 0
@@ -1362,7 +1650,13 @@ contains
             admissibility_tolerance, accepted, final_mode_index, mass_norm_final, &
             mass_cross_final, orthonormal)
     end if
+    call rom_record_rank_stage(outer_iteration, basis_family, &
+         'post_linear_dependence_rank', accepted, 'measured', n_modes - accepted, &
+         'rejected_modes_have_two_pass_mgs_residual_norm_below_threshold')
     if (.not. orthonormal) then
+       call rom_record_rank_stage(outer_iteration, basis_family, &
+            'final_retained_rank', -1, 'not_reached', -1, &
+            'mass_orthonormality_gate_failed_after_mgs')
        call neko_error('ROM projected basis is not mass-orthonormal; '&
             //'gather-scatter normalisation or reorthogonalisation failed')
     end if
@@ -1372,6 +1666,9 @@ contains
        basis = projected
     end if
     n_modes = accepted
+    call rom_record_rank_stage(outer_iteration, basis_family, &
+         'final_retained_rank', n_modes, 'measured', 0, &
+         'final_rank_is_post_two_pass_mass_orthonormalization')
     if (present(kept_indices)) then
        allocate(kept_indices(accepted))
        kept = 0
@@ -1460,6 +1757,11 @@ contains
     call field_sub3(bc_u, bc_u, u, n)
     call field_sub3(bc_v, bc_v, v, n)
     call field_sub3(bc_w, bc_w, w, n)
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call bc_u%copy_from(HOST_TO_DEVICE, sync=.true.)
+       call bc_v%copy_from(HOST_TO_DEVICE, sync=.true.)
+       call bc_w%copy_from(HOST_TO_DEVICE, sync=.true.)
+    end if
     norm_squared = rom_weighted_norm(bc_u, fluid%c_Xh%B, fluid%c_Xh%B_d, n) + &
          rom_weighted_norm(bc_v, fluid%c_Xh%B, fluid%c_Xh%B_d, n) + &
          rom_weighted_norm(bc_w, fluid%c_Xh%B, fluid%c_Xh%B_d, n)
@@ -1502,6 +1804,85 @@ contains
     value = sqrt(max(0.0_rp, rom_weighted_norm(p_rhs, fluid%c_Xh%mult, &
          fluid%c_Xh%mult_d, n)))
   end subroutine rom_weak_continuity_norm
+
+  !> Append one measured rank transition to a family-specific CSV stream.
+  !! Rank -1 and rejection count -1 mean that the stage is unknown or was not
+  !! reached; status and reason distinguish those cases explicitly.
+  subroutine rom_record_rank_stage(outer_iteration, family, stage, rank, status, &
+       rejected_count, reason)
+    integer, intent(in) :: outer_iteration, rank, rejected_count
+    character(len=*), intent(in) :: family, stage, status, reason
+    character(len=:), allocatable :: path
+    integer :: unit, ios
+    logical :: exists
+    integer(kind=8) :: file_size
+
+    if (pe_rank /= 0) return
+    path = 'rom_rank_provenance_' // trim(family) // '.csv'
+    call rom_basis_diagnostics_path_for_outer(outer_iteration, path)
+    inquire(file=trim(path), exist=exists, size=file_size, iostat=ios)
+    if (ios /= 0) then
+       exists = .false.
+       file_size = 0
+    end if
+    open(newunit=unit, file=trim(path), status='unknown', position='append', &
+         action='write', iostat=ios)
+    if (ios /= 0) then
+       call neko_log%warning('Could not append ROM rank provenance: ' // trim(path))
+       return
+    end if
+    if (.not. exists .or. file_size == 0) then
+       write(unit, '(A)') &
+            'outer_iteration,family,stage,rank,status,rejected_count,rejection_reason'
+    end if
+    write(unit, '(I0,",",A,",",A,",",I0,",",A,",",I0,",",A)') &
+         outer_iteration, trim(family), trim(stage), rank, trim(status), &
+         rejected_count, trim(reason)
+    flush(unit)
+    close(unit)
+  end subroutine rom_record_rank_stage
+
+  !> Add the POD family before the extension so adjoint diagnostics never
+  !! replace forward diagnostics when both use the same configured basename.
+  subroutine rom_basis_family_filename(filename, family)
+    character(len=:), allocatable, intent(inout) :: filename
+    character(len=*), intent(in) :: family
+    integer :: slash, dot
+
+    slash = scan(trim(filename), '/', back=.true.)
+    dot = scan(trim(filename), '.', back=.true.)
+    if (dot > slash) then
+       filename = filename(:dot-1) // '_' // trim(family) // filename(dot:)
+    else
+       filename = trim(filename) // '_' // trim(family)
+    end if
+  end subroutine rom_basis_family_filename
+
+  !> Resolve a provenance filename without needing the full simulation object.
+  subroutine rom_basis_diagnostics_path_for_outer(outer_iteration, configured)
+    integer, intent(in) :: outer_iteration
+    character(len=:), allocatable, intent(inout) :: configured
+    character(len=1024) :: basename, directory
+    integer :: slash
+
+    basename = trim(configured)
+    slash = scan(trim(basename), '/', back=.true.)
+    if (slash > 0) basename = basename(slash+1:)
+    write(directory, '("rom_output/outer_",I3.3,"/basis_diagnostics/")') &
+         outer_iteration
+    call mkdir('rom_output')
+    call mkdir(trim(directory))
+    configured = trim(directory) // trim(basename)
+  end subroutine rom_basis_diagnostics_path_for_outer
+
+  function rom_integer_string(value) result(string)
+    integer, intent(in) :: value
+    character(len=:), allocatable :: string
+    character(len=32) :: buffer
+
+    write(buffer, '(I0)') value
+    string = trim(buffer)
+  end function rom_integer_string
 
   !> Place basis-admissibility diagnostics below the matching ROM outer output.
   !! @param[in] simulation Simulation carrying the current outer index.

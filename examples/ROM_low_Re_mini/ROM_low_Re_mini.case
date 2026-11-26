@@ -177,7 +177,7 @@
         "type": "rom",
         "batch_size": 10,
         "n_modes": 8,
-        "i_stream": 200,
+        "i_stream": 20,
         "stream_adjoint": true,
         "dtype": "double",
         "write_modes": false,
@@ -218,14 +218,17 @@
             "tolerance": 1.0e-12,
             "rom": {
                 "enabled": true,
-                "inner_iterations": 5,
+                "inner_iterations": 3,
+                "basis_transform": "algebraic",
+                "differentiate_basis": true,
+                "basis_transform_tau": 1.0,
                 "basis": {
                     "forward": "forward",
-                    "adjoint": "forward"
+                    "adjoint": "enriched"
                 },
-                "substeps": 4,
+                "substeps": 1,
                 "history_outer_iterations": 3,
-                "scalar_metric_weight": 0.5,
+                "scalar_metric_weight": 1.0,
                 "validate_full_order": true,
                 "admissibility_projection": "direct_pod",
                 "time_scheme": "bdf1",

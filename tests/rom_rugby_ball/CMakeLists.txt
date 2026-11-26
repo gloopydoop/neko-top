@@ -46,6 +46,38 @@ add_rom_rugby_ball_diagnostic(
     PkgConfig::json-fortran
     $<$<BOOL:${BLAS_FOUND}>:BLAS::BLAS>
     $<$<BOOL:${LAPACK_FOUND}>:LAPACK::LAPACK>)
+target_sources(ROM_rugby_ball_forward_continuity_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+if(TARGET neko_cxx_support)
+    target_link_libraries(ROM_rugby_ball_forward_continuity_diagnostic PRIVATE
+        neko_cxx_support)
+endif()
+
+add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_lift_weak_decomposition_diagnostic
+    lift_weak_decomposition_diagnostic.f90
+    PkgConfig::json-fortran
+    $<$<BOOL:${BLAS_FOUND}>:BLAS::BLAS>
+    $<$<BOOL:${LAPACK_FOUND}>:LAPACK::LAPACK>)
+target_sources(ROM_rugby_ball_lift_weak_decomposition_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+if(TARGET neko_cxx_support)
+    target_link_libraries(ROM_rugby_ball_lift_weak_decomposition_diagnostic PRIVATE
+        neko_cxx_support)
+endif()
+
+add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_curl_div_compatibility_diagnostic
+    curl_div_compatibility_diagnostic.f90
+    PkgConfig::json-fortran
+    $<$<BOOL:${BLAS_FOUND}>:BLAS::BLAS>
+    $<$<BOOL:${LAPACK_FOUND}>:LAPACK::LAPACK>)
+target_sources(ROM_rugby_ball_curl_div_compatibility_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+if(TARGET neko_cxx_support)
+    target_link_libraries(ROM_rugby_ball_curl_div_compatibility_diagnostic PRIVATE
+        neko_cxx_support)
+endif()
 
 add_rom_rugby_ball_diagnostic(
     ROM_rugby_ball_projection_algebra_diagnostic
@@ -57,8 +89,61 @@ add_rom_rugby_ball_diagnostic(
     $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::cudart>
     $<$<BOOL:${hipblas_FOUND}>:roc::hipblas>
     $<$<BOOL:${hipsolver_FOUND}>:roc::hipsolver>)
+target_sources(ROM_rugby_ball_projection_algebra_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
 if(TARGET neko_cxx_support)
     target_link_libraries(ROM_rugby_ball_projection_algebra_diagnostic PRIVATE
+        neko_cxx_support)
+endif()
+
+add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_projection_transpose_diagnostic
+    projection_transpose_diagnostic.f90
+    PkgConfig::json-fortran
+    $<$<BOOL:${BLAS_FOUND}>:BLAS::BLAS>
+    $<$<BOOL:${LAPACK_FOUND}>:LAPACK::LAPACK>
+    $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::cusolver>
+    $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::cudart>
+    $<$<BOOL:${hipblas_FOUND}>:roc::hipblas>
+    $<$<BOOL:${hipsolver_FOUND}>:roc::hipsolver>)
+target_sources(ROM_rugby_ball_projection_transpose_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+if(TARGET neko_cxx_support)
+    target_link_libraries(ROM_rugby_ball_projection_transpose_diagnostic PRIVATE
+        neko_cxx_support)
+endif()
+
+add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_projection_pairing_diagnostic
+    projection_pairing_diagnostic.f90
+    PkgConfig::json-fortran
+    $<$<BOOL:${BLAS_FOUND}>:BLAS::BLAS>
+    $<$<BOOL:${LAPACK_FOUND}>:LAPACK::LAPACK>
+    $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::cusolver>
+    $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::cudart>
+    $<$<BOOL:${hipblas_FOUND}>:roc::hipblas>
+    $<$<BOOL:${hipsolver_FOUND}>:roc::hipsolver>)
+target_sources(ROM_rugby_ball_projection_pairing_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+if(TARGET neko_cxx_support)
+    target_link_libraries(ROM_rugby_ball_projection_pairing_diagnostic PRIVATE
+        neko_cxx_support)
+endif()
+
+add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_projection_preconditioner_diagnostic
+    projection_preconditioner_diagnostic.f90
+    PkgConfig::json-fortran
+    $<$<BOOL:${BLAS_FOUND}>:BLAS::BLAS>
+    $<$<BOOL:${LAPACK_FOUND}>:LAPACK::LAPACK>
+    $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::cusolver>
+    $<$<BOOL:${CUDAToolkit_FOUND}>:CUDA::cudart>
+    $<$<BOOL:${hipblas_FOUND}>:roc::hipblas>
+    $<$<BOOL:${hipsolver_FOUND}>:roc::hipsolver>)
+target_sources(ROM_rugby_ball_projection_preconditioner_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+if(TARGET neko_cxx_support)
+    target_link_libraries(ROM_rugby_ball_projection_preconditioner_diagnostic PRIVATE
         neko_cxx_support)
 endif()
 
@@ -73,6 +158,34 @@ add_rom_rugby_ball_diagnostic(
 add_rom_rugby_ball_diagnostic(
     ROM_rugby_ball_reduced_bdf1_adjoint_diagnostic
     reduced_bdf1_adjoint_diagnostic.f90)
+
+add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_reduced_system_export_diagnostic
+    reduced_system_export_diagnostic.f90)
+
+add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_cpu_assembly_regression_diagnostic
+    cpu_assembly_regression_diagnostic.f90
+    PkgConfig::json-fortran)
+target_sources(ROM_rugby_ball_cpu_assembly_regression_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+if(TARGET neko_cxx_support)
+    target_link_libraries(ROM_rugby_ball_cpu_assembly_regression_diagnostic PRIVATE
+        neko_cxx_support)
+endif()
+
+add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_affine_continuity_diagnostic
+    rom_affine_continuity_diagnostic.f90
+    PkgConfig::json-fortran
+    $<$<BOOL:${BLAS_FOUND}>:BLAS::BLAS>
+    $<$<BOOL:${LAPACK_FOUND}>:LAPACK::LAPACK>)
+target_sources(ROM_rugby_ball_affine_continuity_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+if(TARGET neko_cxx_support)
+    target_link_libraries(ROM_rugby_ball_affine_continuity_diagnostic PRIVATE
+        neko_cxx_support)
+endif()
 
 add_rom_rugby_ball_diagnostic(
     ROM_rugby_ball_scalar_transport_diagnostic
@@ -101,6 +214,23 @@ add_rom_rugby_ball_diagnostic(
     ROM_rugby_ball_production_rom_gradient_diagnostic
     production_rom_gradient_diagnostic.f90
     PkgConfig::json-fortran)
+target_sources(ROM_rugby_ball_production_rom_gradient_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+if(TARGET neko_cxx_support)
+    target_link_libraries(ROM_rugby_ball_production_rom_gradient_diagnostic PRIVATE
+        neko_cxx_support)
+endif()
+
+add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_adaptive_sensitivity_smoke_diagnostic
+    adaptive_sensitivity_smoke_diagnostic.f90
+    PkgConfig::json-fortran)
+target_sources(ROM_rugby_ball_adaptive_sensitivity_smoke_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+if(TARGET neko_cxx_support)
+    target_link_libraries(ROM_rugby_ball_adaptive_sensitivity_smoke_diagnostic PRIVATE
+        neko_cxx_support)
+endif()
 
 add_rom_rugby_ball_diagnostic(
     ROM_rugby_ball_validation_diagnostic
@@ -115,15 +245,24 @@ add_custom_target(ROM_rugby_ball_diagnostics
     DEPENDS
         ROM_rugby_ball_projection_diagnostic
         ROM_rugby_ball_forward_continuity_diagnostic
+        ROM_rugby_ball_lift_weak_decomposition_diagnostic
+        ROM_rugby_ball_curl_div_compatibility_diagnostic
         ROM_rugby_ball_projection_algebra_diagnostic
+        ROM_rugby_ball_projection_transpose_diagnostic
+        ROM_rugby_ball_projection_pairing_diagnostic
+        ROM_rugby_ball_projection_preconditioner_diagnostic
         ROM_rugby_ball_objective_diagnostic
         ROM_rugby_ball_objective_weight_diagnostic
         ROM_rugby_ball_reduced_bdf1_adjoint_diagnostic
+        ROM_rugby_ball_reduced_system_export_diagnostic
+        ROM_rugby_ball_cpu_assembly_regression_diagnostic
+        ROM_rugby_ball_affine_continuity_diagnostic
         ROM_rugby_ball_scalar_transport_diagnostic
         ROM_rugby_ball_scalar_objective_equivalence_diagnostic
         ROM_rugby_ball_residual_identity_diagnostic
         ROM_rugby_ball_objective_equivalence_diagnostic
         ROM_rugby_ball_production_rom_gradient_diagnostic
+        ROM_rugby_ball_adaptive_sensitivity_smoke_diagnostic
         ROM_rugby_ball_validation_diagnostic
         ROM_rugby_ball_production_rom_step_diagnostic)
 set_target_properties(ROM_rugby_ball_diagnostics PROPERTIES

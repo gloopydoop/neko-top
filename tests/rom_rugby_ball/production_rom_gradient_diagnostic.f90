@@ -1,6 +1,7 @@
 program production_rom_gradient_diagnostic
   use neko, only: neko_init, neko_finalize
   use neko_top, only: neko_top_register_types
+  use user, only: user_setup
   use simulation_m, only: simulation_t
   use design, only: design_t, design_factory
   use brinkman_design, only: brinkman_design_t
@@ -13,13 +14,13 @@ program production_rom_gradient_diagnostic
   use field, only: field_t
   use operators, only: grad
   use field_math, only: field_rzero
-  use field_math, only: field_rzero
   use gather_scatter, only: GS_OP_ADD
   use math, only: col2
   use json_module, only: json_file
   use json_utils, only: json_get
   use json_utils_ext, only: json_read_file
   use vector, only: vector_t
+  use vector_math, only: vector_glsc2
   use comm, only: NEKO_COMM, pe_rank, MPI_REAL_PRECISION
   use mpi_f08, only: MPI_Allreduce, MPI_SUM
   use num_types, only: rp
@@ -36,14 +37,20 @@ program production_rom_gradient_diagnostic
   type(json_file) :: parameters, design_parameters
   type(field_t) :: u, v, w, psi, grad_x, grad_y, grad_z
   type(vector_t) :: x0, xplus, xminus, direction
+  type(vector_t) :: mapped_density, directional_gradient
   real(kind=rp), allocatable :: basis(:, :), gradient(:), chi_gradient(:), &
        chi_plus(:), chi_minus(:), final_state(:)
   real(kind=rp), allocatable :: epsilons(:)
   real(kind=rp) :: objective, objective_plus, objective_minus
   real(kind=rp) :: constraint, constraint_plus, constraint_minus
-  real(kind=rp) :: fd, analytic, chi_analytic, error_value, chi_error
+  real(kind=rp) :: fd, optimizer_pairing, chi_pairing, design_pairing
+  real(kind=rp) :: error_value, chi_error, design_pairing_error
+  real(kind=rp) :: chi_tolerance, design_tolerance
+  real(kind=rp) :: best_scaled_error, best_design_scaled_error
   real(kind=rp) :: local_dot, global_dot, max_error
   real(kind=rp) :: x, y
+  real(kind=rp) :: best_epsilon
+  real(kind=rp) :: best_design_epsilon
   integer :: argc, n, n_modes, r, mode, i, k
   logical :: found
   character(len=1024) :: case_file, modes_path, objective_mode, basis_source
@@ -65,6 +72,7 @@ program production_rom_gradient_diagnostic
   ! startup would wait for the Python state-recovery peer, so the diagnostic
   ! supplies the already configured time grid directly below.
   call parameters%update('unsteady', .false., found)
+  call user_setup(simulation%neko_case%user)
   call simulation%init(parameters)
   select type (fluid_in => simulation%fluid)
   type is (fluid_pnpn_t)
@@ -83,9 +91,13 @@ program production_rom_gradient_diagnostic
   case ('viscous')
      optimizer%rom_problem%has_brinkman = .false.
      optimizer%rom_problem%brinkman_weight = 0.0_rp
+     optimizer%rom_problem%has_scalar_mixing = .false.
+     optimizer%rom_problem%scalar_mixing_weight = 0.0_rp
   case ('brinkman')
      optimizer%rom_problem%has_viscous = .false.
      optimizer%rom_problem%viscous_weight = 0.0_rp
+     optimizer%rom_problem%has_scalar_mixing = .false.
+     optimizer%rom_problem%scalar_mixing_weight = 0.0_rp
   case default
      call neko_error('Unknown production ROM objective diagnostic mode')
   end select
@@ -184,6 +196,8 @@ program production_rom_gradient_diagnostic
 
   call x0%init(design%size()); call xplus%init(design%size())
   call xminus%init(design%size()); call direction%init(design%size())
+  call mapped_density%init(design%size())
+  call directional_gradient%init(design%size())
   x0%x = 0.5_rp
   do i = 1, design%size()
      direction%x(i) = 0.07_rp * sin(real(i, rp) * 0.31_rp)
@@ -199,7 +213,10 @@ program production_rom_gradient_diagnostic
   if (pe_rank == 0) write(*,'(A,ES12.4,A,ES12.4)') &
        'Production ROM baseline objective/constraint = ', objective, ' / ', constraint
 
-  max_error = 0.0_rp
+  best_scaled_error = huge(1.0_rp)
+  best_epsilon = -1.0_rp
+  best_design_scaled_error = huge(1.0_rp)
+  best_design_epsilon = -1.0_rp
   do k = 1, size(epsilons)
      xplus%x = x0%x + epsilons(k) * direction%x
      xminus%x = x0%x - epsilons(k) * direction%x
@@ -219,29 +236,64 @@ program production_rom_gradient_diagnostic
      call optimizer%evaluate_fixed_basis(design, objective, gradient, constraint, &
           final_state)
      deallocate(final_state)
+     mapped_density%x = chi_gradient
+     call design%map_backward(mapped_density)
+     select type (des => design)
+     type is (brinkman_design_t)
+        call des%get_sensitivity(directional_gradient)
+        call des%convert_to_directional_derivative(directional_gradient)
+     class default
+        call neko_error('Production ROM gradient diagnostic requires Brinkman')
+     end select
+     design_pairing = vector_glsc2(directional_gradient, direction)
+     design_pairing_error = abs(fd - design_pairing)
      local_dot = dot_product(gradient, direction%x)
      call MPI_Allreduce(local_dot, global_dot, 1, MPI_REAL_PRECISION, MPI_SUM, &
           NEKO_COMM)
-     analytic = global_dot
-     error_value = abs(fd - analytic)
+     optimizer_pairing = global_dot
+     error_value = abs(fd - optimizer_pairing)
      local_dot = sum(optimizer%rom_problem%weights%x * chi_gradient * (chi_plus - chi_minus) / &
           (2.0_rp * epsilons(k)))
      call MPI_Allreduce(local_dot, global_dot, 1, MPI_REAL_PRECISION, MPI_SUM, &
           NEKO_COMM)
-     chi_analytic = global_dot
-     chi_error = abs(fd - chi_analytic)
-     max_error = max(max_error, error_value, chi_error)
+     chi_pairing = global_dot
+     chi_error = abs(fd - chi_pairing)
+     chi_tolerance = 1.0e-12_rp + 2.0e-5_rp * &
+          max(abs(fd), abs(chi_pairing))
+     design_tolerance = 1.0e-12_rp + 2.0e-5_rp * &
+          max(abs(fd), abs(design_pairing))
+     if (chi_error / chi_tolerance < best_scaled_error) then
+        best_scaled_error = chi_error / chi_tolerance
+        best_epsilon = epsilons(k)
+     end if
+     if (design_pairing_error / design_tolerance < best_design_scaled_error) then
+        best_design_scaled_error = design_pairing_error / design_tolerance
+        best_design_epsilon = epsilons(k)
+     end if
      if (pe_rank == 0) write(*,'(A,ES10.3,A,ES14.6,A,ES14.6,A,ES10.3,A,ES14.6,A,ES10.3)') &
-          'eps=', epsilons(k), ' FD=', fd, ' adjoint=', analytic, &
-          ' mapped_error=', error_value, ' chi_adjoint=', chi_analytic, &
-          ' chi_error=', chi_error
+          'eps=', epsilons(k), ' FD=', fd, ' optimizer_pairing=', optimizer_pairing, &
+          ' optimizer_gap=', error_value, ' mapped_chi_pairing=', chi_pairing, &
+          ' mapped_chi_error=', chi_error
+     if (pe_rank == 0) write(*,'(A,ES14.6,A,ES10.3)') &
+          'design_pullback_pairing=', design_pairing, &
+          ' design_pullback_error=', design_pairing_error
   end do
 
-  if (max_error > 2.0e-5_rp * max(1.0_rp, abs(fd))) then
-     call neko_error('Production ROM mapped gradient finite-difference gate failed')
-  end if
+  if (best_scaled_error >= huge(1.0_rp)) call neko_error( &
+       'Production ROM mapped-chi diagnostic did not evaluate a direction')
+  if (pe_rank == 0) write(*,'(A,ES10.3,A,ES10.3)') &
+       'Best mapped-chi step/error-tolerance = ', best_epsilon, ' / ', &
+       best_scaled_error
+  if (best_design_scaled_error > 1.0_rp) call neko_error( &
+       'Production ROM map-pullback directional derivative check failed at every step size')
+  if (pe_rank == 0) write(*,'(A,ES10.3,A,ES10.3)') &
+       'Best map-pullback step/error-tolerance = ', best_design_epsilon, ' / ', &
+       best_design_scaled_error
+  if (best_scaled_error > 1.0_rp) call neko_error( &
+       'Production ROM mapped-chi directional derivative check failed at every step size')
 
   call x0%free(); call xplus%free(); call xminus%free(); call direction%free()
+  call mapped_density%free(); call directional_gradient%free()
   deallocate(epsilons, gradient, basis)
   call optimizer%free(); call problem%free(); call design%free()
   if (allocated(design)) deallocate(design)

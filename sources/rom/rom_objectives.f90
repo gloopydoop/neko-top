@@ -7,8 +7,8 @@ module rom_objectives
   use vector, only: vector_t
   use matrix, only: matrix_t
   use vector_math, only: vector_col3, vector_add2s2, vector_vdot3, vector_cmult, &
-       vector_cadd, &
-       vector_glsc2, vector_glsc3
+       vector_cadd
+  use rom_assembly, only: rom_glsc2_local, rom_glsc3_local, rom_reduce_buffer
   use scratch_registry, only: neko_scratch_registry
   implicit none
   private
@@ -49,8 +49,9 @@ contains
     type(vector_t), intent(inout) :: constant, linear
     type(matrix_t), intent(inout) :: quadratic
     type(vector_t), pointer :: effective
+    real(kind=rp), allocatable :: local(:)
     integer :: effective_index
-    integer :: n, r, i, j, component, direction
+    integer :: n, r, i, j, component, direction, linear_offset, quadratic_offset
 
     n = weights%size(); r = size(gradients,2)
     if (mask%size() /= n .or. size(gradients,1) /= 3 .or. &
@@ -62,23 +63,36 @@ contains
     constant%x = 0.0_rp
     linear%x = 0.0_rp
     quadratic%x = 0.0_rp
+    linear_offset = 1
+    quadratic_offset = linear_offset + r
+    allocate(local(1+r+r*r)); local = 0.0_rp
     do component = 1, 3
        do direction = 1, 3
-          constant%x(1) = constant%x(1) + viscosity * vector_glsc3( &
+          local(1) = local(1) + viscosity * rom_glsc3_local( &
                lift_gradients(component,direction), effective, &
                lift_gradients(component,direction))
           do i = 1, r
-             linear%x(i) = linear%x(i) + viscosity * vector_glsc3( &
+             local(linear_offset+i) = local(linear_offset+i) + viscosity * rom_glsc3_local( &
                   lift_gradients(component,direction), effective, &
                   gradients(component,i,direction))
              do j = 1, r
-                quadratic%x(i,j) = quadratic%x(i,j) + viscosity * &
-                     vector_glsc3(gradients(component,i,direction), effective, &
+                local(quadratic_offset+(j-1)*r+i) = &
+                     local(quadratic_offset+(j-1)*r+i) + viscosity * &
+                     rom_glsc3_local(gradients(component,i,direction), effective, &
                      gradients(component,j,direction))
              end do
           end do
        end do
     end do
+    call rom_reduce_buffer(local)
+    constant%x(1) = local(1)
+    linear%x = local(linear_offset+1:quadratic_offset)
+    do j = 1, r
+       do i = 1, r
+          quadratic%x(i,j) = local(quadratic_offset+(j-1)*r+i)
+       end do
+    end do
+    deallocate(local)
     call neko_scratch_registry%relinquish_vector(effective_index)
     nullify(effective)
   end subroutine rom_assemble_viscous_terms
@@ -95,7 +109,9 @@ contains
     type(vector_t), intent(inout) :: linear
     type(matrix_t), intent(inout) :: cross
     type(vector_t), pointer :: effective
+    real(kind=rp), allocatable :: local(:)
     integer :: effective_index, n, re, rf, i, j, component, direction
+    integer :: cross_offset
 
     n = weights%size(); re = size(test_gradients,2); rf = size(trial_gradients,2)
     if (size(test_gradients,1) /= 3 .or. size(test_gradients,3) /= 3 .or. &
@@ -106,20 +122,31 @@ contains
     call vector_col3(effective, weights, mask)
     call linear%init(re); call cross%init(re, rf)
     linear%x = 0.0_rp; cross%x = 0.0_rp
+    cross_offset = re
+    allocate(local(re+re*rf)); local = 0.0_rp
     do i = 1, re
        do component = 1, 3
           do direction = 1, 3
-             linear%x(i) = linear%x(i) + viscosity * vector_glsc3( &
+             local(i) = local(i) + viscosity * rom_glsc3_local( &
                   test_gradients(component,i,direction), effective, &
                   lift_gradients(component,direction))
              do j = 1, rf
-                cross%x(i,j) = cross%x(i,j) + viscosity * vector_glsc3( &
+                local(cross_offset+(j-1)*re+i) = &
+                     local(cross_offset+(j-1)*re+i) + viscosity * rom_glsc3_local( &
                      test_gradients(component,i,direction), effective, &
                      trial_gradients(component,j,direction))
              end do
           end do
        end do
     end do
+    call rom_reduce_buffer(local)
+    linear%x = local(1:re)
+    do j = 1, rf
+       do i = 1, re
+          cross%x(i,j) = local(cross_offset+(j-1)*re+i)
+       end do
+    end do
+    deallocate(local)
     call neko_scratch_registry%relinquish_vector(effective_index)
     nullify(effective)
   end subroutine rom_assemble_viscous_cross_terms
@@ -137,8 +164,9 @@ contains
     type(vector_t), intent(inout) :: constant, linear
     type(matrix_t), intent(inout) :: quadratic
     type(vector_t), pointer :: effective, offset
+    real(kind=rp), allocatable :: local(:)
     integer :: effective_index, offset_index
-    integer :: n, r, i, j
+    integer :: n, r, i, j, quadratic_offset
 
     n = weights%size(); r = size(scalar_modes)
     if (mask%size() /= n .or. scalar_lift%size() /= n) &
@@ -149,16 +177,25 @@ contains
     offset = scalar_lift
     call vector_cadd(offset, -scalar_reference_value)
     call constant%init(1); call linear%init(r); call quadratic%init(r,r)
-    constant%x(1) = vector_glsc3(offset, effective, offset)
-    linear%x = 0.0_rp
-    quadratic%x = 0.0_rp
+    quadratic_offset = 1+r
+    allocate(local(1+r+r*r)); local = 0.0_rp
+    local(1) = rom_glsc3_local(offset, effective, offset)
     do i = 1, r
-       linear%x(i) = vector_glsc3(offset, effective, scalar_modes(i))
+       local(1+i) = rom_glsc3_local(offset, effective, scalar_modes(i))
        do j = 1, r
-          quadratic%x(i,j) = vector_glsc3(scalar_modes(i), effective, &
+          local(quadratic_offset+(j-1)*r+i) = rom_glsc3_local(scalar_modes(i), effective, &
                scalar_modes(j))
        end do
     end do
+    call rom_reduce_buffer(local)
+    constant%x(1) = local(1)
+    linear%x = local(2:quadratic_offset)
+    do j = 1, r
+       do i = 1, r
+          quadratic%x(i,j) = local(quadratic_offset+(j-1)*r+i)
+       end do
+    end do
+    deallocate(local)
     call neko_scratch_registry%relinquish_vector([effective_index, offset_index])
     nullify(effective); nullify(offset)
   end subroutine rom_assemble_scalar_mixing_terms
@@ -172,6 +209,7 @@ contains
     type(vector_t), intent(inout) :: linear
     type(matrix_t), intent(inout) :: cross
     type(vector_t), pointer :: effective, offset
+    real(kind=rp), allocatable :: local(:)
     integer :: effective_index, offset_index, n, rf, re, i, j
 
     n = weights%size(); rf = size(trial_scalar_modes); re = size(test_scalar_modes)
@@ -184,13 +222,22 @@ contains
     call vector_cadd(offset, -scalar_reference_value)
     call linear%init(re); call cross%init(re, rf)
     linear%x = 0.0_rp; cross%x = 0.0_rp
+    allocate(local(re+re*rf)); local = 0.0_rp
     do i = 1, re
-       linear%x(i) = vector_glsc3(test_scalar_modes(i), effective, offset)
+       local(i) = rom_glsc3_local(test_scalar_modes(i), effective, offset)
        do j = 1, rf
-          cross%x(i,j) = vector_glsc3(test_scalar_modes(i), effective, &
+          local(re+(j-1)*re+i) = rom_glsc3_local(test_scalar_modes(i), effective, &
                trial_scalar_modes(j))
        end do
     end do
+    call rom_reduce_buffer(local)
+    linear%x = local(1:re)
+    do j = 1, rf
+       do i = 1, re
+          cross%x(i,j) = local(re+(j-1)*re+i)
+       end do
+    end do
+    deallocate(local)
     call neko_scratch_registry%relinquish_vector([effective_index, offset_index])
     nullify(effective); nullify(offset)
   end subroutine rom_assemble_scalar_mixing_cross_terms
@@ -203,6 +250,7 @@ contains
     type(vector_t), intent(in) :: gradients(:, :, :)
     type(matrix_t), intent(inout) :: quadratic
     type(vector_t), pointer :: effective
+    real(kind=rp), allocatable :: local(:)
     integer :: effective_index
     integer :: n, r, i, j, component, direction
 
@@ -212,17 +260,25 @@ contains
     call neko_scratch_registry%request_vector(effective, effective_index, n, .true.)
     call vector_col3(effective, weights, mask)
     call quadratic%init(r, r)
+    allocate(local(r*r)); local = 0.0_rp
     do i = 1, r
        do j = 1, r
           do component = 1, 3
              do direction = 1, 3
-                quadratic%x(i,j) = quadratic%x(i,j) + viscosity * &
-                     vector_glsc3(gradients(component,i,direction), effective, &
+                local((j-1)*r+i) = local((j-1)*r+i) + viscosity * &
+                     rom_glsc3_local(gradients(component,i,direction), effective, &
                      gradients(component,j,direction))
              end do
           end do
        end do
     end do
+    call rom_reduce_buffer(local)
+    do j = 1, r
+       do i = 1, r
+          quadratic%x(i,j) = local((j-1)*r+i)
+       end do
+    end do
+    deallocate(local)
     call neko_scratch_registry%relinquish_vector(effective_index); nullify(effective)
   end subroutine rom_assemble_viscous_quadratic
 
@@ -235,6 +291,7 @@ contains
     type(vector_t), intent(inout) :: lift_linear
     real(kind=rp), intent(out) :: constant
     type(vector_t), pointer :: effective, masked_weights, lift_square
+    real(kind=rp), allocatable :: local(:)
     integer :: effective_index, masked_weights_index, lift_square_index
     integer :: n, r, i, j, component
 
@@ -248,22 +305,32 @@ contains
     call vector_col3(effective, masked_weights, chi)
     call vector_vdot3(lift_square, lift_velocity(1), lift_velocity(2), lift_velocity(3), &
          lift_velocity(1), lift_velocity(2), lift_velocity(3))
-    constant = vector_glsc2(effective, lift_square)
     call quadratic%init(r, r); call lift_linear%init(r)
     quadratic%x = 0.0_rp
     lift_linear%x = 0.0_rp
+    allocate(local(1+r+r*r)); local = 0.0_rp
+    local(1) = rom_glsc2_local(effective, lift_square)
     do i = 1, r
        do j = 1, r
           do component = 1, 3
-             quadratic%x(i,j) = quadratic%x(i,j) + vector_glsc3( &
+             local(1+r+(j-1)*r+i) = local(1+r+(j-1)*r+i) + rom_glsc3_local( &
                   velocity_modes(component,i), effective, velocity_modes(component,j))
           end do
        end do
        do component = 1, 3
-          lift_linear%x(i) = lift_linear%x(i) + vector_glsc3( &
+          local(1+i) = local(1+i) + rom_glsc3_local( &
                velocity_modes(component,i), effective, lift_velocity(component))
        end do
     end do
+    call rom_reduce_buffer(local)
+    constant = local(1)
+    lift_linear%x = local(2:1+r)
+    do j = 1, r
+       do i = 1, r
+          quadratic%x(i,j) = local(1+r+(j-1)*r+i)
+       end do
+    end do
+    deallocate(local)
     call neko_scratch_registry%relinquish_vector([masked_weights_index, effective_index, lift_square_index])
     nullify(masked_weights); nullify(effective); nullify(lift_square)
   end subroutine rom_assemble_brinkman_objective
@@ -277,6 +344,7 @@ contains
     type(matrix_t), intent(inout) :: cross
     type(vector_t), intent(inout) :: lift_linear
     type(vector_t), pointer :: masked_weights, effective
+    real(kind=rp), allocatable :: local(:)
     integer :: masked_weights_index, effective_index
     integer :: n, rf, re, i, j, component
 
@@ -290,17 +358,26 @@ contains
     call vector_col3(effective, masked_weights, chi)
     call cross%init(re, rf); call lift_linear%init(re)
     cross%x = 0.0_rp; lift_linear%x = 0.0_rp
+    allocate(local(re+re*rf)); local = 0.0_rp
     do i = 1, re
        do component = 1, 3
-          lift_linear%x(i) = lift_linear%x(i) + vector_glsc3( &
+          local(i) = local(i) + rom_glsc3_local( &
                test_velocity_modes(component,i), effective, lift_velocity(component))
           do j = 1, rf
-             cross%x(i,j) = cross%x(i,j) + vector_glsc3( &
+             local(re+(j-1)*re+i) = local(re+(j-1)*re+i) + rom_glsc3_local( &
                   test_velocity_modes(component,i), effective, &
                   trial_velocity_modes(component,j))
           end do
        end do
     end do
+    call rom_reduce_buffer(local)
+    lift_linear%x = local(1:re)
+    do j = 1, rf
+       do i = 1, re
+          cross%x(i,j) = local(re+(j-1)*re+i)
+       end do
+    end do
+    deallocate(local)
     call neko_scratch_registry%relinquish_vector([masked_weights_index, effective_index])
     nullify(masked_weights); nullify(effective)
   end subroutine rom_assemble_brinkman_objective_cross

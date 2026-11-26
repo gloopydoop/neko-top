@@ -47,6 +47,11 @@ module rom_projection_operator
      type(field_t), pointer :: v_zero => null()
      type(field_t), pointer :: w_zero => null()
      class(vector_bc_projector_t), pointer :: velocity_projector => null()
+     ! The legacy basis handoff uses Neko's multiplicity averaging.  The
+     ! adaptive candidate path can request the exact mass-weighted nodal map
+     ! paired with its correction, B^{-1} GS(B grad q), without changing the
+     ! legacy fixed-basis operator.
+     logical :: mass_weighted_velocity_average = .false.
      type(c_ptr) :: event
    contains
      procedure, pass(this) :: init => rom_projection_ax_init
@@ -59,7 +64,8 @@ contains
 
   !> Bind the ROM Schur-complement operator to Neko fluid work fields.
   subroutine rom_projection_ax_init(this, fluid, q, p_zero, p_res, grad_x, &
-       grad_y, grad_z, f_x, f_y, f_z, u_zero, v_zero, w_zero, velocity_projector)
+       grad_y, grad_z, f_x, f_y, f_z, u_zero, v_zero, w_zero, velocity_projector, &
+       mass_weighted_velocity_average)
     class(rom_projection_ax_t), intent(inout) :: this
     type(fluid_pnpn_t), target, intent(inout) :: fluid
     type(field_t), target, intent(inout) :: q, p_zero, p_res
@@ -67,6 +73,7 @@ contains
     type(field_t), target, intent(inout) :: f_x, f_y, f_z
     type(field_t), target, intent(inout) :: u_zero, v_zero, w_zero
     class(vector_bc_projector_t), target, intent(inout), optional :: velocity_projector
+    logical, intent(in), optional :: mass_weighted_velocity_average
 
     this%fluid => fluid
     this%q => q
@@ -83,6 +90,10 @@ contains
     this%w_zero => w_zero
     nullify(this%velocity_projector)
     if (present(velocity_projector)) this%velocity_projector => velocity_projector
+    this%mass_weighted_velocity_average = .false.
+    if (present(mass_weighted_velocity_average)) then
+       this%mass_weighted_velocity_average = mass_weighted_velocity_average
+    end if
     this%event = c_null_ptr
   end subroutine rom_projection_ax_init
 
@@ -119,7 +130,10 @@ contains
     ! Neko's pressure Schur complement pairs C with the collocated strong SEM
     ! gradient grad_h.  The ROM restriction is explicit: gather/average the
     ! element-local correction into the continuous velocity space and then
-    ! apply the native essential velocity projector.
+    ! apply the native essential velocity projector.  The adaptive candidate
+    ! path selects the same mass-weighted map as the velocity correction,
+    ! B^{-1} GS(B grad_h q).  The default retains the legacy multiplicity
+    ! average so fixed-basis projection is not changed by this opt-in path.
     if (NEKO_BCKND_DEVICE .eq. 1) then
        call grad(this%grad_x%x_d, this%grad_y%x_d, this%grad_z%x_d, &
             this%q%x_d, this%fluid%c_Xh)
@@ -127,16 +141,39 @@ contains
        call grad(this%grad_x%x, this%grad_y%x, this%grad_z%x, this%q%x, &
             this%fluid%c_Xh)
     end if
-    call this%fluid%gs_Xh%op(this%grad_x%x, this%grad_y%x, this%grad_z%x, &
-         n, GS_OP_ADD)
-    if (NEKO_BCKND_DEVICE .eq. 1) then
-       call device_col2(this%grad_x%x_d, this%fluid%c_Xh%mult_d, n)
-       call device_col2(this%grad_y%x_d, this%fluid%c_Xh%mult_d, n)
-       call device_col2(this%grad_z%x_d, this%fluid%c_Xh%mult_d, n)
+    if (this%mass_weighted_velocity_average) then
+       if (NEKO_BCKND_DEVICE .eq. 1) then
+          call device_col2(this%grad_x%x_d, this%fluid%c_Xh%B_d, n)
+          call device_col2(this%grad_y%x_d, this%fluid%c_Xh%B_d, n)
+          call device_col2(this%grad_z%x_d, this%fluid%c_Xh%B_d, n)
+       else
+          call col2(this%grad_x%x, this%fluid%c_Xh%B, n)
+          call col2(this%grad_y%x, this%fluid%c_Xh%B, n)
+          call col2(this%grad_z%x, this%fluid%c_Xh%B, n)
+       end if
+       call this%fluid%gs_Xh%op(this%grad_x%x, this%grad_y%x, this%grad_z%x, &
+            n, GS_OP_ADD)
+       if (NEKO_BCKND_DEVICE .eq. 1) then
+          call device_col2(this%grad_x%x_d, this%fluid%c_Xh%Binv_d, n)
+          call device_col2(this%grad_y%x_d, this%fluid%c_Xh%Binv_d, n)
+          call device_col2(this%grad_z%x_d, this%fluid%c_Xh%Binv_d, n)
+       else
+          call col2(this%grad_x%x, this%fluid%c_Xh%Binv, n)
+          call col2(this%grad_y%x, this%fluid%c_Xh%Binv, n)
+          call col2(this%grad_z%x, this%fluid%c_Xh%Binv, n)
+       end if
     else
-       call col2(this%grad_x%x, this%fluid%c_Xh%mult, n)
-       call col2(this%grad_y%x, this%fluid%c_Xh%mult, n)
-       call col2(this%grad_z%x, this%fluid%c_Xh%mult, n)
+       call this%fluid%gs_Xh%op(this%grad_x%x, this%grad_y%x, this%grad_z%x, &
+            n, GS_OP_ADD)
+       if (NEKO_BCKND_DEVICE .eq. 1) then
+          call device_col2(this%grad_x%x_d, this%fluid%c_Xh%mult_d, n)
+          call device_col2(this%grad_y%x_d, this%fluid%c_Xh%mult_d, n)
+          call device_col2(this%grad_z%x_d, this%fluid%c_Xh%mult_d, n)
+       else
+          call col2(this%grad_x%x, this%fluid%c_Xh%mult, n)
+          call col2(this%grad_y%x, this%fluid%c_Xh%mult, n)
+          call col2(this%grad_z%x, this%fluid%c_Xh%mult, n)
+       end if
     end if
     if (associated(this%velocity_projector)) then
        call this%velocity_projector%apply(this%grad_x%x, this%grad_y%x, &

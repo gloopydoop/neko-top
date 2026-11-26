@@ -15,7 +15,8 @@ module rom_optimizer
   use dummy_constraint, only: dummy_constraint_t
   use simulation_m, only: simulation_t
   use rom_problem, only: rom_problem_t
-  use rom_config, only: rom_config_t
+  use rom_assembly, only: rom_reset_collective_counters, rom_get_collective_counters
+  use rom_config, only: rom_config_t, rom_config_get_json
   use rom_diagnostic_audit, only: rom_diagnostic_audit_t
   use rom_validation, only: rom_validation_metrics_t, rom_validation_accept
   use num_types, only: rp
@@ -29,9 +30,9 @@ module rom_optimizer
   use device, only: DEVICE_TO_HOST, HOST_TO_DEVICE
   use neko_config, only: NEKO_BCKND_DEVICE
   use logger, only: neko_log
-  use utils, only: neko_error
-  use comm, only: pe_rank
-  use mpi_f08, only: MPI_WTIME
+  use utils, only: neko_error, mkdir
+  use comm, only: pe_rank, NEKO_COMM, MPI_REAL_PRECISION
+  use mpi_f08, only: MPI_WTIME, MPI_Allreduce, MPI_IN_PLACE, MPI_MAX
   use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
   implicit none
   private
@@ -53,6 +54,7 @@ module rom_optimizer
      real(kind=rp) :: mma_scale = 1.0_rp
      logical :: mma_auto_scale = .false.
      logical :: diagnostic_audit = .false.
+     logical :: audit_exact_algebraic = .false.
      real(kind=rp) :: mma_asyinit = 0.2_rp
      real(kind=rp) :: mma_asyincr = 1.2_rp
      real(kind=rp) :: mma_asydecr = 0.7_rp
@@ -65,11 +67,16 @@ module rom_optimizer
      logical :: validation_log_initialized = .false.
      integer :: rom_log_unit = -1
      logical :: rom_log_initialized = .false.
+     integer :: performance_log_unit = -1
+     logical :: performance_log_initialized = .false.
      character(len=16) :: last_validation_status = 'initial'
      real(kind=rp) :: rom_forward_seconds = 0.0_rp
      real(kind=rp) :: rom_adjoint_seconds = 0.0_rp
      real(kind=rp) :: mma_seconds = 0.0_rp
      real(kind=rp) :: full_order_seconds = 0.0_rp
+     real(kind=rp) :: design_mapping_seconds = 0.0_rp
+     real(kind=rp) :: reconstruction_output_seconds = 0.0_rp
+     real(kind=rp) :: performance_values(30) = 0.0_rp
    contains
      procedure, pass(this) :: init_from_json => rom_optimizer_init_from_json
      procedure, pass(this) :: free => rom_optimizer_free
@@ -99,10 +106,11 @@ contains
     class(problem_t), intent(inout) :: problem
     class(design_t), intent(in) :: design
     type(simulation_t), optional, intent(in) :: simulation
-    type(json_file) :: solver_parameters
+    type(json_file) :: solver_parameters, rom_parameters
     type(rom_config_t) :: rom_config
     class(constraint_t), allocatable :: dummy_con
     integer :: max_iterations
+    logical :: rom_found
 
     call this%free()
     call json_get(parameters, 'optimization.solver', solver_parameters)
@@ -139,6 +147,9 @@ contains
     this%validation_tolerance = rom_config%validation_tolerance
     this%validation_gradient_tolerance = rom_config%validation_gradient_tolerance
     this%diagnostic_audit = rom_config%diagnostic_audit
+    call rom_config_get_json(parameters, rom_parameters, rom_found)
+    call json_get_or_default(rom_parameters, 'audit_exact_algebraic', &
+         this%audit_exact_algebraic, .false.)
     call json_get_or_default(solver_parameters, 'mma.asyinit', &
          this%mma_asyinit, 0.2_rp)
     call json_get_or_default(solver_parameters, 'mma.asyincr', &
@@ -166,8 +177,11 @@ contains
     if (this%rom_log_initialized) then
        close(this%rom_log_unit)
     end if
+    if (this%performance_log_initialized) close(this%performance_log_unit)
     this%rom_log_unit = -1
     this%rom_log_initialized = .false.
+    this%performance_log_unit = -1
+    this%performance_log_initialized = .false.
     this%unconstrained_problem = .false.
     call this%audit%free()
     call this%rom_problem%free()
@@ -251,6 +265,125 @@ contains
     this%supplied_basis_for_step = .false.
   end function rom_optimizer_step_from_basis
 
+  !> Feasible one-sided audit along the unmodified first MMA step.  The frozen
+  !! experiment starts with the current physical basis and leaves all its
+  !! design-independent operators intact; only mapped Brinkman terms vary.
+  !! The caller immediately recomputes the actual MMA candidate afterwards.
+  subroutine rom_optimizer_lagged_fd(this, design, outer, x0, x1, density, gradient, f0)
+    class(rom_optimizer_t), intent(inout) :: this
+    class(design_t), intent(inout) :: design
+    integer, intent(in) :: outer
+    type(vector_t), intent(inout) :: x0, x1, density, gradient
+    real(kind=rp), intent(in) :: f0
+    type(vector_t) :: d, probe, directional_gradient, exact_density
+    real(kind=rp) :: steps(4), values(4,2), base(4), deriv(4), dot, true_dot, exact_dot, t, value
+    real(kind=rp), allocatable :: state(:)
+    integer :: mode, level, sample, unit, ios
+    logical :: exists, saved_frozen
+    character(len=:), allocatable :: path, directory
+    character(len=16) :: mode_name
+
+    steps = [0.1_rp, 0.03_rp, 0.01_rp, 0.003_rp]
+    call x0%copy_from(DEVICE_TO_HOST, sync=.true.)
+    call x1%copy_from(DEVICE_TO_HOST, sync=.true.)
+    call d%init(x0%size()); call probe%init(x0%size())
+    d%x = x1%x - x0%x
+    if (NEKO_BCKND_DEVICE .eq. 1) call d%copy_from(HOST_TO_DEVICE, sync=.true.)
+    dot = vector_glsc2(gradient, d)
+    ! MMA uses the average-mass projection; a mathematical directional
+    ! derivative instead uses the local SEM mass weights after map transpose.
+    call directional_gradient%init(x0%size())
+    call design%map_backward(density)
+    select type (des => design)
+    type is (brinkman_design_t)
+       call des%get_sensitivity(directional_gradient)
+       call des%convert_to_directional_derivative(directional_gradient)
+    class default
+       call neko_error('directional audit requires a Brinkman design')
+    end select
+    true_dot = vector_glsc2(directional_gradient, d)
+    exact_dot = 0.0_rp
+    if (this%audit_exact_algebraic) then
+       call exact_density%init(x0%size())
+       call this%rom_problem%compute_density(exact_density, 'exact_algebraic')
+       call design%map_backward(exact_density)
+       select type (des => design)
+       type is (brinkman_design_t)
+          call des%get_sensitivity(directional_gradient)
+          call des%convert_to_directional_derivative(directional_gradient)
+       class default
+          call neko_error('directional audit requires a Brinkman design')
+       end select
+       exact_dot = vector_glsc2(directional_gradient, d)
+       call exact_density%free()
+       ! Restore the selected mapped sensitivity held by the design.
+       call design%map_backward(density)
+    end if
+    base = [f0, this%rom_problem%scalar_mixing_value, &
+         this%rom_problem%viscous_value, this%rom_problem%brinkman_value]
+    directory = trim(this%rom_problem%rom_output_root)//'/diagnostic_audit'
+    if (pe_rank == 0) then
+       call mkdir(trim(this%rom_problem%rom_output_root))
+       call mkdir(directory)
+    end if
+    path = directory//'/mma_directional_fd.csv'
+    if (pe_rank == 0) then
+       inquire(file=path, exist=exists)
+       open(newunit=unit, file=path, status='unknown', position='append', &
+            action='write', iostat=ios)
+       if (ios /= 0) call neko_error('cannot open MMA directional audit')
+       if (.not. exists) write(unit,'(A)') &
+            'outer,sensitivity_source,mode,h,total_fd,mixing_fd,viscous_fd,brinkman_fd,'// &
+            'selected_mma_gradient_dot_step,'// &
+            'selected_directional_dot_step,exact_algebraic_audit_enabled,'// &
+            'exact_algebraic_unverified_dot_step,'// &
+            'total_at_0,mixing_at_0,viscous_at_0,brinkman_at_0,'// &
+            'total_at_h,mixing_at_h,viscous_at_h,brinkman_at_h,'// &
+            'total_at_2h,mixing_at_2h,viscous_at_2h,brinkman_at_2h'
+       close(unit)
+    end if
+    saved_frozen = this%rom_problem%adaptive_modes_frozen
+    do mode = 1, 2
+       if (mode == 1) then
+          mode_name = 'frozen'
+          this%rom_problem%adaptive_modes_frozen = .true.
+       else
+          mode_name = 'adaptive'
+          this%rom_problem%adaptive_modes_frozen = saved_frozen
+       end if
+       ! h=0.5 additionally records the actual MMA endpoint at 2h=1.
+       do level = 1, 5
+          if (level <= 4) then
+             t = steps(level)
+          else
+             t = 0.5_rp
+          end if
+          do sample = 1, 2
+             probe%x = x0%x + (real(sample,rp)*t)*d%x
+             if (NEKO_BCKND_DEVICE .eq. 1) call probe%copy_from(HOST_TO_DEVICE, sync=.true.)
+             call design%update_design(probe)
+             call this%rom_problem%compute(design, value, final_state=state)
+             if (allocated(state)) deallocate(state)
+             values(:,sample) = [value, this%rom_problem%scalar_mixing_value, &
+                  this%rom_problem%viscous_value, this%rom_problem%brinkman_value]
+          end do
+          deriv = (-3.0_rp*base + 4.0_rp*values(:,1) - values(:,2))/(2.0_rp*t)
+          if (pe_rank == 0) then
+             open(newunit=unit, file=path, status='old', position='append', action='write', iostat=ios)
+             if (ios /= 0) call neko_error('cannot append MMA directional audit')
+             write(unit,'(*(G0,:,","))') outer, trim(this%rom_problem%sensitivity_source), &
+                  trim(mode_name), t, deriv, dot, true_dot, this%audit_exact_algebraic, &
+                  exact_dot, base, values
+             close(unit)
+          end if
+       end do
+    end do
+    this%rom_problem%adaptive_modes_frozen = saved_frozen
+    ! The caller updates to x1 and recomputes the forward/adjoint cache next.
+    call design%update_design(x1)
+    call d%free(); call probe%free(); call directional_gradient%free()
+  end subroutine rom_optimizer_lagged_fd
+
   !> Run ROM MMA and full-order validation diagnostics for one iteration.
   function rom_optimizer_step(this, iter, problem, design, simulation) result(converged)
     class(rom_optimizer_t), intent(inout) :: this
@@ -302,7 +435,9 @@ contains
     integer :: inner, n, m, rom_outer
     real(kind=rp) :: timer_start
     logical :: audit_active
+    logical :: exact_diagnostic_active, projected_diagnostic_active
     character(len=512) :: audit_design_file
+    character(len=32) :: exact_sensitivity_source
 
     if (.not. present(simulation)) call neko_error('rom_mma step requires simulation')
     reference_objective = 0.0_rp
@@ -335,7 +470,8 @@ contains
     ! The streamed/POD basis is not available during optimizer initialization.
     ! Create the audit only after refresh (or an externally supplied basis), so
     ! its metadata and vector partition describe the actual final basis.
-    if (this%diagnostic_audit .and. .not. this%audit%initialized) then
+    if (this%diagnostic_audit .and. this%rom_problem%forward_constrained_enriched .and. &
+         .not. this%audit%initialized) then
        call this%audit%init(trim(this%rom_problem%rom_output_root)// &
             '/diagnostic_audit', this%rom_problem, this%mma, &
             this%outer_max_iterations, this%inner_iterations, this%tolerance, &
@@ -357,6 +493,13 @@ contains
     call vector_copy(old_design, x)
 
     audit_active = this%diagnostic_audit .and. this%rom_problem%forward_constrained_enriched
+    exact_sensitivity_source = 'exact_galerkin'
+    if (this%rom_problem%experimental_algebraic) &
+         exact_sensitivity_source = 'exact_algebraic'
+    exact_diagnostic_active = audit_active .or. &
+         trim(this%rom_problem%sensitivity_source) == trim(exact_sensitivity_source)
+    projected_diagnostic_active = audit_active .or. &
+         trim(this%rom_problem%sensitivity_source) == 'projected_adjoint'
     if (audit_active) then
        call exact_density%init(n)
        call projected_density%init(n)
@@ -421,6 +564,9 @@ contains
     ! Evaluate the current design once before the first MMA update.  The
     ! resulting ROM forward/adjoint and gradients are consumed by the first
     ! inner update and then replaced only after the design has changed.
+    this%design_mapping_seconds = 0.0_rp
+    this%reconstruction_output_seconds = 0.0_rp
+    call rom_reset_collective_counters()
     timer_start = real(MPI_WTIME(), rp)
     call this%rom_problem%compute(design, rom_objective, final_state=rom_state)
     this%rom_forward_seconds = real(MPI_WTIME(), rp) - timer_start
@@ -438,7 +584,10 @@ contains
     else
        call this%rom_problem%compute_volume_constraint(design, fval%x(1), dfdx)
     end if
+    timer_start = real(MPI_WTIME(), rp)
     call this%rom_problem%project_density(design, density, df0dx)
+    this%design_mapping_seconds = this%design_mapping_seconds + &
+         real(MPI_WTIME(), rp) - timer_start
     call rom_optimizer_check_finite_vector('initial ROM density', density%x)
     call rom_optimizer_check_finite_vector('initial ROM constraint', fval%x)
     call rom_optimizer_check_finite_vector('initial ROM objective sensitivity', df0dx%x)
@@ -447,7 +596,8 @@ contains
        call fval%copy_from(HOST_TO_DEVICE, sync = .true.)
     end if
     if (audit_active) then
-       call this%rom_problem%compute_density(exact_density, 'exact_galerkin')
+       call this%rom_problem%compute_density(exact_density, &
+            trim(exact_sensitivity_source))
        call this%rom_problem%compute_density(projected_density, 'projected_adjoint')
        call this%rom_problem%project_density(design, exact_density, exact_gradient)
        call this%rom_problem%project_density(design, projected_density, projected_gradient)
@@ -455,21 +605,22 @@ contains
        call vector_copy(projected_gradient_reference, projected_gradient)
        call rom_optimizer_check_finite_vector('initial exact Galerkin gradient', exact_gradient%x)
        call rom_optimizer_check_finite_vector('initial projected-adjoint gradient', projected_gradient%x)
-       if (trim(this%rom_problem%sensitivity_source) == 'exact_galerkin') then
+       if (trim(this%rom_problem%sensitivity_source) == &
+            trim(exact_sensitivity_source)) then
           selected_gradient_device_error = vector_glsubnorm(df0dx, exact_gradient) / &
                max(1.0_rp, sqrt(vector_glsc2(exact_gradient, exact_gradient)))
        else
           selected_gradient_device_error = vector_glsubnorm(df0dx, projected_gradient) / &
                max(1.0_rp, sqrt(vector_glsc2(projected_gradient, projected_gradient)))
        end if
-       write(audit_design_file, '("vectors/outer_",I0,"_inner_0_design.bin")') iter
-       call this%audit%write_evaluation(iter, 0, x, density, df0dx, exact_density, &
+       write(audit_design_file, '("vectors/outer_",I0,"_inner_0_design.bin")') rom_outer
+       call this%audit%write_evaluation(rom_outer, 0, x, density, df0dx, exact_density, &
             exact_gradient, projected_density, projected_gradient, fval%x, dfdx)
-       call this%audit%write_full_evaluation(iter, 0, x, fom_initial_raw, &
+       call this%audit%write_full_evaluation(rom_outer, 0, x, fom_initial_raw, &
             fom_initial_gradient, initial_constraints, fom_initial_constraint_gradient)
-       call this%audit%write_gradient_comparison('reference', iter, 0, exact_gradient, &
+       call this%audit%write_gradient_comparison('reference', rom_outer, 0, exact_gradient, &
             projected_gradient, fom_initial_gradient)
-       call this%audit%write_objective_comparison('reference', iter, 0, &
+       call this%audit%write_objective_comparison('reference', rom_outer, 0, &
             trim(audit_design_file), &
             rom_objective, this%rom_problem%scalar_mixing_value, &
             this%rom_problem%viscous_value, this%rom_problem%brinkman_value, &
@@ -477,7 +628,7 @@ contains
             fom_initial_brinkman)
        call this%mma%KKT(x, df0dx, fval, dfdx)
        constraint_before = fval%x
-       call this%audit%write_step(iter, 0, x, x, exact_gradient, projected_gradient, &
+       call this%audit%write_step(rom_outer, 0, x, x, exact_gradient, projected_gradient, &
             df0dx, rom_objective, rom_objective, this%rom_problem%scalar_mixing_value, &
             this%rom_problem%scalar_mixing_value, this%rom_problem%viscous_value, &
             this%rom_problem%viscous_value, this%rom_problem%brinkman_value, &
@@ -493,10 +644,14 @@ contains
     ! been formed.  This produces the inner-zero forward, design and
     ! sensitivity fields in the same output lifecycle as later inner steps.
     if (this%enable_output .and. allocated(rom_state)) then
+       timer_start = real(MPI_WTIME(), rp)
        call this%rom_problem%write_outputs(design, simulation, 0, rom_state)
        call this%rom_problem%write_inner_diagnostics(rom_outer, 0, rom_objective, &
             fval%x(1), this%rom_forward_seconds, this%rom_adjoint_seconds, 0.0_rp)
+       this%reconstruction_output_seconds = this%reconstruction_output_seconds + &
+            real(MPI_WTIME(), rp) - timer_start
     end if
+    call rom_optimizer_write_performance(this, rom_outer, 0)
 
     do inner = 1, this%inner_iterations
        this%inner_counter = this%inner_counter + 1
@@ -522,11 +677,19 @@ contains
        call this%mma%update(this%inner_counter, x, df0dx, fval, dfdx)
        this%mma_seconds = real(MPI_WTIME(), rp) - timer_start
        call rom_optimizer_check_finite_vector('MMA design candidate', x%x)
+       if (this%diagnostic_audit .and. this%rom_problem%experimental_algebraic .and. inner == 1) &
+            call rom_optimizer_lagged_fd(this, design, rom_outer, xold, x, density, df0dx, rom_objective)
+       this%design_mapping_seconds = 0.0_rp
+       this%reconstruction_output_seconds = 0.0_rp
+       timer_start = real(MPI_WTIME(), rp)
        call design%update_design(x)
+       this%design_mapping_seconds = this%design_mapping_seconds + &
+            real(MPI_WTIME(), rp) - timer_start
 
        ! Evaluate the updated design exactly once.  This evaluation supplies
        ! the KKT check, output fields, and the cached state/gradient used by
        ! the next inner update; the next loop entrance does not repeat it.
+       call rom_reset_collective_counters()
        timer_start = real(MPI_WTIME(), rp)
        call this%rom_problem%compute(design, rom_objective, final_state=rom_state)
        this%rom_forward_seconds = real(MPI_WTIME(), rp) - timer_start
@@ -543,7 +706,10 @@ contains
        else
           call this%rom_problem%compute_volume_constraint(design, fval%x(1), dfdx)
        end if
+       timer_start = real(MPI_WTIME(), rp)
        call this%rom_problem%project_density(design, density, df0dx)
+       this%design_mapping_seconds = this%design_mapping_seconds + &
+            real(MPI_WTIME(), rp) - timer_start
        call rom_optimizer_check_finite_vector('ROM density', density%x)
        call rom_optimizer_check_finite_vector('ROM constraint', fval%x)
        call rom_optimizer_check_finite_vector('ROM objective sensitivity', df0dx%x)
@@ -560,20 +726,22 @@ contains
        this%norm2_design_change = global_norm
        if (NEKO_BCKND_DEVICE .eq. 1) call fval%copy_from(DEVICE_TO_HOST, sync = .true.)
        if (audit_active) then
-          call this%rom_problem%compute_density(exact_density, 'exact_galerkin')
+          call this%rom_problem%compute_density(exact_density, &
+               trim(exact_sensitivity_source))
           call this%rom_problem%compute_density(projected_density, 'projected_adjoint')
           call this%rom_problem%project_density(design, exact_density, exact_gradient)
           call this%rom_problem%project_density(design, projected_density, projected_gradient)
-          if (trim(this%rom_problem%sensitivity_source) == 'exact_galerkin') then
+          if (trim(this%rom_problem%sensitivity_source) == &
+               trim(exact_sensitivity_source)) then
              selected_gradient_device_error = vector_glsubnorm(df0dx, exact_gradient) / &
                   max(1.0_rp, sqrt(vector_glsc2(exact_gradient, exact_gradient)))
           else
              selected_gradient_device_error = vector_glsubnorm(df0dx, projected_gradient) / &
                   max(1.0_rp, sqrt(vector_glsc2(projected_gradient, projected_gradient)))
           end if
-          call this%audit%write_evaluation(iter, inner, x, density, df0dx, exact_density, &
+          call this%audit%write_evaluation(rom_outer, inner, x, density, df0dx, exact_density, &
                exact_gradient, projected_density, projected_gradient, fval%x, dfdx)
-          call this%audit%write_step(iter, inner, xold, x, exact_gradient_before, &
+          call this%audit%write_step(rom_outer, inner, xold, x, exact_gradient_before, &
                projected_gradient_before, selected_gradient_before, &
                rom_objective_before, rom_objective, rom_scalar_before, &
                this%rom_problem%scalar_mixing_value, rom_viscous_before, &
@@ -583,15 +751,19 @@ contains
                selected_gradient_device_error_before)
           selected_gradient_device_error_before = selected_gradient_device_error
        end if
-       call rom_optimizer_write_inner(this, iter, inner, rom_objective, fval%x)
-       if (this%enable_output .and. allocated(rom_state)) &
-            call this%rom_problem%write_outputs(design, simulation, inner, rom_state)
-       if (this%enable_output .and. allocated(rom_state)) &
-       call this%rom_problem%write_inner_diagnostics(rom_outer, inner, &
-            rom_objective, fval%x(1), this%rom_forward_seconds, &
-            this%rom_adjoint_seconds, this%mma_seconds)
+       call rom_optimizer_write_inner(this, rom_outer, inner, rom_objective, fval%x)
+       if (this%enable_output .and. allocated(rom_state)) then
+          timer_start = real(MPI_WTIME(), rp)
+          call this%rom_problem%write_outputs(design, simulation, inner, rom_state)
+          call this%rom_problem%write_inner_diagnostics(rom_outer, inner, &
+               rom_objective, fval%x(1), this%rom_forward_seconds, &
+               this%rom_adjoint_seconds, this%mma_seconds)
+          this%reconstruction_output_seconds = this%reconstruction_output_seconds + &
+               real(MPI_WTIME(), rp) - timer_start
+       end if
+       call rom_optimizer_write_performance(this, rom_outer, inner)
        if (pe_rank == 0) write(*,'(A,I0,A,I0,A,ES12.4,A,ES12.4)') &
-            'ROM outer ', iter, ', inner ', inner, ': objective=', rom_objective, &
+            'ROM outer ', rom_outer, ', inner ', inner, ': objective=', rom_objective, &
             ', max design change=', global_max
        if (this%get_stop_design_change() >= 0.0_rp .and. &
             global_max < this%get_stop_design_change()) exit
@@ -606,23 +778,32 @@ contains
     projected_gradient_error = -1.0_rp
     if (this%rom_problem%forward_constrained_enriched) then
        if (.not. audit_active) then
-          call exact_density%init(n)
-          call projected_density%init(n)
-          call exact_gradient%init(n)
-          call projected_gradient%init(n)
+          if (exact_diagnostic_active) then
+             call exact_density%init(n)
+             call exact_gradient%init(n)
+          end if
+          if (projected_diagnostic_active) then
+             call projected_density%init(n)
+             call projected_gradient%init(n)
+          end if
        end if
-       call this%rom_problem%compute_density(exact_density, 'exact_galerkin')
-       call this%rom_problem%compute_density(projected_density, 'projected_adjoint')
-       call rom_optimizer_check_finite_vector('exact Galerkin raw density', &
-            exact_density%x)
-       call rom_optimizer_check_finite_vector('projected-adjoint raw density', &
-            projected_density%x)
-       call this%rom_problem%project_density(design, exact_density, exact_gradient)
-       call this%rom_problem%project_density(design, projected_density, projected_gradient)
-       call rom_optimizer_check_finite_vector('exact Galerkin gradient', &
-            exact_gradient%x)
-       call rom_optimizer_check_finite_vector('projected-adjoint gradient', &
-            projected_gradient%x)
+       if (exact_diagnostic_active) then
+          call this%rom_problem%compute_density(exact_density, &
+               trim(exact_sensitivity_source))
+          call rom_optimizer_check_finite_vector('exact Galerkin raw density', &
+               exact_density%x)
+          call this%rom_problem%project_density(design, exact_density, exact_gradient)
+          call rom_optimizer_check_finite_vector('exact Galerkin gradient', &
+               exact_gradient%x)
+       end if
+       if (projected_diagnostic_active) then
+          call this%rom_problem%compute_density(projected_density, 'projected_adjoint')
+          call rom_optimizer_check_finite_vector('projected-adjoint raw density', &
+               projected_density%x)
+          call this%rom_problem%project_density(design, projected_density, projected_gradient)
+          call rom_optimizer_check_finite_vector('projected-adjoint gradient', &
+               projected_gradient%x)
+       end if
     end if
     call design%get_values(x)
     call vector_sub3(dx, x, old_design)
@@ -677,9 +858,11 @@ contains
        end if
     end select
     this%full_order_seconds = real(MPI_WTIME(), rp) - timer_start
-    if (this%rom_problem%forward_constrained_enriched) then
+    if (this%rom_problem%forward_constrained_enriched .and. exact_diagnostic_active) then
        exact_gradient_error = vector_glsubnorm(df0dx, exact_gradient) / &
             max(1.0_rp, sqrt(vector_glsc2(df0dx, df0dx)))
+    end if
+    if (this%rom_problem%forward_constrained_enriched .and. projected_diagnostic_active) then
        projected_gradient_error = vector_glsubnorm(df0dx, projected_gradient) / &
             max(1.0_rp, sqrt(vector_glsc2(df0dx, df0dx)))
     end if
@@ -697,20 +880,20 @@ contains
             problem%get_log_header(.true.), 'brinkman_dissipation')
        call fom_candidate_constraints%copy_from(DEVICE_TO_HOST, sync=.true.)
        fom_candidate_constraints%x = actual_constraints
-       call this%audit%write_full_evaluation(iter, this%inner_iterations, x, &
+       call this%audit%write_full_evaluation(rom_outer, this%inner_iterations, x, &
             fom_candidate_raw, fom_candidate_gradient, actual_constraints, &
             fom_candidate_constraint_gradient)
-       call this%audit%write_gradient_comparison('candidate', iter, &
+       call this%audit%write_gradient_comparison('candidate', rom_outer, &
             this%inner_iterations, exact_gradient, projected_gradient, &
             fom_candidate_gradient)
        write(audit_design_file, '("vectors/outer_",I0,"_inner_",I0,"_design.bin")') &
-            iter, this%inner_iterations
-       call this%audit%write_objective_comparison('candidate', iter, &
+            rom_outer, this%inner_iterations
+       call this%audit%write_objective_comparison('candidate', rom_outer, &
             this%inner_iterations, trim(audit_design_file), rom_objective, &
             this%rom_problem%scalar_mixing_value, this%rom_problem%viscous_value, &
             this%rom_problem%brinkman_value, actual_objective, fom_candidate_scalar, &
             fom_candidate_viscous, fom_candidate_brinkman)
-       call this%audit%finite_difference(iter, this%rom_problem, design, old_design, &
+       call this%audit%finite_difference(rom_outer, this%rom_problem, design, old_design, &
             x, exact_gradient_reference, projected_gradient_reference, first_update)
     end if
     objective_gradient_error = vector_glsubnorm(df0dx, predicted_gradient) / &
@@ -740,13 +923,13 @@ contains
             'ROM candidate failed full-order validation; retaining candidate')
        this%last_validation_status = 'kept_unvalidated'
     end if
-    call write_validation_record(this, iter, rom_objective, actual_objective, &
+    call write_validation_record(this, rom_outer, rom_objective, actual_objective, &
          predicted_constraints, actual_constraints, validation_metrics, &
          validation_checked, validation_passed)
     predicted_improvement = rom_reference_objective - rom_objective
     actual_improvement = 0.0_rp
     if (reference_available) actual_improvement = reference_objective - actual_objective
-    call write_gradient_diagnostic(this, iter, rom_reference_objective, &
+    call write_gradient_diagnostic(this, rom_outer, rom_reference_objective, &
          reference_objective, rom_objective, actual_objective, predicted_improvement, &
          actual_improvement, exact_gradient_error, projected_gradient_error, &
          objective_gradient_error, reference_available, validation_checked, &
@@ -760,8 +943,12 @@ contains
     call df0dx%free(); call dx%free(); call density%free(); call dfdx%free()
     call predicted_gradient%free(); call predicted_constraint_gradient%free()
     if (this%rom_problem%forward_constrained_enriched) then
-       call exact_density%free(); call projected_density%free()
-       call exact_gradient%free(); call projected_gradient%free()
+       if (exact_diagnostic_active) then
+          call exact_density%free(); call exact_gradient%free()
+       end if
+       if (projected_diagnostic_active) then
+          call projected_density%free(); call projected_gradient%free()
+       end if
        if (audit_active) then
           call exact_gradient_reference%free(); call projected_gradient_reference%free()
           call exact_density_before%free(); call projected_density_before%free()
@@ -804,8 +991,10 @@ contains
   !! need an explicitly ordered record stream of their own.
   subroutine rom_optimizer_init_log(this)
     class(rom_optimizer_t), intent(inout) :: this
-    integer :: ios
+    integer :: ios, header_unit
     logical :: exists
+    character(len=4096) :: performance_header, expected_performance_header
+    character(len=64) :: performance_filename
 
     if (pe_rank /= 0) return
     inquire(file='optimization_data.csv', exist=exists)
@@ -821,6 +1010,48 @@ contains
         'norm2_design_change,rom_forward_seconds,rom_adjoint_seconds,'// &
         'mma_seconds,full_order_seconds,status'
     this%rom_log_initialized = .true.
+    expected_performance_header = &
+         'outer_iteration,inner_iteration,basis_adaptation_seconds,'// &
+         'spatial_mode_derivatives_seconds,forward_operator_assembly_seconds,'// &
+         'adjoint_operator_assembly_seconds,objective_operator_assembly_seconds,'// &
+         'initial_projection_seconds,forward_ode_seconds,exact_adjoint_seconds,'// &
+         'projected_tensor_assembly_seconds,projected_adjoint_integration_seconds,'// &
+         'temporal_correlation_seconds,spatial_sensitivity_seconds,'// &
+         'design_mapping_seconds,reconstruction_output_seconds,'// &
+         'host_collective_calls,host_collective_elements,host_collective_bytes,'// &
+         'device_global_contraction_calls,device_global_contraction_elements,'// &
+         'device_global_contraction_bytes,host_collective_seconds,'// &
+         'device_global_contraction_seconds,velocity_mode_cotangent_seconds,'// &
+         'scalar_mode_cotangent_seconds,derivative_transpose_seconds,'// &
+         'basis_transform_pullback_seconds,projected_tensor_cache_hit,scalar_mixing_cache_hit,'// &
+         'scalar_transport_cache_hit,scalar_transport_cache_build_outer_seconds'
+    ! Do not append a new schema to an older performance log.
+    performance_filename = 'rom_performance.csv'
+    inquire(file=trim(performance_filename), exist=exists)
+    if (exists) then
+       open(newunit=header_unit, file=trim(performance_filename), &
+            status='old', action='read', iostat=ios)
+       if (ios /= 0) call neko_error('could not inspect ROM performance header')
+       read(header_unit, '(A)', iostat=ios) performance_header
+       close(header_unit)
+       if (ios /= 0 .or. trim(performance_header) /= trim(expected_performance_header)) &
+            performance_filename = 'rom_performance_v2.csv'
+    end if
+    inquire(file=trim(performance_filename), exist=exists)
+    if (exists) then
+       open(newunit=header_unit, file=trim(performance_filename), &
+            status='old', action='read', iostat=ios)
+       if (ios /= 0) call neko_error('could not inspect ROM performance header')
+       read(header_unit, '(A)', iostat=ios) performance_header
+       close(header_unit)
+       if (ios /= 0 .or. trim(performance_header) /= trim(expected_performance_header)) &
+            call neko_error('incompatible ROM performance CSV header')
+    end if
+    open(newunit=this%performance_log_unit, file=trim(performance_filename), &
+         status='unknown', position='append', action='write', iostat=ios)
+    if (ios /= 0) call neko_error('could not open ROM performance CSV')
+    if (.not. exists) write(this%performance_log_unit, '(A)') trim(expected_performance_header)
+    this%performance_log_initialized = .true.
   end subroutine rom_optimizer_init_log
 
   !> Write one full-order outer record using the live Neko problem log.
@@ -908,6 +1139,63 @@ contains
          this%rom_forward_seconds, this%rom_adjoint_seconds, this%mma_seconds, &
          0.0_rp, 'not_validated')
   end subroutine rom_optimizer_write_inner
+
+  !> Record phase timings and assembly communication counters for one candidate.
+  !! One packed maximum reduction makes timings comparable across ranks. The
+  !! telemetry reduction itself is not included in the assembly counters.
+  subroutine rom_optimizer_write_performance(this, outer, inner)
+    class(rom_optimizer_t), intent(inout) :: this
+    integer, intent(in) :: outer, inner
+    integer(kind=8) :: host_calls, host_elements, host_bytes
+    integer(kind=8) :: device_calls, device_elements, device_bytes
+    real(kind=rp) :: host_seconds, device_seconds
+    integer :: ierr, i, ios
+
+    call rom_get_collective_counters(host_calls, host_elements, host_bytes, &
+         device_calls, device_elements, device_bytes, host_seconds, device_seconds)
+    this%performance_values = [ &
+         this%rom_problem%basis_adaptation_seconds, &
+         this%rom_problem%spatial_mode_derivatives_seconds, &
+         this%rom_problem%forward_local_operator_assembly_seconds, &
+         this%rom_problem%adjoint_local_operator_assembly_seconds, &
+         this%rom_problem%objective_operator_assembly_seconds, &
+         this%rom_problem%initial_state_projection_seconds, &
+         this%rom_problem%forward_ode_seconds, &
+         this%rom_problem%exact_adjoint_seconds, &
+         this%rom_problem%projected_tensor_assembly_seconds, &
+         this%rom_problem%projected_adjoint_integration_seconds, &
+         this%rom_problem%temporal_correlation_seconds, &
+         this%rom_problem%spatial_sensitivity_seconds, &
+         this%design_mapping_seconds, this%reconstruction_output_seconds, &
+         real(host_calls,rp), real(host_elements,rp), real(host_bytes,rp), &
+         real(device_calls,rp), real(device_elements,rp), real(device_bytes,rp), &
+         host_seconds, device_seconds, &
+         this%rom_problem%velocity_mode_cotangent_seconds, &
+         this%rom_problem%scalar_mode_cotangent_seconds, &
+         this%rom_problem%derivative_transpose_seconds, &
+         this%rom_problem%basis_transform_pullback_seconds, &
+         this%rom_problem%projected_tensor_cache_hit, &
+         this%rom_problem%scalar_mixing_cache_hit, &
+         this%rom_problem%scalar_transport_cache_hit, &
+         this%rom_problem%scalar_transport_cache_build_seconds ]
+    call MPI_Allreduce(MPI_IN_PLACE, this%performance_values, &
+         size(this%performance_values), MPI_REAL_PRECISION, MPI_MAX, &
+         NEKO_COMM, ierr)
+    if (ierr /= 0) call neko_error('ROM performance timing reduction failed')
+    if (pe_rank /= 0 .or. .not. this%performance_log_initialized) return
+    write(this%performance_log_unit, '(I0,",",I0)', advance='no', iostat=ios) &
+         outer, inner
+    if (ios /= 0) call neko_error('could not write ROM rom_performance.csv')
+    do i = 1, size(this%performance_values)
+       write(this%performance_log_unit, '(",",ES24.16)', advance='no', iostat=ios) &
+            this%performance_values(i)
+       if (ios /= 0) call neko_error('could not write ROM rom_performance.csv')
+    end do
+    write(this%performance_log_unit, '(A)', iostat=ios) ''
+    if (ios /= 0) call neko_error('could not finish ROM rom_performance.csv row')
+    flush(this%performance_log_unit, iostat=ios)
+    if (ios /= 0) call neko_error('could not flush ROM rom_performance.csv')
+  end subroutine rom_optimizer_write_performance
 
   !> Append one ordered record to the ROM optimization history.
   !! @param this ROM optimizer.
