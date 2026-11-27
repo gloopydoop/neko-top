@@ -76,7 +76,7 @@ module rom_optimizer
      real(kind=rp) :: full_order_seconds = 0.0_rp
      real(kind=rp) :: design_mapping_seconds = 0.0_rp
      real(kind=rp) :: reconstruction_output_seconds = 0.0_rp
-     real(kind=rp) :: performance_values(30) = 0.0_rp
+     real(kind=rp) :: performance_values(34) = 0.0_rp
    contains
      procedure, pass(this) :: init_from_json => rom_optimizer_init_from_json
      procedure, pass(this) :: free => rom_optimizer_free
@@ -991,7 +991,7 @@ contains
   !! need an explicitly ordered record stream of their own.
   subroutine rom_optimizer_init_log(this)
     class(rom_optimizer_t), intent(inout) :: this
-    integer :: ios, header_unit
+    integer :: ios, header_unit, version
     logical :: exists
     character(len=4096) :: performance_header, expected_performance_header
     character(len=64) :: performance_filename
@@ -1024,29 +1024,26 @@ contains
          'device_global_contraction_seconds,velocity_mode_cotangent_seconds,'// &
          'scalar_mode_cotangent_seconds,derivative_transpose_seconds,'// &
          'basis_transform_pullback_seconds,projected_tensor_cache_hit,scalar_mixing_cache_hit,'// &
-         'scalar_transport_cache_hit,scalar_transport_cache_build_outer_seconds'
-    ! Do not append a new schema to an older performance log.
-    performance_filename = 'rom_performance.csv'
-    inquire(file=trim(performance_filename), exist=exists)
-    if (exists) then
+         'scalar_transport_cache_hit,scalar_transport_cache_build_outer_seconds,'// &
+         'potential_construction_outer_seconds,potential_poisson_solves_outer,'// &
+         'potential_transform_seconds,potential_transpose_seconds'
+    ! Preserve old schemas and select the first compatible versioned file.
+    do version = 1, 3
+       select case (version)
+       case (1); performance_filename = 'rom_performance.csv'
+       case (2); performance_filename = 'rom_performance_v2.csv'
+       case (3); performance_filename = 'rom_performance_v3.csv'
+       end select
+       inquire(file=trim(performance_filename), exist=exists)
+       if (.not. exists) exit
        open(newunit=header_unit, file=trim(performance_filename), &
             status='old', action='read', iostat=ios)
        if (ios /= 0) call neko_error('could not inspect ROM performance header')
        read(header_unit, '(A)', iostat=ios) performance_header
        close(header_unit)
-       if (ios /= 0 .or. trim(performance_header) /= trim(expected_performance_header)) &
-            performance_filename = 'rom_performance_v2.csv'
-    end if
-    inquire(file=trim(performance_filename), exist=exists)
-    if (exists) then
-       open(newunit=header_unit, file=trim(performance_filename), &
-            status='old', action='read', iostat=ios)
-       if (ios /= 0) call neko_error('could not inspect ROM performance header')
-       read(header_unit, '(A)', iostat=ios) performance_header
-       close(header_unit)
-       if (ios /= 0 .or. trim(performance_header) /= trim(expected_performance_header)) &
-            call neko_error('incompatible ROM performance CSV header')
-    end if
+       if (ios == 0 .and. trim(performance_header) == trim(expected_performance_header)) exit
+    end do
+    if (version > 3) call neko_error('incompatible ROM performance CSV headers')
     open(newunit=this%performance_log_unit, file=trim(performance_filename), &
          status='unknown', position='append', action='write', iostat=ios)
     if (ios /= 0) call neko_error('could not open ROM performance CSV')
@@ -1177,7 +1174,11 @@ contains
          this%rom_problem%projected_tensor_cache_hit, &
          this%rom_problem%scalar_mixing_cache_hit, &
          this%rom_problem%scalar_transport_cache_hit, &
-         this%rom_problem%scalar_transport_cache_build_seconds ]
+         this%rom_problem%scalar_transport_cache_build_seconds, &
+         this%rom_problem%potential_construction_seconds, &
+         real(this%rom_problem%potential_poisson_solves,rp), &
+         this%rom_problem%potential_transform_seconds, &
+         this%rom_problem%potential_transpose_seconds ]
     call MPI_Allreduce(MPI_IN_PLACE, this%performance_values, &
          size(this%performance_values), MPI_REAL_PRECISION, MPI_MAX, &
          NEKO_COMM, ierr)

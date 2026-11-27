@@ -18,6 +18,7 @@ module rom_problem
   use rom_model, only: rom_model_t, rom_bdf1_export_context_t
   use rom_config, only: rom_config_t
   use rom_lift, only: rom_lift_t
+  use rom_vector_potential, only: rom_vector_potential_t
        use rom_assembly, only: rom_assemble_mass, rom_assemble_brinkman, &
        rom_assemble_mass_coupled, rom_assemble_scalar_transport, &
        rom_assemble_lift_convection, rom_assemble_diffusion, &
@@ -106,6 +107,11 @@ module rom_problem
      type(vector_t), allocatable :: reference_velocity_modes(:, :)
      type(vector_t), allocatable :: reference_test_velocity_modes(:, :)
      type(vector_t), allocatable :: reference_velocity_gradients(:, :, :)
+     ! Reference vector potentials are constructed once at the outer basis
+     ! handoff and reused for every candidate in that inner cycle.
+     type(rom_vector_potential_t) :: reference_forward_potential
+     integer, allocatable :: reference_potential_forward_map(:)
+     integer, allocatable :: reference_potential_test_map(:)
      type(vector_t) :: reference_chi, reference_D
      logical :: reference_modes_saved = .false.
      type(simulation_t), pointer :: simulation => null()
@@ -230,6 +236,13 @@ module rom_problem
      real(kind=rp) :: scalar_mode_cotangent_seconds = 0.0_rp
      real(kind=rp) :: derivative_transpose_seconds = 0.0_rp
      real(kind=rp) :: basis_transform_pullback_seconds = 0.0_rp
+     ! Vector-potential work is split by lifecycle: construction belongs to
+     ! the accepted outer basis, while transformation and pullback accumulate
+     ! over candidate evaluations in the corresponding inner cycle.
+     real(kind=rp) :: potential_construction_seconds = 0.0_rp
+     real(kind=rp) :: potential_poisson_solves = 0.0_rp
+     real(kind=rp) :: potential_transform_seconds = 0.0_rp
+     real(kind=rp) :: potential_transpose_seconds = 0.0_rp
      real(kind=rp) :: projected_tensor_cache_hit = 0.0_rp
      logical :: projected_tensor_cache_valid = .false.
      integer :: projected_tensor_cache_forward_rank = 0
@@ -596,6 +609,8 @@ contains
     this%scalar_mode_cotangent_seconds = 0.0_rp
     this%derivative_transpose_seconds = 0.0_rp
     this%basis_transform_pullback_seconds = 0.0_rp
+    this%potential_transform_seconds = 0.0_rp
+    this%potential_transpose_seconds = 0.0_rp
     this%projected_tensor_cache_hit = 0.0_rp
     this%scalar_mixing_cache_hit = 0.0_rp
     this%scalar_transport_cache_hit = 0.0_rp
@@ -1706,7 +1721,7 @@ contains
        end do
     end if
     if (this%basis_transform_adaptive .and. &
-         (this%differentiate_basis .or. source_name == 'exact_algebraic') .and. &
+         (source_name == 'exact_galerkin' .or. source_name == 'exact_algebraic') .and. &
          abs(this%basis_transform_tau) > &
          10.0_rp * epsilon(1.0_rp)) then
        call rom_problem_add_adaptive_mode_density(this, density)
@@ -1728,16 +1743,13 @@ contains
   !!
   !! The reduced adjoint supplies the cotangents of the BDF1 residual.  This
   !! routine reverse-assembles those cotangents first with respect to the
-  !! physical velocity modes and their SEM gradients, then applies the
-  !! mass-adjoint of the fixed admissibility projection and finally the
-  !! analytical derivative of
-  !! `V_i(chi)=P[(1+tau*chi_ref)/(1+tau*chi) V_i_ref]`.
+  !! physical velocity modes and their SEM gradients, then applies the selected
+  !! transformation's exact discrete transpose after the native weighted
+  !! derivative transpose.
   !!
   !! The transformed POD factors are frozen.  No SVD or reorthogonalisation is
-  !! differentiated here.  The routine is intentionally restricted to the
-  !! forward:forward adaptive formulation; unsupported projected/enriched
-  !! combinations continue to fail closed in the public sensitivity entry
-  !! point.
+  !! differentiated here. In mixed basis selections this uses the exact
+  !! forward-ROM adjoint, independently of the projected-adjoint search path.
   subroutine rom_problem_add_adaptive_mode_density(this, density)
     class(rom_problem_t), intent(inout) :: this
     type(vector_t), intent(inout) :: density
@@ -1755,6 +1767,8 @@ contains
     type(vector_t), pointer :: adjoint_initial, initial_cotangent
     type(vector_t), pointer :: product, product_two, current_chi, candidate_D, inv_D2
     type(vector_t), pointer :: total, projected_cotangent, transform_factor
+    type(vector_t), pointer :: factor_cotangent
+    type(vector_t) :: correction_cotangent(3)
     type(field_t), pointer :: field_work, transpose_work, cot_x, cot_y, cot_z
     type(field_t), pointer :: chi_field
     type(fluid_pnpn_t), pointer :: fluid
@@ -1764,6 +1778,7 @@ contains
     integer :: product_index, product_two_index, current_chi_index, candidate_D_index
     integer :: inv_D2_index, total_index, projected_cotangent_index
     integer :: transform_factor_index, field_work_index, transpose_work_index
+    integer :: factor_cotangent_index
     integer :: cot_x_index, cot_y_index, cot_z_index
     real(kind=rp) :: nu, dt_step, timer_start, scalar_contract
     real(kind=rp) :: viscous_volume, brinkman_volume, viscous_time_weight
@@ -1840,6 +1855,14 @@ contains
     call neko_scratch_registry%request_vector(total, total_index, n, .true.)
     call neko_scratch_registry%request_vector(projected_cotangent, projected_cotangent_index, n, .true.)
     call neko_scratch_registry%request_vector(transform_factor, transform_factor_index, n, .true.)
+    if (this%basis_transform == 'vector_potential') &
+         call neko_scratch_registry%request_vector(factor_cotangent, &
+         factor_cotangent_index, n, .true.)
+    if (this%basis_transform == 'vector_potential') then
+       do c = 1, 3
+          call correction_cotangent(c)%init(n)
+       end do
+    end if
     call neko_scratch_registry%request_field(field_work, field_work_index, fluid%dm_Xh, .true.)
     call neko_scratch_registry%request_field(transpose_work, transpose_work_index, fluid%dm_Xh, .true.)
     call neko_scratch_registry%request_field(cot_x, cot_x_index, fluid%dm_Xh, .true.)
@@ -1856,6 +1879,11 @@ contains
     call vector_col2(product, candidate_D)
     call vector_invcol2(inv_D2, product)
     call vector_cmult(inv_D2, this%basis_transform_tau)
+    if (this%basis_transform == 'vector_potential') then
+       call vector_copy(transform_factor, this%reference_D)
+       call vector_invcol2(transform_factor, candidate_D)
+       call vector_cadd(transform_factor, -1.0_rp)
+    end if
     nullify(chi_field)
 
     ! The canonical initial condition is the same Neko field used for the
@@ -1870,6 +1898,9 @@ contains
        call field_add2s2(field_work, this%lift%velocity(c), -1.0_rp, n)
        call field_to_vector(initial_hom(c), field_work)
     end do
+    ! With an independently selected adjoint basis, use the separately stored
+    ! exact forward-ROM adjoint. Equal-space FF and E:E run that exact adjoint
+    ! in `adjoint` directly.
     if (this%forward_constrained_enriched) then
        adjoint_initial%x = this%exact_adjoint%x(:,1)
     else
@@ -2199,7 +2230,7 @@ contains
        this%derivative_transpose_seconds = this%derivative_transpose_seconds + &
             real(MPI_WTIME(),rp) - timer_start
        timer_start = real(MPI_WTIME(),rp)
-       if (.not. this%experimental_algebraic) then
+       if (this%basis_transform == 'projected') then
           call rom_project_velocity_cotangent(fluid, cot_x, cot_y, cot_z, &
                projection_residual, linear_residual = projection_linear_residual, &
                iterations = projection_iterations, converged = projection_converged)
@@ -2208,25 +2239,43 @@ contains
              call neko_error('adaptive mode pullback projection failed its continuity gate')
           end if
        end if
-       call vector_cmult2(transform_factor, this%reference_D, 1.0_rp)
-       do c = 1, 3
-          select case (c)
-          case (1); call field_to_vector(projected_cotangent, cot_x)
-          case (2); call field_to_vector(projected_cotangent, cot_y)
-          case (3); call field_to_vector(projected_cotangent, cot_z)
-          end select
-          call vector_col3(product, transform_factor, this%reference_velocity_modes(c,i))
-          call vector_col3(product_two, product, inv_D2)
-          call vector_col3(total, product_two, projected_cotangent)
-          if (this%experimental_algebraic) then
-             ! The design mapping consumes a pointwise sensitivity density.
-             ! The accumulated spatial cotangent is the assembled Euclidean
-             ! covector, so remove one SEM weight here; map_backward then
-             ! applies its metric once, matching the direct design derivative.
-             call vector_invcol2(total, this%weights)
-          end if
+       if (this%basis_transform == 'vector_potential') then
+          call field_to_vector(correction_cotangent(1), cot_x)
+          call field_to_vector(correction_cotangent(2), cot_y)
+          call field_to_vector(correction_cotangent(3), cot_z)
+          factor_cotangent = 0.0_rp
+          call this%reference_forward_potential%pullback( &
+               this%reference_potential_forward_map(i), transform_factor, &
+               correction_cotangent, factor_cotangent)
+          call vector_col3(total, factor_cotangent, inv_D2)
+          call vector_col3(total, total, this%reference_D)
+          call vector_invcol2(total, this%weights)
           call vector_add2s2(density, total, -1.0_rp)
-       end do
+       else
+          call vector_cmult2(transform_factor, this%reference_D, 1.0_rp)
+          do c = 1, 3
+             select case (c)
+             case (1); call field_to_vector(projected_cotangent, cot_x)
+             case (2); call field_to_vector(projected_cotangent, cot_y)
+             case (3); call field_to_vector(projected_cotangent, cot_z)
+             end select
+             call vector_col3(product, transform_factor, this%reference_velocity_modes(c,i))
+             call vector_col3(product_two, product, inv_D2)
+             call vector_col3(total, product_two, projected_cotangent)
+             if (this%experimental_algebraic) then
+                ! The design mapping consumes a pointwise sensitivity density.
+                ! The accumulated spatial cotangent is the assembled Euclidean
+                ! covector, so remove one SEM weight here; map_backward then
+                ! applies its metric once, matching the direct design derivative.
+                call vector_invcol2(total, this%weights)
+             end if
+             call vector_add2s2(density, total, -1.0_rp)
+          end do
+       end if
+       if (this%basis_transform == 'vector_potential') then
+          this%potential_transpose_seconds = this%potential_transpose_seconds + &
+               real(MPI_WTIME(),rp) - timer_start
+       end if
        this%basis_transform_pullback_seconds = &
             this%basis_transform_pullback_seconds + real(MPI_WTIME(),rp) - timer_start
     end do
@@ -2238,6 +2287,13 @@ contains
          initial_cotangent_index, product_index, product_two_index, current_chi_index, &
          candidate_D_index, inv_D2_index, total_index, projected_cotangent_index, &
          transform_factor_index])
+    if (this%basis_transform == 'vector_potential') &
+         call neko_scratch_registry%relinquish_vector(factor_cotangent_index)
+    if (this%basis_transform == 'vector_potential') then
+       do c = 1, 3
+          call correction_cotangent(c)%free()
+       end do
+    end if
     do i = 1, r
        do c = 1, 3
           call mode_value(c,i)%free()
@@ -2252,6 +2308,7 @@ contains
     nullify(delta_state); nullify(adjoint_initial); nullify(initial_cotangent)
     nullify(product); nullify(product_two); nullify(current_chi); nullify(candidate_D)
     nullify(inv_D2); nullify(total); nullify(projected_cotangent); nullify(transform_factor)
+    nullify(factor_cotangent)
     nullify(field_work); nullify(transpose_work); nullify(cot_x); nullify(cot_y); nullify(cot_z)
     nullify(fluid)
   end subroutine rom_problem_add_adaptive_mode_density
@@ -3282,6 +3339,10 @@ contains
                   //'candidate velocity modes are not pressure projected; '&
                   //'sensitivity_source=lagged_basis is an approximate search direction')
           end if
+       else if (this%basis_transform == 'vector_potential') then
+          call neko_log%message('vector-potential ROM basis saved; candidates use the '// &
+               'native gathered curl and homogeneous velocity boundary projector; '// &
+               'discrete continuity residuals are measured and not presumed zero')
        else
           call neko_log%warning('design-dependent ROM reference basis saved; '&
                //'candidate admissibility projection and exact mode pullback remain '&
@@ -4075,9 +4136,12 @@ contains
     type(vector_t), intent(in) :: mapped
     type(vector_t), pointer :: candidate_D, ratio
     type(vector_t), pointer :: reference_difference
+    type(vector_t), pointer :: transform_factor
+    type(vector_t) :: potential_correction(3)
     type(field_t), pointer :: field, gx, gy, gz
     type(field_t), pointer :: p_work, p_rhs, f_x, f_y, f_z, u_zero, v_zero, w_zero
     integer :: candidate_D_index, ratio_index, reference_difference_index
+    integer :: transform_factor_index
     integer :: field_index, gx_index, gy_index, gz_index
     integer :: diagnostic_field_indices(8)
     integer :: n, r, e, i, c, d
@@ -4108,6 +4172,9 @@ contains
     call neko_scratch_registry%request_vector(ratio, ratio_index, n, .true.)
     call neko_scratch_registry%request_vector(reference_difference, &
          reference_difference_index, n, .true.)
+    if (this%basis_transform == 'vector_potential') &
+         call neko_scratch_registry%request_vector(transform_factor, &
+         transform_factor_index, n, .true.)
     timer_start = real(MPI_WTIME(),rp)
     call vector_copy(candidate_D, mapped)
     call vector_cmult(candidate_D, this%basis_transform_tau)
@@ -4119,25 +4186,56 @@ contains
     end if
     call vector_copy(ratio, this%reference_D)
     call vector_invcol2(ratio, candidate_D)
+    if (this%basis_transform == 'vector_potential') then
+       call vector_copy(transform_factor, ratio)
+       call vector_cadd(transform_factor, -1.0_rp)
+       do c = 1, 3
+          call potential_correction(c)%init(n)
+       end do
+    end if
     call vector_copy(reference_difference, candidate_D)
     call vector_add2s2(reference_difference, this%reference_D, -1.0_rp)
     call vector_absval(reference_difference)
     reference_difference_norm = vector_glmax(reference_difference)
 
+    timer_start = real(MPI_WTIME(),rp)
     do i = 1, r
        do c = 1, 3
           call vector_copy(this%velocity_modes(c,i), &
                this%reference_velocity_modes(c,i))
-          call vector_col2(this%velocity_modes(c,i), ratio)
        end do
+       if (this%basis_transform == 'vector_potential') then
+          call this%reference_forward_potential%apply( &
+               this%reference_potential_forward_map(i), transform_factor, &
+               potential_correction)
+          do c = 1, 3
+             call vector_add2(this%velocity_modes(c,i), potential_correction(c))
+          end do
+       else
+          do c = 1, 3
+             call vector_col2(this%velocity_modes(c,i), ratio)
+          end do
+       end if
     end do
     if (this%forward_constrained_enriched) then
        do i = 1, e
           do c = 1, 3
              call vector_copy(this%test_velocity_modes(c,i), &
                   this%reference_test_velocity_modes(c,i))
-             call vector_col2(this%test_velocity_modes(c,i), ratio)
           end do
+          if (this%basis_transform == 'vector_potential') then
+             call this%reference_forward_potential%apply( &
+                  this%reference_potential_test_map(i), transform_factor, &
+                  potential_correction)
+             do c = 1, 3
+                call vector_add2(this%test_velocity_modes(c,i), &
+                     potential_correction(c))
+             end do
+          else
+             do c = 1, 3
+                call vector_col2(this%test_velocity_modes(c,i), ratio)
+             end do
+          end if
        end do
     else
        if (e /= r) call neko_error( &
@@ -4148,6 +4246,13 @@ contains
           end do
        end do
     end if
+    if (this%basis_transform == 'vector_potential') then
+       this%potential_transform_seconds = this%potential_transform_seconds + &
+            real(MPI_WTIME(),rp) - timer_start
+       do c = 1, 3
+          call potential_correction(c)%free()
+       end do
+    end if
     call neko_scratch_registry%request_field(field, field_index, &
          this%simulation%fluid%u%dof, .true.)
     call neko_scratch_registry%request_field(gx, gx_index, &
@@ -4156,7 +4261,7 @@ contains
          this%simulation%fluid%u%dof, .true.)
     call neko_scratch_registry%request_field(gz, gz_index, &
          this%simulation%fluid%u%dof, .true.)
-    if (.not. this%experimental_algebraic .and. &
+    if (this%basis_transform == 'projected' .and. &
          reference_difference_norm > 100.0_rp * epsilon(1.0_rp) * &
          max(1.0_rp, vector_glmax(candidate_D))) then
        select type (fluid => this%simulation%fluid)
@@ -4229,7 +4334,8 @@ contains
     this%adaptive_strong_divergence = 0.0_rp
     this%adaptive_weak_continuity = 0.0_rp
     this%adaptive_boundary_residual = 0.0_rp
-    if (this%experimental_algebraic) then
+    if (this%experimental_algebraic .or. &
+         this%basis_transform == 'vector_potential') then
        ! Use the same backend-aware discrete diagnostics as basis handoff.
        ! The weak residual uses Neko's pressure residual operator, but performs
        ! no pressure solve or velocity projection.
@@ -4287,7 +4393,10 @@ contains
     nullify(field, gx, gy, gz)
     call neko_scratch_registry%relinquish_vector([candidate_D_index, ratio_index, &
          reference_difference_index])
+    if (this%basis_transform == 'vector_potential') &
+         call neko_scratch_registry%relinquish_vector(transform_factor_index)
     nullify(candidate_D, ratio, reference_difference)
+    nullify(transform_factor)
   end subroutine rom_problem_update_adaptive_modes
 
   !> Project a reduced density onto the physical design representation.
@@ -4862,11 +4971,22 @@ contains
   subroutine rom_problem_save_reference_basis(this)
     class(rom_problem_t), intent(inout) :: this
     type(field_t), pointer :: chi_field
-    integer :: n, r, e, c, i
+    type(field_t) :: potential_field, grad_x, grad_y, grad_z
+    type(vector_t), allocatable :: unique_modes(:,:)
+    type(vector_t) :: diagnostic_factor, diagnostic_correction(3)
+    type(vector_t) :: diagnostic_difference, diagnostic_divergence
+    integer :: n, r, e, c, i, j, k, n_unique
+    integer :: source_mode, source_family
+    real(kind=rp) :: timer_start
+    real(kind=rp) :: reconstruction_error, gauge_residual, reference_norm
+    logical :: found
+    character(len=256) :: diagnostic_message
 
     this%projected_tensor_cache_valid = .false.
     this%scalar_mixing_cache_valid = .false.
     if (.not. this%basis_transform_adaptive) return
+    this%potential_construction_seconds = 0.0_rp
+    this%potential_poisson_solves = 0.0_rp
     n = this%weights%size()
     r = size(this%velocity_modes, 2)
     e = size(this%test_velocity_modes, 2)
@@ -4894,13 +5014,231 @@ contains
     call vector_cmult(this%reference_D, this%basis_transform_tau)
     call vector_cadd(this%reference_D, 1.0_rp)
     nullify(chi_field)
+    if (this%basis_transform == 'vector_potential') then
+       ! One shared solve set covers forward and independently selected test
+       ! directions. Exact duplicates (including an enriched prefix) share the
+       ! same stored potential and index.
+       allocate(unique_modes(3, r + e))
+       allocate(this%reference_potential_forward_map(r), &
+            this%reference_potential_test_map(e))
+       n_unique = 0
+       do i = 1, r
+          found = .false.
+          do j = 1, n_unique
+             if (rom_problem_velocity_modes_equal( &
+                  this%reference_velocity_modes(:,i), unique_modes(:,j))) then
+                this%reference_potential_forward_map(i) = j
+                found = .true.
+                exit
+             end if
+          end do
+          if (.not. found) then
+             n_unique = n_unique + 1
+             do c = 1, 3
+                call unique_modes(c,n_unique)%init(n)
+                call vector_copy(unique_modes(c,n_unique), &
+                     this%reference_velocity_modes(c,i))
+             end do
+             this%reference_potential_forward_map(i) = n_unique
+          end if
+       end do
+       do i = 1, e
+          found = .false.
+          do j = 1, n_unique
+             if (rom_problem_velocity_modes_equal( &
+                  this%reference_test_velocity_modes(:,i), unique_modes(:,j))) then
+                this%reference_potential_test_map(i) = j
+                found = .true.
+                exit
+             end if
+          end do
+          if (.not. found) then
+             n_unique = n_unique + 1
+             do c = 1, 3
+                call unique_modes(c,n_unique)%init(n)
+                call vector_copy(unique_modes(c,n_unique), &
+                     this%reference_test_velocity_modes(c,i))
+             end do
+             this%reference_potential_test_map(i) = n_unique
+          end if
+       end do
+       timer_start = real(MPI_WTIME(),rp)
+       select type (fluid => this%simulation%fluid)
+       type is (fluid_pnpn_t)
+          call this%reference_forward_potential%construct( &
+               fluid%c_Xh, unique_modes(:,1:n_unique), &
+               fluid%bcs_vel_projector, 1.0e-10_rp, 500)
+       class default
+          call neko_error('vector-potential ROM requires a Pn/Pn fluid')
+       end select
+       this%potential_construction_seconds = real(MPI_WTIME(),rp) - timer_start
+       this%potential_poisson_solves = &
+            real(this%reference_forward_potential%solve_count,rp)
+       ! Outer-basis diagnostics use the exact candidate correction operator:
+       ! native gathered curl followed by the homogeneous velocity projector.
+       ! The scalar Poisson gauge is also measured rather than presumed.
+       call diagnostic_factor%init(n)
+       diagnostic_factor = 1.0_rp
+       call diagnostic_difference%init(n)
+       call diagnostic_divergence%init(n)
+       do c = 1, 3
+          call diagnostic_correction(c)%init(n)
+       end do
+       call potential_field%init(this%simulation%fluid%u%dof, 'vp_diag_potential')
+       call grad_x%init(this%simulation%fluid%u%dof, 'vp_diag_grad_x')
+       call grad_y%init(this%simulation%fluid%u%dof, 'vp_diag_grad_y')
+       call grad_z%init(this%simulation%fluid%u%dof, 'vp_diag_grad_z')
+       do j = 1, n_unique
+          source_family = 0
+          source_mode = 0
+          do i = 1, r
+             if (this%reference_potential_forward_map(i) == j) then
+                source_family = 1
+                source_mode = i
+                exit
+             end if
+          end do
+          if (source_family == 0) then
+             do i = 1, e
+                if (this%reference_potential_test_map(i) == j) then
+                   source_family = 2
+                   source_mode = i
+                   exit
+                end if
+             end do
+          end if
+          if (source_family == 0) call neko_error( &
+               'Vector-potential direction has no reference velocity mode')
+          call this%reference_forward_potential%apply( &
+               j, diagnostic_factor, diagnostic_correction)
+          reference_norm = 0.0_rp
+          do c = 1, 3
+             if (source_family == 1) then
+                call vector_copy(diagnostic_difference, diagnostic_correction(c))
+                call vector_add2s2(diagnostic_difference, &
+                     this%reference_velocity_modes(c,source_mode), -1.0_rp)
+                reference_norm = reference_norm + vector_glsc3( &
+                     this%reference_velocity_modes(c,source_mode), this%weights, &
+                     this%reference_velocity_modes(c,source_mode))
+             else
+                call vector_copy(diagnostic_difference, diagnostic_correction(c))
+                call vector_add2s2(diagnostic_difference, &
+                     this%reference_test_velocity_modes(c,source_mode), -1.0_rp)
+                reference_norm = reference_norm + vector_glsc3( &
+                     this%reference_test_velocity_modes(c,source_mode), this%weights, &
+                     this%reference_test_velocity_modes(c,source_mode))
+             end if
+             if (c == 1) then
+                call vector_to_field(potential_field, &
+                     this%reference_forward_potential%potential(c,j))
+                if (NEKO_BCKND_DEVICE .eq. 1) then
+                   call grad(grad_x%x_d, grad_y%x_d, grad_z%x_d, &
+                        potential_field%x_d, this%simulation%fluid%c_Xh)
+                else
+                   call grad(grad_x%x, grad_y%x, grad_z%x, potential_field%x, &
+                        this%simulation%fluid%c_Xh)
+                end if
+                call field_to_vector(diagnostic_divergence, grad_x)
+             else if (c == 2) then
+                call vector_to_field(potential_field, &
+                     this%reference_forward_potential%potential(c,j))
+                if (NEKO_BCKND_DEVICE .eq. 1) then
+                   call grad(grad_x%x_d, grad_y%x_d, grad_z%x_d, &
+                        potential_field%x_d, this%simulation%fluid%c_Xh)
+                else
+                   call grad(grad_x%x, grad_y%x, grad_z%x, potential_field%x, &
+                        this%simulation%fluid%c_Xh)
+                end if
+                call field_to_vector(diagnostic_difference, grad_y)
+                call vector_add2(diagnostic_divergence, diagnostic_difference)
+             else
+                call vector_to_field(potential_field, &
+                     this%reference_forward_potential%potential(c,j))
+                if (NEKO_BCKND_DEVICE .eq. 1) then
+                   call grad(grad_x%x_d, grad_y%x_d, grad_z%x_d, &
+                        potential_field%x_d, this%simulation%fluid%c_Xh)
+                else
+                   call grad(grad_x%x, grad_y%x, grad_z%x, potential_field%x, &
+                        this%simulation%fluid%c_Xh)
+                end if
+                call field_to_vector(diagnostic_difference, grad_z)
+                call vector_add2(diagnostic_divergence, diagnostic_difference)
+             end if
+          end do
+          ! Compute the full vector reconstruction after the gauge derivative
+          ! loop reused the difference scratch.
+          reconstruction_error = 0.0_rp
+          do c = 1, 3
+             call vector_copy(diagnostic_difference, diagnostic_correction(c))
+             if (source_family == 1) then
+                call vector_add2s2(diagnostic_difference, &
+                     this%reference_velocity_modes(c,source_mode), -1.0_rp)
+             else
+                call vector_add2s2(diagnostic_difference, &
+                     this%reference_test_velocity_modes(c,source_mode), -1.0_rp)
+             end if
+             reconstruction_error = reconstruction_error + vector_glsc3( &
+                  diagnostic_difference, this%weights, diagnostic_difference)
+          end do
+          reconstruction_error = sqrt(max(0.0_rp,reconstruction_error)) / &
+               max(sqrt(max(0.0_rp,reference_norm)),tiny(1.0_rp))
+          gauge_residual = sqrt(max(0.0_rp,vector_glsc3( &
+               diagnostic_divergence,this%weights,diagnostic_divergence)))
+          write(diagnostic_message, '(A,I0,A,ES12.4,A,ES12.4)') &
+               'VP reference mode ', j, ' assembled-curl reconstruction error=', &
+               reconstruction_error, ' Coulomb-gauge residual=', gauge_residual
+          call neko_log%message(trim(diagnostic_message))
+       end do
+       do c = 1, 3
+          call diagnostic_correction(c)%free()
+       end do
+       call diagnostic_factor%free()
+       call diagnostic_difference%free()
+       call diagnostic_divergence%free()
+       call potential_field%free()
+       call grad_x%free(); call grad_y%free(); call grad_z%free()
+       do j = 1, n_unique
+          do c = 1, 3
+             call unique_modes(c,j)%free()
+          end do
+       end do
+       deallocate(unique_modes)
+    end if
     this%reference_modes_saved = .true.
   end subroutine rom_problem_save_reference_basis
+
+  !> Exact equality is used only to identify vectors that can share a linear
+  !! reference-potential solve. Near-duplicate POD directions remain distinct.
+  logical function rom_problem_velocity_modes_equal(left, right)
+    type(vector_t), intent(in) :: left(3), right(3)
+    type(vector_t) :: difference
+    integer :: c, n
+    rom_problem_velocity_modes_equal = .true.
+    n = left(1)%size()
+    do c = 1, 3
+       if (left(c)%size() /= n .or. right(c)%size() /= n) then
+          rom_problem_velocity_modes_equal = .false.
+          return
+       end if
+    end do
+    call difference%init(3*n)
+    do c = 1, 3
+       difference%x((c-1)*n+1:c*n) = left(c)%x - right(c)%x
+    end do
+    call vector_absval(difference)
+    rom_problem_velocity_modes_equal = vector_glmax(difference) == 0.0_rp
+    call difference%free()
+  end function rom_problem_velocity_modes_equal
 
   !> Release the immutable adaptive reference basis and its design field.
   subroutine rom_problem_free_reference_basis(this)
     class(rom_problem_t), intent(inout) :: this
     integer :: i, c
+    call this%reference_forward_potential%free()
+    if (allocated(this%reference_potential_forward_map)) &
+         deallocate(this%reference_potential_forward_map)
+    if (allocated(this%reference_potential_test_map)) &
+         deallocate(this%reference_potential_test_map)
     if (allocated(this%reference_velocity_modes)) then
        do i = 1, size(this%reference_velocity_modes, 2)
           do c = 1, size(this%reference_velocity_modes, 1)
@@ -4920,6 +5258,8 @@ contains
     call this%reference_chi%free()
     call this%reference_D%free()
     this%reference_modes_saved = .false.
+    this%potential_construction_seconds = 0.0_rp
+    this%potential_poisson_solves = 0.0_rp
   end subroutine rom_problem_free_reference_basis
 
   !> Release vector and matrix containers owned by the ROM problem.

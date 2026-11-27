@@ -11,6 +11,7 @@ target_sources(neko-top
         ${CMAKE_CURRENT_SOURCE_DIR}/rom_objectives.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/rom_projection_operator.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/rom_basis_handoff.f90
+        ${CMAKE_CURRENT_SOURCE_DIR}/rom_vector_potential.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/rom_problem.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/rom_diagnostic_audit.f90
         ${CMAKE_CURRENT_SOURCE_DIR}/rom_validation.f90

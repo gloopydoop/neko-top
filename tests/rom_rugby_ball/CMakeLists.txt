@@ -233,6 +233,28 @@ if(TARGET neko_cxx_support)
 endif()
 
 add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_vector_potential_rom_directional_diagnostic
+    vector_potential_rom_directional_diagnostic.f90
+    PkgConfig::json-fortran)
+target_sources(ROM_rugby_ball_vector_potential_rom_directional_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+if(TARGET neko_cxx_support)
+    target_link_libraries(ROM_rugby_ball_vector_potential_rom_directional_diagnostic PRIVATE
+        neko_cxx_support)
+endif()
+
+add_rom_rugby_ball_diagnostic(
+    ROM_rugby_ball_vector_potential_manufactured_diagnostic
+    vector_potential_manufactured_diagnostic.f90
+    PkgConfig::json-fortran)
+target_sources(ROM_rugby_ball_vector_potential_manufactured_diagnostic PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/ROM_low_Re_mini/user.f90)
+if(TARGET neko_cxx_support)
+    target_link_libraries(ROM_rugby_ball_vector_potential_manufactured_diagnostic PRIVATE
+        neko_cxx_support)
+endif()
+
+add_rom_rugby_ball_diagnostic(
     ROM_rugby_ball_validation_diagnostic
     rom_validation_diagnostic.f90)
 
@@ -263,6 +285,7 @@ add_custom_target(ROM_rugby_ball_diagnostics
         ROM_rugby_ball_objective_equivalence_diagnostic
         ROM_rugby_ball_production_rom_gradient_diagnostic
         ROM_rugby_ball_adaptive_sensitivity_smoke_diagnostic
+        ROM_rugby_ball_vector_potential_rom_directional_diagnostic
         ROM_rugby_ball_validation_diagnostic
         ROM_rugby_ball_production_rom_step_diagnostic)
 set_target_properties(ROM_rugby_ball_diagnostics PROPERTIES

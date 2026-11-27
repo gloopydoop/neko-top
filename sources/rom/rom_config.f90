@@ -180,6 +180,17 @@ contains
        else
           this%sensitivity_source = 'lagged_basis'
        end if
+    else if (trim(this%basis_transform) == 'vector_potential') then
+       if (this%differentiate_basis) then
+          ! The exact sensitivity always follows the forward Galerkin ROM,
+          ! even when a separate physical adjoint space is selected.
+          this%sensitivity_source = 'exact_galerkin'
+       else if (trim(this%formulation) == 'separate_pod' .or. &
+            trim(this%formulation) == 'forward_enriched_adjoint') then
+          this%sensitivity_source = 'projected_adjoint'
+       else
+          this%sensitivity_source = 'lagged_basis'
+       end if
     else if (this%differentiate_basis .and. &
          trim(this%basis_transform) == 'projected') then
        ! Differentiate the forward Galerkin ROM using its consistent adjoint,
@@ -211,7 +222,8 @@ contains
        if (this%basis_transform_tau < 0.0_rp) call neko_error( &
             'ROM basis_transform_tau must be nonnegative')
     case ('vector_potential')
-       call neko_error('basis_transform=vector_potential is not implemented yet')
+       if (this%basis_transform_tau < 0.0_rp) call neko_error( &
+            'ROM basis_transform_tau must be nonnegative')
     case default
        call neko_error('basis_transform must be none, algebraic, projected or vector_potential')
     end select

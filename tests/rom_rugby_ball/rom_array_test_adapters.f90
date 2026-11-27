@@ -66,15 +66,15 @@ contains
          size(gradients,1) /= n .or. size(gradients,2) /= 3 .or. &
          size(gradients,3) /= r .or. size(gradients,4) /= 3 .or. &
          any(shape(quadratic) /= [r,r,r])) error stop 'DGEMM convection shape mismatch'
-    call w%init(n); w%x = weights
+    call w%init(n); w = weights
     allocate(m(3,r), g(3,r,3), weighted_tests(n,r))
     do state_mode = 1, r
        do component = 1, 3
           call m(component,state_mode)%init(n)
-          m(component,state_mode)%x = modes(:,component,state_mode)
+          m(component,state_mode) = modes(:,component,state_mode)
           do field = 1, 3
              call g(component,state_mode,field)%init(n)
-             g(component,state_mode,field)%x = gradients(:,component,state_mode,field)
+             g(component,state_mode,field) = gradients(:,component,state_mode,field)
           end do
        end do
     end do
@@ -155,11 +155,11 @@ contains
     integer :: n, nf, r, i, j, field
 
     n = size(weights); nf = size(modes,2); r = size(modes,3)
-    call w%init(n); w%x = weights
+    call w%init(n); w = weights
     allocate(m(nf,r))
     do j = 1, r
        do field = 1, nf
-          call m(field,j)%init(n); m(field,j)%x = modes(:,field,j)
+          call m(field,j)%init(n); m(field,j) = modes(:,field,j)
        end do
     end do
     mass = 0.0_rp
@@ -187,8 +187,8 @@ contains
     type(matrix_t) :: result
     integer :: n, nf, r, i, j
     n=size(weights); nf=size(modes,2); r=size(modes,3)
-    call w%init(n); w%x=weights; allocate(m(nf,r))
-    do j=1,r; do i=1,nf; call m(i,j)%init(n); m(i,j)%x=modes(:,i,j); end do; end do
+    call w%init(n); w =weights; allocate(m(nf,r))
+    do j=1,r; do i=1,nf; call m(i,j)%init(n); m(i,j) =modes(:,i,j); end do; end do
     call rom_assemble_mass(w,m,result); mass=result%x
     do j=1,r; do i=1,nf; call m(i,j)%free(); end do; end do
     deallocate(m); call w%free(); call result%free()
@@ -204,12 +204,12 @@ contains
     integer :: n, r, field, j
 
     n = size(weights); r = size(trial_modes,3)
-    call w%init(n); w%x = weights
+    call w%init(n); w = weights
     allocate(test(3,r), trial(3,r))
     do j = 1, r
        do field = 1, 3
-          call test(field,j)%init(n); test(field,j)%x = test_modes(:,field,j)
-          call trial(field,j)%init(n); trial(field,j)%x = trial_modes(:,field,j)
+          call test(field,j)%init(n); test(field,j) = test_modes(:,field,j)
+          call trial(field,j)%init(n); trial(field,j) = trial_modes(:,field,j)
        end do
     end do
     call rom_assemble_cross_mass(w, trial, test, result)
@@ -231,12 +231,12 @@ contains
     integer :: n, r, field, i, j
 
     n = size(weights); r = size(trial_modes,3)
-    call w%init(n); w%x = weights
+    call w%init(n); w = weights
     allocate(test(3,r), trial(3,r))
     do j = 1, r
        do field = 1, 3
-          call test(field,j)%init(n); test(field,j)%x = test_modes(:,field,j)
-          call trial(field,j)%init(n); trial(field,j)%x = trial_modes(:,field,j)
+          call test(field,j)%init(n); test(field,j) = test_modes(:,field,j)
+          call trial(field,j)%init(n); trial(field,j) = trial_modes(:,field,j)
        end do
     end do
     mass = 0.0_rp
@@ -266,10 +266,10 @@ contains
     type(vector_t) :: result_lift
     integer :: n, r, i, j
     n=size(weights); r=size(modes,3)
-    call w%init(n); call c%init(n); w%x=weights; c%x=chi
+    call w%init(n); call c%init(n); w =weights; c =chi
     allocate(m(3,r),l(3))
-    do j=1,r; do i=1,3; call m(i,j)%init(n); m(i,j)%x=modes(:,i,j); end do; end do
-    do i=1,3; call l(i)%init(n); l(i)%x=lift(:,i); end do
+    do j=1,r; do i=1,3; call m(i,j)%init(n); m(i,j) =modes(:,i,j); end do; end do
+    do i=1,3; call l(i)%init(n); l(i) =lift(:,i); end do
     call rom_assemble_brinkman(w,c,m,l,result,result_lift)
     brinkman=result%x; lift_vector=result_lift%x
     do j=1,r; do i=1,3; call m(i,j)%free(); end do; end do
@@ -290,15 +290,15 @@ contains
     integer :: n, r, field, j
 
     n = size(weights); r = size(trial_modes,3)
-    call w%init(n); call c%init(n); w%x=weights; c%x=chi
+    call w%init(n); call c%init(n); w =weights; c =chi
     allocate(test(3,r), trial(3,r), l(3))
     do j = 1, r
        do field = 1, 3
-          call test(field,j)%init(n); test(field,j)%x = test_modes(:,field,j)
-          call trial(field,j)%init(n); trial(field,j)%x = trial_modes(:,field,j)
+          call test(field,j)%init(n); test(field,j) = test_modes(:,field,j)
+          call trial(field,j)%init(n); trial(field,j) = trial_modes(:,field,j)
        end do
     end do
-    do field = 1, 3; call l(field)%init(n); l(field)%x=lift(:,field); end do
+    do field = 1, 3; call l(field)%init(n); l(field) =lift(:,field); end do
     call rom_assemble_brinkman_petrov(w, c, trial, test, l, result, result_lift)
     brinkman=result%x; lift_vector=result_lift%x
     do j = 1, r
@@ -323,15 +323,15 @@ contains
 
     n = size(weights); r = size(trial_modes,3)
     call w%init(n); call c%init(n); call effective%init(n)
-    w%x=weights; c%x=chi; call vector_col3(effective,w,c)
+    w =weights; c =chi; call vector_col3(effective,w,c)
     allocate(test(3,r), trial(3,r), l(3))
     do j = 1, r
        do field = 1, 3
-          call test(field,j)%init(n); test(field,j)%x = test_modes(:,field,j)
-          call trial(field,j)%init(n); trial(field,j)%x = trial_modes(:,field,j)
+          call test(field,j)%init(n); test(field,j) = test_modes(:,field,j)
+          call trial(field,j)%init(n); trial(field,j) = trial_modes(:,field,j)
        end do
     end do
-    do field = 1, 3; call l(field)%init(n); l(field)%x=lift(:,field); end do
+    do field = 1, 3; call l(field)%init(n); l(field) =lift(:,field); end do
     brinkman=0.0_rp; lift_vector=0.0_rp
     do i = 1, r
        do j = 1, r
@@ -367,16 +367,16 @@ contains
 
     n = size(weights); r = size(modes,3)
     call w%init(n); call c%init(n); call effective%init(n)
-    w%x = weights; c%x = chi; call vector_col3(effective, w, c)
+    w = weights; c = chi; call vector_col3(effective, w, c)
     allocate(m(3,r), l(3))
     do j = 1, r
        do component = 1, 3
           call m(component,j)%init(n)
-          m(component,j)%x = modes(:,component,j)
+          m(component,j) = modes(:,component,j)
        end do
     end do
     do component = 1, 3
-       call l(component)%init(n); l(component)%x = lift(:,component)
+       call l(component)%init(n); l(component) = lift(:,component)
     end do
     brinkman = 0.0_rp; lift_vector = 0.0_rp
     do i = 1, r
@@ -408,13 +408,13 @@ contains
     type(matrix_t) :: result
     type(vector_t) :: result_constant
     integer :: n,r,i,j,k,d
-    n=size(weights); r=size(modes,3); call w%init(n); w%x=weights
+    n=size(weights); r=size(modes,3); call w%init(n); w =weights
     allocate(m(3,r),g(3,r,3),l(3),lg(3,3))
     do j=1,r; do i=1,3
-       call m(i,j)%init(n); m(i,j)%x=modes(:,i,j)
-       do d=1,3; call g(i,j,d)%init(n); g(i,j,d)%x=gradients(:,i,j,d); end do
+       call m(i,j)%init(n); m(i,j) =modes(:,i,j)
+       do d=1,3; call g(i,j,d)%init(n); g(i,j,d) =gradients(:,i,j,d); end do
     end do; end do
-    do i=1,3; call l(i)%init(n); l(i)%x=lift(:,i); end do
+    do i=1,3; call l(i)%init(n); l(i) =lift(:,i); end do
     ! The legacy residual diagnostic uses a uniform lift, so grad(lift)=0.
     do i=1,3; do d=1,3; call lg(i,d)%init(n); lg(i,d)=0.0_rp; end do; end do
     call rom_assemble_lift_convection(w,m,g,l,lg,result,result_constant)
@@ -433,9 +433,9 @@ contains
     type(vector_t), allocatable :: g(:,:,:)
     type(matrix_t) :: result
     integer :: n,r,i,j,d
-    n=size(weights); r=size(gradients,3); call w%init(n); w%x=weights
+    n=size(weights); r=size(gradients,3); call w%init(n); w =weights
     allocate(g(3,r,3))
-    do j=1,r; do i=1,3; do d=1,3; call g(i,j,d)%init(n); g(i,j,d)%x=gradients(:,i,j,d); end do; end do; end do
+    do j=1,r; do i=1,3; do d=1,3; call g(i,j,d)%init(n); g(i,j,d) =gradients(:,i,j,d); end do; end do; end do
     call rom_assemble_diffusion(w,nu,g,result); diffusion=result%x
     do j=1,r; do i=1,3; do d=1,3; call g(i,j,d)%free(); end do; end do; end do
     deallocate(g); call w%free(); call result%free()
@@ -452,13 +452,13 @@ contains
     integer :: n, r, i, j, component, direction
 
     n = size(weights); r = size(gradients,3)
-    call w%init(n); w%x = weights
+    call w%init(n); w = weights
     allocate(g(3,r,3))
     do j = 1, r
        do component = 1, 3
           do direction = 1, 3
              call g(component,j,direction)%init(n)
-             g(component,j,direction)%x = gradients(:,component,j,direction)
+             g(component,j,direction) = gradients(:,component,j,direction)
           end do
        end do
     end do
@@ -491,11 +491,11 @@ contains
     type(vector_t), allocatable :: m(:,:), g(:,:,:)
     type(matrix_t), allocatable :: result(:)
     integer :: n,r,i,j,d
-    n=size(weights); r=size(modes,3); call w%init(n); w%x=weights
+    n=size(weights); r=size(modes,3); call w%init(n); w =weights
     allocate(m(3,r),g(3,r,3),result(r))
     do j=1,r; do i=1,3
-       call m(i,j)%init(n); m(i,j)%x=modes(:,i,j)
-       do d=1,3; call g(i,j,d)%init(n); g(i,j,d)%x=gradients(:,i,j,d); end do
+       call m(i,j)%init(n); m(i,j) =modes(:,i,j)
+       do d=1,3; call g(i,j,d)%init(n); g(i,j,d) =gradients(:,i,j,d); end do
     end do; end do
     call rom_assemble_convection(w,m,g,result)
     do i=1,r; quadratic(i,:,:)=result(i)%x; end do
@@ -515,16 +515,16 @@ contains
     integer :: n, r, test_mode, advect_mode, state_mode, field, component
 
     n = size(weights); r = size(modes,3)
-    call w%init(n); w%x=weights
+    call w%init(n); w =weights
     call pointwise%init(n); call product%init(n)
     allocate(m(3,r),g(3,r,3))
     do state_mode = 1, r
        do component = 1, 3
           call m(component,state_mode)%init(n)
-          m(component,state_mode)%x = modes(:,component,state_mode)
+          m(component,state_mode) = modes(:,component,state_mode)
           do field = 1, 3
              call g(component,state_mode,field)%init(n)
-             g(component,state_mode,field)%x = gradients(:,component,state_mode,field)
+             g(component,state_mode,field) = gradients(:,component,state_mode,field)
           end do
        end do
     end do
@@ -564,9 +564,9 @@ contains
     type(vector_t), allocatable :: g(:,:,:)
     type(matrix_t) :: result
     integer :: n,r,i,j,d
-    n=size(weights); r=size(gradients,3); call w%init(n); call m%init(n); w%x=weights; m%x=mask
+    n=size(weights); r=size(gradients,3); call w%init(n); call m%init(n); w =weights; m =mask
     allocate(g(3,r,3))
-    do j=1,r; do i=1,3; do d=1,3; call g(i,j,d)%init(n); g(i,j,d)%x=gradients(:,i,j,d); end do; end do; end do
+    do j=1,r; do i=1,3; do d=1,3; call g(i,j,d)%init(n); g(i,j,d) =gradients(:,i,j,d); end do; end do; end do
     call rom_assemble_viscous_quadratic(w,m,viscosity,g,result); quadratic=result%x
     do j=1,r; do i=1,3; do d=1,3; call g(i,j,d)%free(); end do; end do; end do
     deallocate(g); call w%free(); call m%free(); call result%free()
@@ -582,9 +582,9 @@ contains
     type(vector_t) :: result_lift
     integer :: n,r,i,j
     n=size(weights); r=size(modes,3); call w%init(n); call m%init(n); call c%init(n)
-    w%x=weights; m%x=mask; c%x=chi; allocate(v(3,r),l(3))
-    do j=1,r; do i=1,3; call v(i,j)%init(n); v(i,j)%x=modes(:,i,j); end do; end do
-    do i=1,3; call l(i)%init(n); l(i)%x=lift(:,i); end do
+    w =weights; m =mask; c =chi; allocate(v(3,r),l(3))
+    do j=1,r; do i=1,3; call v(i,j)%init(n); v(i,j) =modes(:,i,j); end do; end do
+    do i=1,3; call l(i)%init(n); l(i) =lift(:,i); end do
     call rom_assemble_brinkman_objective(w,m,c,v,l,result,result_lift,constant)
     quadratic=result%x; lift_linear=result_lift%x
     do j=1,r; do i=1,3; call v(i,j)%free(); end do; end do
@@ -599,7 +599,7 @@ contains
     real(kind=rp) :: constant
     type(vector_t) :: s, l; type(matrix_t) :: q
     call s%init(size(state)); call l%init(size(state)); call q%init(size(state),size(state))
-    s%x=state; l=0.0_rp; q%x=quadratic; constant=0.0_rp
+    s =state; l=0.0_rp; q%x =quadratic; constant=0.0_rp
     value=rom_viscous_value(s,constant,l,q,domain)
     call s%free(); call l%free(); call q%free()
   end function test_viscous_value
@@ -610,7 +610,7 @@ contains
     real(kind=rp) :: value
     type(vector_t) :: s,l; type(matrix_t) :: q
     call s%init(size(state)); call l%init(size(state)); call q%init(size(state),size(state))
-    s%x=state; l%x=lift_linear; q%x=quadratic
+    s =state; l =lift_linear; q%x =quadratic
     value=rom_brinkman_value(s,constant,l,q,domain); call s%free(); call l%free(); call q%free()
   end function test_brinkman_value
 
@@ -622,9 +622,9 @@ contains
     type(vector_t), allocatable :: v(:,:),l(:)
     integer :: n,r,i,j
     n=size(weights); r=size(state); call w%init(n); call m%init(n); call s%init(r)
-    w%x=weights; m%x=mask; s%x=state; allocate(v(3,r),l(3))
-    do j=1,r; do i=1,3; call v(i,j)%init(n); v(i,j)%x=modes(:,i,j); end do; end do
-    do i=1,3; call l(i)%init(n); l(i)%x=lift(:,i); end do
+    w =weights; m =mask; s =state; allocate(v(3,r),l(3))
+    do j=1,r; do i=1,3; call v(i,j)%init(n); v(i,j) =modes(:,i,j); end do; end do
+    do i=1,3; call l(i)%init(n); l(i) =lift(:,i); end do
     call rom_brinkman_density(w,m,l,v,s,domain,d); density=d%x
     do j=1,r; do i=1,3; call v(i,j)%free(); end do; end do
     do i=1,3; call l(i)%free(); end do
@@ -644,10 +644,10 @@ contains
 
     n = size(weights); r = size(modes, 2)
     call w%init(n); call m%init(n); call l%init(n)
-    w%x = weights; m%x = mask; l%x = lift
+    w = weights; m = mask; l = lift
     allocate(s(r))
     do i = 1, r
-       call s(i)%init(n); s(i)%x = modes(:, i)
+       call s(i)%init(n); s(i) = modes(:, i)
     end do
     call rom_assemble_scalar_mixing_terms(w, m, l, s, reference, &
          result_constant, result_linear, result_quadratic)
@@ -670,7 +670,7 @@ contains
 
     call s%init(size(state)); call l%init(size(state))
     call q%init(size(state), size(state))
-    s%x = state; l%x = linear; q%x = quadratic
+    s = state; l = linear; q%x = quadratic
     value = rom_scalar_mixing_value(s, constant, l, q, domain)
     call s%free(); call l%free(); call q%free()
   end function test_scalar_mixing_value
@@ -697,25 +697,25 @@ contains
     integer :: n, r, i, j, c, d
 
     n = size(weights); r = size(scalar_modes, 2)
-    call w%init(n); w%x = weights
-    call sl%init(n); sl%x = scalar_lift
-    call diff%init(n); diff%x = diffusivity
+    call w%init(n); w = weights
+    call sl%init(n); sl = scalar_lift
+    call diff%init(n); diff = diffusivity
     allocate(vm(3,r), sm(r), vg(3,r,3), sg(r,3), lv(3), lsg(3))
     do j = 1, r
-       call sm(j)%init(n); sm(j)%x = scalar_modes(:,j)
+       call sm(j)%init(n); sm(j) = scalar_modes(:,j)
        do c = 1, 3
-          call vm(c,j)%init(n); vm(c,j)%x = velocity_modes(:,c,j)
+          call vm(c,j)%init(n); vm(c,j) = velocity_modes(:,c,j)
           do d = 1, 3
-             call vg(c,j,d)%init(n); vg(c,j,d)%x = velocity_gradients(:,c,j,d)
+             call vg(c,j,d)%init(n); vg(c,j,d) = velocity_gradients(:,c,j,d)
           end do
        end do
        do d = 1, 3
-          call sg(j,d)%init(n); sg(j,d)%x = scalar_gradients(:,j,d)
+          call sg(j,d)%init(n); sg(j,d) = scalar_gradients(:,j,d)
        end do
     end do
     do c = 1, 3
-       call lv(c)%init(n); lv(c)%x = lift_velocity(:,c)
-       call lsg(c)%init(n); lsg(c)%x = lift_scalar_gradient(:,c)
+       call lv(c)%init(n); lv(c) = lift_velocity(:,c)
+       call lsg(c)%init(n); lsg(c) = lift_scalar_gradient(:,c)
     end do
     allocate(result_quadratic(r))
     call result_linear%init(r,r); result_linear = 0.0_rp
@@ -770,30 +770,30 @@ contains
     integer :: n, r, i, j, k, direction
 
     n = size(weights); r = size(scalar_modes,2)
-    call w%init(n); w%x = weights
+    call w%init(n); w = weights
     call effective%init(n); effective = w
     call vector_cmult(effective, scalar_weight)
     call product%init(n); call pointwise%init(n)
-    call diff%init(n); diff%x = diffusivity
-    call scalar_lift_vec%init(n); scalar_lift_vec%x = scalar_lift
+    call diff%init(n); diff = diffusivity
+    call scalar_lift_vec%init(n); scalar_lift_vec = scalar_lift
     allocate(vm(3,r), sm(r), vg(3,r,3), sg(r,3), lv(3), lsg(3))
     do j = 1, r
-       call sm(j)%init(n); sm(j)%x = scalar_modes(:,j)
+       call sm(j)%init(n); sm(j) = scalar_modes(:,j)
        do i = 1, 3
-          call vm(i,j)%init(n); vm(i,j)%x = velocity_modes(:,i,j)
+          call vm(i,j)%init(n); vm(i,j) = velocity_modes(:,i,j)
        end do
        do direction = 1, 3
           call sg(j,direction)%init(n)
-          sg(j,direction)%x = scalar_gradients(:,j,direction)
+          sg(j,direction) = scalar_gradients(:,j,direction)
           do i = 1, 3
              call vg(i,j,direction)%init(n)
-             vg(i,j,direction)%x = velocity_gradients(:,i,j,direction)
+             vg(i,j,direction) = velocity_gradients(:,i,j,direction)
           end do
        end do
     end do
     do i = 1, 3
-       call lv(i)%init(n); lv(i)%x = lift_velocity(:,i)
-       call lsg(i)%init(n); lsg(i)%x = lift_scalar_gradient(:,i)
+       call lv(i)%init(n); lv(i) = lift_velocity(:,i)
+       call lsg(i)%init(n); lsg(i) = lift_scalar_gradient(:,i)
     end do
     linear = 0.0_rp; constant = 0.0_rp
     quadratic = 0.0_rp; implicit_linear = 0.0_rp

@@ -192,7 +192,7 @@
             "mapping": [
                 {
                     "type": "PDE_filter",
-                    "r": 0.05,
+                    "r": 0.1,
                     "tol": 1e-15
                 },
                 {
@@ -219,11 +219,11 @@
             "rom": {
                 "enabled": true,
                 "inner_iterations": 3,
-                "basis_transform": "algebraic",
-                "differentiate_basis": true,
+                "basis_transform": "none",
+                "differentiate_basis": false,
                 "basis_transform_tau": 1.0,
                 "basis": {
-                    "forward": "forward",
+                    "forward": "enriched",
                     "adjoint": "enriched"
                 },
                 "substeps": 1,

@@ -8,9 +8,12 @@ program rom_cpu_assembly_regression_diagnostic
   use json_module, only: json_file
   use json_utils_ext, only: json_read_file
   use fluid_pnpn, only: fluid_pnpn_t
+  use coefs, only: coef_t
   use field, only: field_t
   use operators, only: grad
   use num_types, only: rp
+  use neko_config, only: NEKO_BCKND_DEVICE
+  use device, only: HOST_TO_DEVICE, DEVICE_TO_HOST
   use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
   use comm, only: NEKO_COMM, pe_rank
   use mpi_f08, only: MPI_Comm_size, MPI_Allreduce, MPI_MAX, MPI_DOUBLE_PRECISION, MPI_Wtime
@@ -92,7 +95,8 @@ program rom_cpu_assembly_regression_diagnostic
   call neko_init()
   call neko_top_register_types()
   parameters = json_read_file(trim(case_file))
-  call parameters%update('unsteady', .false., found)
+  ! The simulation defaults to steady mode; avoid mutating the loaded case
+  ! object here so its nested case.mesh_file entry remains intact.
   call user_setup(simulation%neko_case%user)
   call simulation%init(parameters)
   select type (fluid_in => simulation%fluid)
@@ -148,15 +152,15 @@ program rom_cpu_assembly_regression_diagnostic
      modes(:,1,mode) = reshape(u%x, [n])
      modes(:,2,mode) = reshape(v%x, [n])
      modes(:,3,mode) = reshape(w%x, [n])
-     call grad(gx%x, gy%x, gz%x, u%x, fluid%c_Xh)
+     call gradient_from_host(u, gx, gy, gz, fluid%c_Xh)
      gradients(:,1,mode,1) = reshape(gx%x, [n])
      gradients(:,1,mode,2) = reshape(gy%x, [n])
      gradients(:,1,mode,3) = reshape(gz%x, [n])
-     call grad(gx%x, gy%x, gz%x, v%x, fluid%c_Xh)
+     call gradient_from_host(v, gx, gy, gz, fluid%c_Xh)
      gradients(:,2,mode,1) = reshape(gx%x, [n])
      gradients(:,2,mode,2) = reshape(gy%x, [n])
      gradients(:,2,mode,3) = reshape(gz%x, [n])
-     call grad(gx%x, gy%x, gz%x, w%x, fluid%c_Xh)
+     call gradient_from_host(w, gx, gy, gz, fluid%c_Xh)
      gradients(:,3,mode,1) = reshape(gx%x, [n])
      gradients(:,3,mode,2) = reshape(gy%x, [n])
      gradients(:,3,mode,3) = reshape(gz%x, [n])
@@ -176,7 +180,7 @@ program rom_cpu_assembly_regression_diagnostic
      diffusivity(i) = 0.01_rp + 0.003_rp * (1.0_rp + 0.5_rp*sin(x)*cos(z))
   end do
   u%x = reshape(scalar_lift, shape(u%x))
-  call grad(gx%x, gy%x, gz%x, u%x, fluid%c_Xh)
+  call gradient_from_host(u, gx, gy, gz, fluid%c_Xh)
   lift_scalar_gradient(:,1) = reshape(gx%x, [n])
   lift_scalar_gradient(:,2) = reshape(gy%x, [n])
   lift_scalar_gradient(:,3) = reshape(gz%x, [n])
@@ -189,7 +193,7 @@ program rom_cpu_assembly_regression_diagnostic
              0.1_rp*z*x
      end do
      scalar_modes(:,mode) = reshape(u%x, [n])
-     call grad(gx%x, gy%x, gz%x, u%x, fluid%c_Xh)
+     call gradient_from_host(u, gx, gy, gz, fluid%c_Xh)
      scalar_gradients(:,mode,1) = reshape(gx%x, [n])
      scalar_gradients(:,mode,2) = reshape(gy%x, [n])
      scalar_gradients(:,mode,3) = reshape(gz%x, [n])
@@ -477,6 +481,18 @@ program rom_cpu_assembly_regression_diagnostic
   call neko_finalize()
 
 contains
+
+  subroutine gradient_from_host(input, gx, gy, gz, coef)
+    type(field_t), intent(inout) :: input, gx, gy, gz
+    type(coef_t), intent(in) :: coef
+    if (NEKO_BCKND_DEVICE .eq. 1) call input%copy_from(HOST_TO_DEVICE, sync=.true.)
+    call grad(gx%x, gy%x, gz%x, input%x, coef)
+    if (NEKO_BCKND_DEVICE .eq. 1) then
+       call gx%copy_from(DEVICE_TO_HOST, sync=.true.)
+       call gy%copy_from(DEVICE_TO_HOST, sync=.true.)
+       call gz%copy_from(DEVICE_TO_HOST, sync=.true.)
+    end if
+  end subroutine gradient_from_host
 
   subroutine write_matrix_pair(label, packed, legacy)
     character(len=*), intent(in) :: label
