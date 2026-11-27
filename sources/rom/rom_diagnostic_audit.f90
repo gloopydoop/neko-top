@@ -26,7 +26,7 @@ module rom_diagnostic_audit
   public :: rom_diagnostic_audit_t
 
   !> File-backed ROM diagnostic collector.
-  type, public :: rom_diagnostic_audit_t
+  type :: rom_diagnostic_audit_t
      logical :: enabled = .false.
      logical :: initialized = .false.
      character(len=:), allocatable :: directory

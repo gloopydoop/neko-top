@@ -76,7 +76,7 @@ module rom_problem
      type(matrix_t) :: modes
   end type rom_basis_storage_t
 
-  type, public :: rom_problem_t
+  type :: rom_problem_t
      type(rom_model_t) :: rom
      type(rom_basis_storage_t) :: basis
      type(rom_basis_storage_t) :: test_basis

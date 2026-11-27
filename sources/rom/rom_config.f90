@@ -11,7 +11,7 @@ module rom_config
   public :: rom_config_t, rom_config_get_json
 
   !> Canonical settings shared by the ROM optimiser and ROM problem.
-  type, public :: rom_config_t
+  type :: rom_config_t
      logical :: enabled = .true.
      ! User-facing basis selection.  The formulation and sensitivity source
      ! below are derived implementation metadata, not configuration choices.
@@ -216,17 +216,14 @@ contains
          'ROM requires time_scheme=bdf1')
     if (trim(this%pressure_treatment) /= 'solenoidal_galerkin') call neko_error( &
          'ROM requires pressure_treatment=solenoidal_galerkin')
-    select case (trim(this%basis_transform))
-    case ('none')
-    case ('algebraic', 'projected')
+    if (this%basis_transform == 'algebraic' .or. &
+         this%basis_transform == 'projected' .or. &
+         this%basis_transform == 'vector_potential') then
        if (this%basis_transform_tau < 0.0_rp) call neko_error( &
             'ROM basis_transform_tau must be nonnegative')
-    case ('vector_potential')
-       if (this%basis_transform_tau < 0.0_rp) call neko_error( &
-            'ROM basis_transform_tau must be nonnegative')
-    case default
+    else if (this%basis_transform /= 'none') then
        call neko_error('basis_transform must be none, algebraic, projected or vector_potential')
-    end select
+    end if
     if (trim(this%basis_transform) == 'projected' .and. &
          (trim(this%basis_forward) /= 'forward' .or. &
           trim(this%basis_adjoint) /= 'forward')) call neko_error( &
@@ -238,23 +235,26 @@ contains
     class(rom_config_t), intent(inout) :: this
     character(len=:), allocatable :: pair
     pair = '('//trim(this%basis_forward)//','//trim(this%basis_adjoint)//')'
-    select case (trim(this%basis_forward)//':'//trim(this%basis_adjoint))
-    case ('forward:forward')
+    if (this%basis_forward == 'forward' .and. &
+         this%basis_adjoint == 'forward') then
        this%formulation = 'forward_galerkin'
        this%sensitivity_source = 'exact_galerkin'
-    case ('forward:adjoint')
+    else if (this%basis_forward == 'forward' .and. &
+         this%basis_adjoint == 'adjoint') then
        this%formulation = 'separate_pod'
        this%sensitivity_source = 'projected_adjoint'
-    case ('forward:enriched')
+    else if (this%basis_forward == 'forward' .and. &
+         this%basis_adjoint == 'enriched') then
        this%formulation = 'forward_enriched_adjoint'
        this%sensitivity_source = 'projected_adjoint'
-    case ('enriched:enriched')
+    else if (this%basis_forward == 'enriched' .and. &
+         this%basis_adjoint == 'enriched') then
        this%formulation = 'enriched_galerkin'
        this%sensitivity_source = 'exact_galerkin'
-    case default
+    else
        call neko_error('unsupported ROM basis pair '//trim(pair)//'; supported pairs are '// &
             '(forward,forward), (forward,adjoint), (forward,enriched) and (enriched,enriched)')
-    end select
+    end if
   end subroutine rom_config_derive_formulation
 
 end module rom_config

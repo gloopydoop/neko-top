@@ -108,6 +108,30 @@ contains
     integer :: n
     type(c_ptr) :: event
 
+    ! The Ax interface requires INTENT(IN) for this.  Work-field targets
+    ! are mutable, but the pointer associations of this must not change.
+    ! Use local aliases to avoid CCE treating target updates as changes to this.
+    type(fluid_pnpn_t), pointer :: fluid
+    type(field_t), pointer :: q, p_zero, p_res
+    type(field_t), pointer :: grad_x, grad_y, grad_z, f_x, f_y, f_z
+    type(field_t), pointer :: u_zero, v_zero, w_zero
+    class(vector_bc_projector_t), pointer :: velocity_projector
+
+    fluid => this%fluid
+    q => this%q
+    p_zero => this%p_zero
+    p_res => this%p_res
+    grad_x => this%grad_x
+    grad_y => this%grad_y
+    grad_z => this%grad_z
+    f_x => this%f_x
+    f_y => this%f_y
+    f_z => this%f_z
+    u_zero => this%u_zero
+    v_zero => this%v_zero
+    w_zero => this%w_zero
+    velocity_projector => this%velocity_projector
+
     n = coef%dof%size()
     ! The Neko KSP owns the pressure-vector representation.  Its Krylov
     ! search vectors are already in the pressure coefficient space used by
@@ -116,16 +140,16 @@ contains
     ! seen by GMRES.  Gather-scatter is applied below to C^T q, where it is
     ! the required assembly of the velocity mass-adjoint gradient.
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call device_copy(this%q%x_d, device_get_ptr(u), n)
+       call device_copy(q%x_d, device_get_ptr(u), n)
     else
-       this%q%x = u
+       q%x = u
     end if
     ! KSP constrains the output residual, but a general right
     ! preconditioner is not required to preserve the pressure Dirichlet
     ! subspace in its input vector.  Apply the same essential pressure
     ! restriction before differentiating q; otherwise S is evaluated on a
     ! different domain from the native pressure solve.
-    call this%fluid%bcs_prs_projector%apply(this%q%x, n)
+    call fluid%bcs_prs_projector%apply(q%x, n)
 
     ! Neko's pressure Schur complement pairs C with the collocated strong SEM
     ! gradient grad_h.  The ROM restriction is explicit: gather/average the
@@ -135,84 +159,84 @@ contains
     ! B^{-1} GS(B grad_h q).  The default retains the legacy multiplicity
     ! average so fixed-basis projection is not changed by this opt-in path.
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call grad(this%grad_x%x_d, this%grad_y%x_d, this%grad_z%x_d, &
-            this%q%x_d, this%fluid%c_Xh)
+       call grad(grad_x%x_d, grad_y%x_d, grad_z%x_d, &
+            q%x_d, fluid%c_Xh)
     else
-       call grad(this%grad_x%x, this%grad_y%x, this%grad_z%x, this%q%x, &
-            this%fluid%c_Xh)
+       call grad(grad_x%x, grad_y%x, grad_z%x, q%x, &
+            fluid%c_Xh)
     end if
     if (this%mass_weighted_velocity_average) then
        if (NEKO_BCKND_DEVICE .eq. 1) then
-          call device_col2(this%grad_x%x_d, this%fluid%c_Xh%B_d, n)
-          call device_col2(this%grad_y%x_d, this%fluid%c_Xh%B_d, n)
-          call device_col2(this%grad_z%x_d, this%fluid%c_Xh%B_d, n)
+          call device_col2(grad_x%x_d, fluid%c_Xh%B_d, n)
+          call device_col2(grad_y%x_d, fluid%c_Xh%B_d, n)
+          call device_col2(grad_z%x_d, fluid%c_Xh%B_d, n)
        else
-          call col2(this%grad_x%x, this%fluid%c_Xh%B, n)
-          call col2(this%grad_y%x, this%fluid%c_Xh%B, n)
-          call col2(this%grad_z%x, this%fluid%c_Xh%B, n)
+          call col2(grad_x%x, fluid%c_Xh%B, n)
+          call col2(grad_y%x, fluid%c_Xh%B, n)
+          call col2(grad_z%x, fluid%c_Xh%B, n)
        end if
-       call this%fluid%gs_Xh%op(this%grad_x%x, this%grad_y%x, this%grad_z%x, &
+       call fluid%gs_Xh%op(grad_x%x, grad_y%x, grad_z%x, &
             n, GS_OP_ADD)
        if (NEKO_BCKND_DEVICE .eq. 1) then
-          call device_col2(this%grad_x%x_d, this%fluid%c_Xh%Binv_d, n)
-          call device_col2(this%grad_y%x_d, this%fluid%c_Xh%Binv_d, n)
-          call device_col2(this%grad_z%x_d, this%fluid%c_Xh%Binv_d, n)
+          call device_col2(grad_x%x_d, fluid%c_Xh%Binv_d, n)
+          call device_col2(grad_y%x_d, fluid%c_Xh%Binv_d, n)
+          call device_col2(grad_z%x_d, fluid%c_Xh%Binv_d, n)
        else
-          call col2(this%grad_x%x, this%fluid%c_Xh%Binv, n)
-          call col2(this%grad_y%x, this%fluid%c_Xh%Binv, n)
-          call col2(this%grad_z%x, this%fluid%c_Xh%Binv, n)
+          call col2(grad_x%x, fluid%c_Xh%Binv, n)
+          call col2(grad_y%x, fluid%c_Xh%Binv, n)
+          call col2(grad_z%x, fluid%c_Xh%Binv, n)
        end if
     else
-       call this%fluid%gs_Xh%op(this%grad_x%x, this%grad_y%x, this%grad_z%x, &
+       call fluid%gs_Xh%op(grad_x%x, grad_y%x, grad_z%x, &
             n, GS_OP_ADD)
        if (NEKO_BCKND_DEVICE .eq. 1) then
-          call device_col2(this%grad_x%x_d, this%fluid%c_Xh%mult_d, n)
-          call device_col2(this%grad_y%x_d, this%fluid%c_Xh%mult_d, n)
-          call device_col2(this%grad_z%x_d, this%fluid%c_Xh%mult_d, n)
+          call device_col2(grad_x%x_d, fluid%c_Xh%mult_d, n)
+          call device_col2(grad_y%x_d, fluid%c_Xh%mult_d, n)
+          call device_col2(grad_z%x_d, fluid%c_Xh%mult_d, n)
        else
-          call col2(this%grad_x%x, this%fluid%c_Xh%mult, n)
-          call col2(this%grad_y%x, this%fluid%c_Xh%mult, n)
-          call col2(this%grad_z%x, this%fluid%c_Xh%mult, n)
+          call col2(grad_x%x, fluid%c_Xh%mult, n)
+          call col2(grad_y%x, fluid%c_Xh%mult, n)
+          call col2(grad_z%x, fluid%c_Xh%mult, n)
        end if
     end if
-    if (associated(this%velocity_projector)) then
-       call this%velocity_projector%apply(this%grad_x%x, this%grad_y%x, &
-            this%grad_z%x, n)
+    if (associated(velocity_projector)) then
+       call velocity_projector%apply(grad_x%x, grad_y%x, &
+            grad_z%x, n)
     else
-       call this%fluid%bcs_vel_projector%apply(this%grad_x%x, this%grad_y%x, &
-            this%grad_z%x, n)
+       call fluid%bcs_vel_projector%apply(grad_x%x, grad_y%x, &
+            grad_z%x, n)
     end if
 
     ! Apply C to the restricted mass-adjoint gradient.  The result is left
     ! in local elemental form because the surrounding Neko KSP applies its
     ! standard gather-scatter and pressure essential-BC restriction.
-    call field_col3(this%f_x, this%grad_x, this%fluid%rho)
-    call field_col3(this%f_y, this%grad_y, this%fluid%rho)
-    call field_col3(this%f_z, this%grad_z, this%fluid%rho)
+    call field_col3(f_x, grad_x, fluid%rho)
+    call field_col3(f_y, grad_y, fluid%rho)
+    call field_col3(f_z, grad_z, fluid%rho)
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call device_col2(this%f_x%x_d, this%fluid%c_Xh%B_d, n)
-       call device_col2(this%f_y%x_d, this%fluid%c_Xh%B_d, n)
-       call device_col2(this%f_z%x_d, this%fluid%c_Xh%B_d, n)
+       call device_col2(f_x%x_d, fluid%c_Xh%B_d, n)
+       call device_col2(f_y%x_d, fluid%c_Xh%B_d, n)
+       call device_col2(f_z%x_d, fluid%c_Xh%B_d, n)
     else
-       call col2(this%f_x%x, this%fluid%c_Xh%B, n)
-       call col2(this%f_y%x, this%fluid%c_Xh%B, n)
-       call col2(this%f_z%x, this%fluid%c_Xh%B, n)
+       call col2(f_x%x, fluid%c_Xh%B, n)
+       call col2(f_y%x, fluid%c_Xh%B, n)
+       call col2(f_z%x, fluid%c_Xh%B, n)
     end if
-    call field_rzero(this%p_zero)
+    call field_rzero(p_zero)
     event = c_null_ptr
-    call this%fluid%prs_res%compute(this%p_zero, this%p_res, this%grad_x, &
-         this%grad_y, this%grad_z, this%u_zero, this%v_zero, this%w_zero, &
-         this%f_x, this%f_y, this%f_z, this%fluid%c_Xh, this%fluid%gs_Xh, &
-         this%fluid%bc_prs_surface, this%fluid%bc_sym_surface, &
-         this%fluid%Ax_prs, 0.0_rp, 1.0_rp, this%u_zero, this%fluid%rho, &
+    call fluid%prs_res%compute(p_zero, p_res, grad_x, &
+         grad_y, grad_z, u_zero, v_zero, w_zero, &
+         f_x, f_y, f_z, fluid%c_Xh, fluid%gs_Xh, &
+         fluid%bc_prs_surface, fluid%bc_sym_surface, &
+         fluid%Ax_prs, 0.0_rp, 1.0_rp, u_zero, fluid%rho, &
          event)
-    if (.not. this%fluid%prs_dirichlet) then
-       call ortho(this%p_res%x, this%fluid%glb_n_points, n)
+    if (.not. fluid%prs_dirichlet) then
+       call ortho(p_res%x, fluid%glb_n_points, n)
     end if
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call device_copy(device_get_ptr(w), this%p_res%x_d, n)
+       call device_copy(device_get_ptr(w), p_res%x_d, n)
     else
-       w = this%p_res%x
+       w = p_res%x
     end if
   end subroutine rom_projection_ax_compute
 

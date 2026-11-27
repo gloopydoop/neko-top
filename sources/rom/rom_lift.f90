@@ -27,7 +27,7 @@ module rom_lift
   public :: rom_lift_t
 
   !> Spatial lift and its SEM derivatives.
-  type, public :: rom_lift_t
+  type :: rom_lift_t
      logical :: enabled = .false.
      logical :: scalar_enabled = .false.
      type(field_t) :: reference(3)
