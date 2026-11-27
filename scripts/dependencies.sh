@@ -427,10 +427,34 @@ function find_adios2() {
     if [ -n "${pyver:-}" ] && [ -d "$ADIOS2_DIR/lib64/python${pyver}/site-packages" ]; then
         export PYTHONPATH="$ADIOS2_DIR/lib64/python${pyver}/site-packages${PYTHONPATH:+:$PYTHONPATH}"
     fi
-    if [ -n "${pyver:-}" ] && [ -n "${MAIN_DIR:-}" ] && [ -d "$MAIN_DIR/lib/python${pyver}/site-packages" ]; then
+    # A repository-local regular adios2 package shadows even an earlier
+    # selected ADIOS2 namespace package.  Use it only as a fallback, and
+    # remove inherited copies of those local paths when bindings are selected.
+    if [ -n "${pyver:-}" ] && [ -n "${MAIN_DIR:-}" ] && \
+       { [ -d "$ADIOS2_DIR/lib/python${pyver}/site-packages/adios2/bindings" ] || \
+         [ -d "$ADIOS2_DIR/lib64/python${pyver}/site-packages/adios2/bindings" ]; }; then
+        local python_path_entry filtered_pythonpath=""
+        local -a python_path_entries
+        IFS=: read -r -a python_path_entries <<< "${PYTHONPATH:-}"
+        for python_path_entry in "${python_path_entries[@]}"; do
+            case "$python_path_entry" in
+                "$MAIN_DIR/lib/python${pyver}/site-packages"|\
+                "$MAIN_DIR/lib64/python${pyver}/site-packages") continue ;;
+            esac
+            filtered_pythonpath="${filtered_pythonpath:+${filtered_pythonpath}:}${python_path_entry}"
+        done
+        export PYTHONPATH="$filtered_pythonpath"
+    fi
+    if [ -n "${pyver:-}" ] && [ -n "${MAIN_DIR:-}" ] && \
+       [ ! -d "$ADIOS2_DIR/lib/python${pyver}/site-packages/adios2/bindings" ] && \
+       [ ! -d "$ADIOS2_DIR/lib64/python${pyver}/site-packages/adios2/bindings" ] && \
+       [ -d "$MAIN_DIR/lib/python${pyver}/site-packages" ]; then
         export PYTHONPATH="$MAIN_DIR/lib/python${pyver}/site-packages${PYTHONPATH:+:$PYTHONPATH}"
     fi
-    if [ -n "${pyver:-}" ] && [ -n "${MAIN_DIR:-}" ] && [ -d "$MAIN_DIR/lib64/python${pyver}/site-packages" ]; then
+    if [ -n "${pyver:-}" ] && [ -n "${MAIN_DIR:-}" ] && \
+       [ ! -d "$ADIOS2_DIR/lib/python${pyver}/site-packages/adios2/bindings" ] && \
+       [ ! -d "$ADIOS2_DIR/lib64/python${pyver}/site-packages/adios2/bindings" ] && \
+       [ -d "$MAIN_DIR/lib64/python${pyver}/site-packages" ]; then
         export PYTHONPATH="$MAIN_DIR/lib64/python${pyver}/site-packages${PYTHONPATH:+:$PYTHONPATH}"
     fi
 

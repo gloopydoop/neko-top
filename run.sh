@@ -401,6 +401,16 @@ for case in ${example_list[@]}; do
         example=$example/$case_name
     fi
 
+    # A failed cleanup may have created a results directory even though the
+    # execution failed. Preserve it before allowing a clean retry.
+    if [ "$CLEAN" == true ] && [ -d "$RPATH/$example" ] && \
+       [ -s "$LPATH/$example/error.log" ] && \
+       [ ! -f "$RPATH/$example/output.log" ]; then
+        failed_results="$RPATH/${example}.failed.$(date +%Y%m%d%H%M%S).$$"
+        mv -- "$RPATH/$example" "$failed_results" || exit 1
+        printf '\t%-12s %-s\n' "Preserved:" "$failed_results"
+    fi
+
     if [ "$RERUN" == false ] && [ -d "$RPATH/$example" ]; then
         printf '\t\e[1;32m%-12s\e[m %-s\n' "Complete:" "$example"
         continue

@@ -266,12 +266,12 @@
             {
                 "type": "viscous_dissipation",
                 "start_time": 10.0,
-                "weight": 15.0
+                "weight": 150.0
             },
             {
                 "type": "brinkman_dissipation",
                 "start_time": 10.0,
-                "weight": 15.0,
+                "weight": 150.0,
             }
         ]
     }

@@ -11,8 +11,8 @@ CASE_DIR=$(pwd)
 CASE_FILE=${1:-"${CASE_DIR}/$(basename "${CASE_DIR}").case"}
 PY_SCRIPT=${2:-"${MAIN_DIR}/scripts/python/rom_state_recover.py"}
 
-NEKO_RANKS=${NEKO_RANKS:-9}
-PY_RANKS=${PY_RANKS:-4}
+NEKO_RANKS=${NEKO_RANKS:-1}
+PY_RANKS=${PY_RANKS:-9}
 
 if [ ! -f "${CASE_FILE}" ]; then
     echo "Error: case file not found: ${CASE_FILE}" >&2
@@ -35,7 +35,6 @@ else
     echo "Error: no Neko executable found." >&2
     exit 1
 fi
-
 CASE_NAME="$(basename "${CASE_FILE}")"
 CASE_BASE="${CASE_NAME%.case}"
 LOG_FILE=${LOG_FILE:-"mpmd_${CASE_BASE}.log"}

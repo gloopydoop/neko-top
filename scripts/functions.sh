@@ -59,7 +59,7 @@ function run {
         printf "See error.log for details.\n"
         return 1
     fi
-    rm -fr error.log && touch error.log
+    : >error.log
 
     # ------------------------------------------------------------------------ #
     # Execute the example
@@ -71,12 +71,15 @@ function run {
     TIME_START=$(date +%s)
     if [ -f "run.sh" ]; then
         ./run.sh 2>error.log
+        run_status=$?
 
     elif [[ -n "$SLURM_JOB_NAME" && -n "$CPU_BIND" ]]; then
         srun -u --cpu-bind=${CPU_BIND} $neko $casefile 2>error.log
+        run_status=$?
 
     elif command -v srun 2>&1 1>/dev/null; then
         srun -u $neko $casefile 2>error.log
+        run_status=$?
 
     elif [ -n "$(which mpirun 2>/dev/null)" ]; then
         # Look for the number of cores to use
@@ -97,6 +100,7 @@ function run {
         fi
 
         mpirun --tag-output -n $ncores $neko $casefile 2>error.log
+        run_status=$?
 
         # Remove all lines printed from mpi rank > 0 and remove the mpi tag
         sed -i '/^\[[0-9]*,[1-9]*\]/d' error.log
@@ -104,6 +108,7 @@ function run {
 
     else
         $neko $casefile 2>error.log
+        run_status=$?
 
     fi
     TIME_END=$(date +%s)
@@ -111,6 +116,10 @@ function run {
     # ------------------------------------------------------------------------ #
     # Check for errors and normal end
 
+    if [ "${run_status:-0}" -ne 0 ]; then
+        printf "ERROR: Execution failed with exit status %s. See application logs for details.\n" "$run_status" >>error.log
+        return "$run_status"
+    fi
     if [ -s ./error.log ]; then
         printf "ERROR: An error occurred during execution.\n"
         printf "See error.log for details.\n"

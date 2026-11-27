@@ -14,7 +14,7 @@ module rom_basis_handoff
   use gather_scatter, only: GS_OP_ADD
   use math, only: col2, glsc3
   use device_math, only: device_col2, device_glsc3
-  use device, only: DEVICE_TO_HOST, HOST_TO_DEVICE
+  use device, only: DEVICE_TO_HOST, HOST_TO_DEVICE, glb_cmd_event
   use neko_config, only: NEKO_BCKND_DEVICE
   use krylov, only: ksp_monitor_t
   use json_file_module, only: json_file
@@ -510,6 +510,7 @@ contains
     failed = .false.
     diagnostic_open = .false.
     event = C_NULL_PTR
+    if (NEKO_BCKND_DEVICE .eq. 1) event = glb_cmd_event
 
     if (pe_rank == 0) then
        open(newunit=diagnostic_unit, file=trim(diagnostics_file), &
@@ -828,6 +829,7 @@ contains
     call rom_col2_B(f_z, fluid, n)
     call field_rzero(p_zero); call field_rzero(phi)
     event = C_NULL_PTR
+    if (NEKO_BCKND_DEVICE .eq. 1) event = glb_cmd_event
     call fluid%prs_res%compute(p_zero, p_res, u, v, w, u_zero, v_zero, w_zero, &
          f_x, f_y, f_z, fluid%c_Xh, fluid%gs_Xh, fluid%bc_prs_surface, &
          fluid%bc_sym_surface, fluid%Ax_prs, 0.0_rp, 1.0_rp, u_zero, &
@@ -1109,6 +1111,7 @@ contains
     pressure_ksp_final = 0.0_rp; pressure_iterations = 0
     pressure_converged = .false.; final_mode_index = 0
     event = C_NULL_PTR
+    if (NEKO_BCKND_DEVICE .eq. 1) event = glb_cmd_event
     diagnostic_open = .false.
     projection_failed = .false.
     if (pe_rank == 0) then
